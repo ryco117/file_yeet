@@ -1,0 +1,11 @@
+[package]
+name = "file_yeet_client"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+chrono = "0.4.31"
+clap = { version = "4.4.17", features = ["derive"] }
+file_yeet_shared = { path = "../shared" }
+net2 = "0.2.39"
