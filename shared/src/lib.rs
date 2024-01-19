@@ -1,43 +1,10 @@
-use std::{
-    net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs},
-    num::NonZeroUsize,
-};
-
-/// Default to localhost for IPv4 address.
-pub const DEFAULT_IPV4: &str = "127.0.0.1";
+use std::{net::TcpStream, num::NonZeroUsize};
 
 /// Magic number for the default port.
 pub const DEFAULT_PORT: u16 = 7828;
 
 /// Define a sane maximum payload size for the client.
 pub const MAX_PAYLOAD_SIZE: usize = 1024;
-
-/// Helper struct to store an IP address and port to uniquely identify an address.
-#[derive(Clone, Debug)]
-pub struct Address {
-    pub ip: IpAddr,
-    pub port: u16,
-}
-
-/// Implement trait to display and `Address` in a human-readable format.
-impl std::fmt::Display for Address {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        let &Address { ip, port } = self;
-        write!(f, "{ip}:{port}")
-    }
-}
-
-/// Helper for using an `Address` with `std::net` functions.
-impl ToSocketAddrs for Address {
-    type Iter = std::option::IntoIter<SocketAddr>;
-    fn to_socket_addrs(&self) -> std::io::Result<std::option::IntoIter<SocketAddr>> {
-        let &Address { ip, port } = self;
-        match ip {
-            IpAddr::V4(ip) => (ip, port).to_socket_addrs(),
-            IpAddr::V6(ip) => (ip, port).to_socket_addrs(),
-        }
-    }
-}
 
 /// The error type when reading from a TCP stream with `read_stream(...)`.
 #[derive(Debug)]

@@ -36,9 +36,9 @@ fn main() {
         args.server_ip
             .as_ref()
             .filter(|s| !s.is_empty())
-            .map_or(file_yeet_shared::DEFAULT_IPV4, String::as_str)
-            .parse()
-            .expect("Invalid IP address"),
+            .map_or(Ipv4Addr::LOCALHOST, |s| {
+                s.parse().expect("Invalid IP address")
+            }),
         args.server_port,
     );
 
