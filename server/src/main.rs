@@ -73,7 +73,7 @@ async fn main() {
 
                 // Let the client know that we couldn't get their socket address.
                 warp::reply::with_status(
-                    "Failed to get client socket",
+                    "Failed to get client socket\n",
                     StatusCode::SERVICE_UNAVAILABLE,
                 )
                 .into_response()
@@ -199,9 +199,9 @@ async fn handle_subscribe_fetch(hash_hex: String, clients: ClientMap) -> WithSta
     if hash_hex.len() != 2 * hash.len()
         || faster_hex::hex_decode(hash_hex.as_bytes(), &mut hash).is_err()
     {
-        eprintln!("{} Failed to decode hash", Local::now());
+        eprintln!("{} Failed to validate SHA-256 hash", Local::now());
         return warp::reply::with_status(
-            "Failed to decode hash".to_owned(),
+            "Failed to decode hash\n".to_owned(),
             StatusCode::BAD_REQUEST,
         );
     }
@@ -211,7 +211,7 @@ async fn handle_subscribe_fetch(hash_hex: String, clients: ClientMap) -> WithSta
     let Some(client) = read_lock.get(&hash) else {
         eprintln!("{} Failed to find client for hash", Local::now());
         return warp::reply::with_status(
-            "Failed to find client for hash".to_owned(),
+            "Failed to find client for hash\n".to_owned(),
             StatusCode::NOT_FOUND,
         );
     };
