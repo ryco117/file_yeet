@@ -8,8 +8,9 @@ use std::{
 
 use chrono::Local;
 use clap::Parser;
-use futures_util::{stream::SplitSink, SinkExt};
-use tokio::sync::RwLock;
+use file_yeet_shared::MAX_PAYLOAD_SIZE;
+use futures_util::SinkExt;
+use tokio::sync::{mpsc, RwLock};
 use warp::{
     http::StatusCode,
     reply::{Reply, WithStatus},
@@ -20,7 +21,7 @@ use warp::{
 /// A client that has connected to the server.
 struct Client {
     pub address: SocketAddr,
-    pub stream: SplitSink<WebSocket, Message>,
+    pub stream: mpsc::Sender<Message>,
 }
 
 #[derive(Parser)]
@@ -64,7 +65,7 @@ async fn main() {
 
     // Define the HTTP based API.
     let api = {
-        /// Rewrap the address in an `Ok` or print and wrap `Response` as an `Err`.
+        /// Helper to rewrap the address in an `Ok` or print an error return a failure response.
         fn unwrap_address_or_respond(
             addr: Option<SocketAddr>,
         ) -> Result<SocketAddr, warp::reply::Response> {
@@ -81,33 +82,55 @@ async fn main() {
         }
 
         // Use `warp` to create an API for publishing new files.
-        let publish_api = warp::path("pub")
+        let publish_api = warp::path!("pub" / String)
             // The `ws()` filter will prepare the Websocket handshake.
             .and(warp::ws())
             .and(warp::addr::remote())
             .and(get_clients.clone())
-            .map(move |ws: warp::ws::Ws, client_socket, clients| {
-                // Ensure a client socket address can be established, otherwise return an error.
-                let client_socket = match unwrap_address_or_respond(client_socket) {
-                    Ok(addr) => addr,
-                    Err(err) => return err,
-                };
+            .map(
+                move |hash_hex: String, ws: warp::ws::Ws, client_socket, clients| {
+                    // Ensure a client socket address can be determined, otherwise return an error.
+                    let client_socket = match unwrap_address_or_respond(client_socket) {
+                        Ok(addr) => addr,
+                        Err(e) => return e,
+                    };
 
-                // Handle the websocket connection, established through an HTTP upgrade.
-                ws.on_upgrade(move |ws| handle_publish_websocket(ws, client_socket, clients))
+                    // Validate the file hash is hexadecimal of the correct length or return an error.
+                    let Some(hash) = validate_hash_hex(&hash_hex) else {
+                        eprintln!("{} Failed to validate SHA-256 hash", Local::now());
+                        return warp::reply::with_status(
+                            "Failed to decode hash\n".to_owned(),
+                            StatusCode::BAD_REQUEST,
+                        )
+                        .into_response();
+                    };
+
+                    // Handle the websocket connection, established through an HTTP upgrade.
+                    ws.on_upgrade(move |ws| {
+                        handle_publish_websocket(ws, client_socket, hash, clients)
+                    })
                     .into_response()
-            });
+                },
+            );
 
         // API for fetching the address of a peer that has a file.
-        let subscribe_api =
-            warp::path!("sub" / String)
-                .and(get_clients)
-                .and_then(move |hash_hex, clients| async {
-                    // Handle the fetch request asynchronously and promise an HTTP response.
-                    Ok::<WithStatus<std::string::String>, warp::Rejection>(
-                        handle_subscribe_fetch(hash_hex, clients).await,
-                    )
-                });
+        let subscribe_api = warp::path!("sub" / String)
+            .and(warp::addr::remote())
+            .and(get_clients)
+            .and_then(move |hash_hex, client_socket, clients| async move {
+                // Ensure a client socket address can be determined, otherwise return an error.
+                let client_socket = match unwrap_address_or_respond(client_socket) {
+                    Ok(addr) => addr,
+                    Err(e) => return Ok::<_, warp::Rejection>(e),
+                };
+
+                // Handle the fetch request asynchronously and promise an HTTP response.
+                Ok::<_, warp::Rejection>(
+                    handle_subscribe_fetch(client_socket, hash_hex, clients)
+                        .await
+                        .into_response(),
+                )
+            });
 
         // Merge available endpoints.
         publish_api.or(subscribe_api)
@@ -121,6 +144,7 @@ async fn main() {
 async fn handle_publish_websocket(
     websocket: WebSocket,
     client_socket: SocketAddr,
+    hash: [u8; 32],
     clients: ClientMap,
 ) {
     /// Internal function to make error handling more convenient.
@@ -128,58 +152,47 @@ async fn handle_publish_websocket(
         websocket: WebSocket,
         client_socket: SocketAddr,
         clients: ClientMap,
+        hash: [u8; 32],
     ) -> Result<(), ()> {
         // Necessary to `split()` the websocket into a sender and receiver.
         use futures_util::StreamExt as _;
 
         let sock_string = client_socket.to_string();
-        println!("{} New connection from: {}", Local::now(), &sock_string);
+        println!("{} New publish connection from: {}", Local::now(), &sock_string);
 
         // Split the socket into a sender and receiver of messages.
-        let (user_tx, mut user_rx) = websocket.split();
-
-        let mut client = Client {
-            address: client_socket,
-            stream: user_tx,
-        };
+        let (mut client_tx, _) = websocket.split();
 
         // Send the client back the socket address we believe to be theirs.
         // This is so users can perform their own sanity checks on the result.
-        client
-            .stream
+        client_tx
             .send(Message::text(&sock_string))
             .await
-            .map_err(|err| {
+            .map_err(|e| {
                 eprintln!(
-                    "{} Failed to send socket address to client: {err}",
+                    "{} Failed to send socket address to client: {e}",
                     Local::now()
                 );
             })?;
 
-        // Read the SHA-256 hash of the file from the client as a byte sequence.
-        let msg = user_rx
-            .next()
-            .await
-            .ok_or_else(|| eprintln!("{} The client closed the websocket early", Local::now()))?
-            .map_err(|err| {
-                eprintln!(
-                    "{} Failed to receive message from client: {err}",
-                    Local::now()
-                );
-            })?;
+        // Use a channel to handle buffering and flushing of messages.
+        // Ensures that the websocket stream doesn't need to be cloned or passed between threads.
+        let (tx, mut rx) = mpsc::channel(2 * MAX_PAYLOAD_SIZE);
+        tokio::task::spawn(async move {
+            while let Some(message) = rx.recv().await {
+                client_tx.send(message).await.unwrap_or_else(|e| {
+                    eprintln!("websocket send error: {e}");
+                });
+            }
+        });
 
-        // Ensure the correct number of bytes were sent.
-        let mut hash = [0; 32];
-        let bytes = msg.as_bytes();
-        if bytes.len() != hash.len() {
-            return Err(eprintln!(
-                "{} Received invalid number of bytes for a SHA-256 hash from client",
-                Local::now()
-            ));
-        }
-        hash.copy_from_slice(bytes);
+        let client = Client {
+            address: client_socket,
+            stream: tx,
+        };
 
         // Add the client to the map of clients.
+        // TODO: If there is already a client for this hash, perhaps multple clients can be stored for a file hash.
         if let Some(old_client) = clients.lock.write().await.insert(hash, client) {
             println!("{} Replaced client: {}", Local::now(), old_client.address);
         }
@@ -187,28 +200,32 @@ async fn handle_publish_websocket(
     }
 
     // Springboard to the internal function and handle the result asynchronously.
-    handle_internal(websocket, client_socket, clients)
+    handle_internal(websocket, client_socket, clients, hash)
         .await
         .unwrap_or_default();
 }
 
 /// Handle the fetch request for a specific file hash.
-async fn handle_subscribe_fetch(hash_hex: String, clients: ClientMap) -> WithStatus<String> {
-    // Validate the hash string is the correct length and can be decoded.
-    let mut hash = [0; 32];
-    if hash_hex.len() != 2 * hash.len()
-        || faster_hex::hex_decode(hash_hex.as_bytes(), &mut hash).is_err()
-    {
+async fn handle_subscribe_fetch(
+    subscriber_socket: SocketAddr,
+    hash_hex: String,
+    clients: ClientMap,
+) -> WithStatus<String> {
+    let sock_string = subscriber_socket.to_string();
+    println!("{} New subscribe connection from: {}", Local::now(), &sock_string);
+
+    // Validate the file hash or return an error.
+    let Some(hash) = validate_hash_hex(&hash_hex) else {
         eprintln!("{} Failed to validate SHA-256 hash", Local::now());
         return warp::reply::with_status(
             "Failed to decode hash\n".to_owned(),
             StatusCode::BAD_REQUEST,
         );
-    }
+    };
 
     // Attempt to get the client from the map.
     let read_lock = clients.lock.read().await;
-    let Some(client) = read_lock.get(&hash) else {
+    let Some(pub_client) = read_lock.get(&hash) else {
         eprintln!("{} Failed to find client for hash", Local::now());
         return warp::reply::with_status(
             "Failed to find client for hash\n".to_owned(),
@@ -216,6 +233,25 @@ async fn handle_subscribe_fetch(hash_hex: String, clients: ClientMap) -> WithSta
         );
     };
 
+    // Feed the client socket address to the task that handles communicating with this client.
+    pub_client
+        .stream
+        .send(Message::text(sock_string))
+        .await
+        .expect("Could not feed the publish task thread");
+
     // Send the client the address of the peer that has the file.
-    warp::reply::with_status(client.address.to_string(), StatusCode::OK)
+    warp::reply::with_status(pub_client.address.to_string(), StatusCode::OK)
+}
+
+/// Validate the hash string is the correct length and can be decoded.
+fn validate_hash_hex(hash_hex: &str) -> Option<[u8; 32]> {
+    let mut hash = [0; 32];
+    if hash_hex.len() != 2 * hash.len()
+        || faster_hex::hex_decode(hash_hex.as_bytes(), &mut hash).is_err()
+    {
+        eprintln!("{} Failed to validate SHA-256 hash", Local::now());
+        return None;
+    }
+    Some(hash)
 }
