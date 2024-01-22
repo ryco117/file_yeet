@@ -24,7 +24,7 @@ An official container build is available at `ryco117/file_yeet_server:latest`. H
 ```bash
 docker build -t file_yeet_server:local .
 ```
-**Note**: The docker container must be run with `--net=host` to ensure that the container hass visibility of the client's IP address, instead of a docker intermediary.
+**Note**: The docker container must be run with `--net=host` to ensure that the container has visibility of the client's IP address, instead of a docker intermediary.
 
 
 ### Client
