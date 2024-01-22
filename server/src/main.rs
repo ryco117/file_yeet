@@ -65,57 +65,6 @@ async fn main() {
 
     // Define the HTTP based API.
     let api = {
-        /// Helper to rewrap the address in an `Ok` or print an error return a failure response.
-        fn unwrap_address_or_respond(
-            addr: Option<SocketAddr>,
-        ) -> Result<SocketAddr, warp::reply::Response> {
-            addr.ok_or_else(|| {
-                eprintln!("{} Failed to get client socket", Local::now());
-
-                // Let the client know that we couldn't get their socket address.
-                warp::reply::with_status(
-                    "Failed to get client socket\n",
-                    StatusCode::SERVICE_UNAVAILABLE,
-                )
-                .into_response()
-            })
-        }
-
-        /// Helper to use the available HTTP information to determine which address to use for the client.
-        fn determine_client_address(
-            client_socket: Option<SocketAddr>,
-            forwarded_for: &Option<String>,
-        ) -> Result<SocketAddr, warp::reply::Response> {
-            println!(
-                "{} Known client information: Socket: {:?} X-Forwarded-For: {:?}",
-                Local::now(),
-                &client_socket,
-                &forwarded_for
-            );
-
-            // If the client is behind a proxy, use the `X-Forwarded-For` header.
-            // This header takes the form of a comma separated list, with the first entry being the client's address.
-            let forwarded_client = forwarded_for
-                .as_ref()
-                .map(String::as_str)
-                .unwrap_or_default()
-                .split(',')
-                .next();
-            if let Some(client_address) = forwarded_client {
-                if !client_address.is_empty() {
-                    match client_address.parse() {
-                        Ok(addr) => return Ok(addr),
-                        Err(e) => eprintln!(
-                            "{} Failed to parse X-Forwarded-For header: {e}",
-                            Local::now()
-                        ),
-                    }
-                }
-            }
-
-            unwrap_address_or_respond(client_socket)
-        }
-
         // Use `warp` to create an API for publishing new files.
         let publish_api = warp::path!("pub" / String)
             // The `ws()` filter will prepare the Websocket handshake.
@@ -296,4 +245,53 @@ fn validate_hash_hex(hash_hex: &str) -> Option<[u8; 32]> {
         return None;
     }
     Some(hash)
+}
+
+/// Helper to use the available HTTP information to determine which address to use for the client.
+fn determine_client_address(
+    client_socket: Option<SocketAddr>,
+    forwarded_for: &Option<String>,
+) -> Result<SocketAddr, warp::reply::Response> {
+    println!(
+        "{} Known client information: Socket: {:?} X-Forwarded-For: {:?}",
+        Local::now(),
+        &client_socket,
+        &forwarded_for
+    );
+
+    // Use the `X-Forwarded-For` header to determine if the client is behind a proxy, and return an error if so.
+    // This header takes the form of a comma separated list, with the first entry being the client's address.
+    let forwarded_client = forwarded_for
+        .as_ref()
+        .map(String::as_str)
+        .unwrap_or_default()
+        .split(',')
+        .next();
+    if let Some(client_address) = forwarded_client {
+        if !client_address.is_empty() {
+            // The headers indicate that a proxy is between the client and the server.
+            // This means that TCP hole punching will not work, abort.
+            eprintln!(
+                "{} Client is behind a proxy, aborting TCP hole punching: {client_address}",
+                Local::now()
+            );
+            return Err(warp::reply::with_status(
+                "Client is behind a proxy\n",
+                StatusCode::BAD_GATEWAY,
+            )
+            .into_response());
+        }
+    }
+
+    // Ensure that the client socket address can be determined or return an error.
+    client_socket.ok_or_else(|| {
+        eprintln!("{} Failed to get client socket", Local::now());
+
+        // Let the client know that we couldn't get their socket address.
+        warp::reply::with_status(
+            "Failed to get client socket\n",
+            StatusCode::SERVICE_UNAVAILABLE,
+        )
+        .into_response()
+    })
 }
