@@ -81,19 +81,56 @@ async fn main() {
             })
         }
 
+        /// Helper to use the available HTTP information to determine which address to use for the client.
+        fn determine_client_address(
+            client_socket: Option<SocketAddr>,
+            forwarded_for: &Option<String>,
+        ) -> Result<SocketAddr, warp::reply::Response> {
+            println!(
+                "{} Known client information: Socket: {:?} X-Forwarded-For: {:?}",
+                Local::now(),
+                &client_socket,
+                &forwarded_for
+            );
+
+            // If the client is behind a proxy, use the `X-Forwarded-For` header.
+            // This header takes the form of a comma separated list, with the first entry being the client's address.
+            let forwarded_client = forwarded_for
+                .as_ref()
+                .map(String::as_str)
+                .unwrap_or_default()
+                .split(',')
+                .next();
+            if let Some(client_address) = forwarded_client {
+                if !client_address.is_empty() {
+                    match client_address.parse() {
+                        Ok(addr) => return Ok(addr),
+                        Err(e) => eprintln!(
+                            "{} Failed to parse X-Forwarded-For header: {e}",
+                            Local::now()
+                        ),
+                    }
+                }
+            }
+
+            unwrap_address_or_respond(client_socket)
+        }
+
         // Use `warp` to create an API for publishing new files.
         let publish_api = warp::path!("pub" / String)
             // The `ws()` filter will prepare the Websocket handshake.
             .and(warp::ws())
             .and(warp::addr::remote())
+            .and(warp::header::optional("X-Forwarded-For"))
             .and(get_clients.clone())
             .map(
-                move |hash_hex: String, ws: warp::ws::Ws, client_socket, clients| {
+                move |hash_hex: String, ws: warp::ws::Ws, client_socket, forwarded_for, clients| {
                     // Ensure a client socket address can be determined, otherwise return an error.
-                    let client_socket = match unwrap_address_or_respond(client_socket) {
-                        Ok(addr) => addr,
-                        Err(e) => return e,
-                    };
+                    let client_socket =
+                        match determine_client_address(client_socket, &forwarded_for) {
+                            Ok(addr) => addr,
+                            Err(e) => return e,
+                        };
 
                     // Validate the file hash is hexadecimal of the correct length or return an error.
                     let Some(hash) = validate_hash_hex(&hash_hex) else {
@@ -116,21 +153,25 @@ async fn main() {
         // API for fetching the address of a peer that has a file.
         let subscribe_api = warp::path!("sub" / String)
             .and(warp::addr::remote())
+            .and(warp::header::optional("X-Forwarded-For"))
             .and(get_clients)
-            .and_then(move |hash_hex, client_socket, clients| async move {
-                // Ensure a client socket address can be determined, otherwise return an error.
-                let client_socket = match unwrap_address_or_respond(client_socket) {
-                    Ok(addr) => addr,
-                    Err(e) => return Ok::<_, warp::Rejection>(e),
-                };
+            .and_then(
+                move |hash_hex, client_socket, forwarded_for, clients| async move {
+                    // Ensure a client socket address can be determined, otherwise return an error.
+                    let client_socket =
+                        match determine_client_address(client_socket, &forwarded_for) {
+                            Ok(addr) => addr,
+                            Err(e) => return Ok::<_, warp::Rejection>(e),
+                        };
 
-                // Handle the fetch request asynchronously and promise an HTTP response.
-                Ok::<_, warp::Rejection>(
-                    handle_subscribe_fetch(client_socket, hash_hex, clients)
-                        .await
-                        .into_response(),
-                )
-            });
+                    // Handle the fetch request asynchronously and promise an HTTP response.
+                    Ok::<_, warp::Rejection>(
+                        handle_subscribe_fetch(client_socket, hash_hex, clients)
+                            .await
+                            .into_response(),
+                    )
+                },
+            );
 
         // Merge available endpoints.
         publish_api.or(subscribe_api)
@@ -147,18 +188,17 @@ async fn handle_publish_websocket(
     hash: [u8; 32],
     clients: ClientMap,
 ) {
-    /// Internal function to make error handling more convenient.
-    async fn handle_internal(
-        websocket: WebSocket,
-        client_socket: SocketAddr,
-        clients: ClientMap,
-        hash: [u8; 32],
-    ) -> Result<(), ()> {
+    // Internal function to make error handling more convenient.
+    let handle_publish = || async move {
         // Necessary to `split()` the websocket into a sender and receiver.
         use futures_util::StreamExt as _;
 
         let sock_string = client_socket.to_string();
-        println!("{} New publish connection from: {}", Local::now(), &sock_string);
+        println!(
+            "{} New publish connection from: {}",
+            Local::now(),
+            &sock_string
+        );
 
         // Split the socket into a sender and receiver of messages.
         let (mut client_tx, _) = websocket.split();
@@ -181,7 +221,7 @@ async fn handle_publish_websocket(
         tokio::task::spawn(async move {
             while let Some(message) = rx.recv().await {
                 client_tx.send(message).await.unwrap_or_else(|e| {
-                    eprintln!("websocket send error: {e}");
+                    eprintln!("Websocket send error: {e}");
                 });
             }
         });
@@ -196,13 +236,11 @@ async fn handle_publish_websocket(
         if let Some(old_client) = clients.lock.write().await.insert(hash, client) {
             println!("{} Replaced client: {}", Local::now(), old_client.address);
         }
-        Ok(())
-    }
+        Ok::<(), ()>(())
+    };
 
     // Springboard to the internal function and handle the result asynchronously.
-    handle_internal(websocket, client_socket, clients, hash)
-        .await
-        .unwrap_or_default();
+    handle_publish().await.unwrap_or_default();
 }
 
 /// Handle the fetch request for a specific file hash.
@@ -212,7 +250,11 @@ async fn handle_subscribe_fetch(
     clients: ClientMap,
 ) -> WithStatus<String> {
     let sock_string = subscriber_socket.to_string();
-    println!("{} New subscribe connection from: {}", Local::now(), &sock_string);
+    println!(
+        "{} New subscribe connection from: {}",
+        Local::now(),
+        &sock_string
+    );
 
     // Validate the file hash or return an error.
     let Some(hash) = validate_hash_hex(&hash_hex) else {

@@ -1,5 +1,6 @@
 use std::{
-    net::{Ipv4Addr, SocketAddr},
+    net::{Ipv4Addr, SocketAddr, ToSocketAddrs},
+    process::exit,
     sync::{Arc, Mutex},
 };
 
@@ -14,9 +15,9 @@ use tokio::{
 #[derive(clap::Parser)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
-    /// The server to connect to. Mediates peer-to-peer connections.
+    /// The server to connect to. Either an IP address or a hostname.
     #[arg(short, long)]
-    server_ip: Option<String>,
+    server_address: Option<String>,
 
     /// The server port to connect to.
     #[arg(short='p', long, default_value_t = file_yeet_shared::DEFAULT_PORT)]
@@ -36,17 +37,8 @@ async fn main() {
     use clap::Parser as _;
     let args = Cli::parse();
 
-    // TODO: Allow the using IPv6 and hostname server addresses.
-    let server_address: (Ipv4Addr, u16) = (
-        args.server_ip
-            .as_ref()
-            .filter(|s| !s.is_empty())
-            .map_or(Ipv4Addr::LOCALHOST, |s| {
-                s.parse().expect("Invalid IP address")
-            }),
-        args.server_port,
-    );
-    let (ip, port) = &server_address;
+    // Get the server address info.
+    let (server_address, hostname, port) = get_server_connection_info(&args);
 
     // File publishing.
     if args.listen {
@@ -58,7 +50,7 @@ async fn main() {
 
         // Create a TCP stream to the server.
         let server_stream = server_socket
-            .connect(server_address.into())
+            .connect(server_address)
             .await
             .expect("Failed to connect to server");
 
@@ -70,7 +62,7 @@ async fn main() {
 
         // Connect to the server's websocket and specify .
         let (mut socket, connect_response) =
-            tokio_tungstenite::client_async(format!("ws://{ip}:{port}/pub/6c1d798ec1c7cca4c62883807a9faf1623c02c26d8f03da5f4e6ae2322a72978"), server_stream)
+            tokio_tungstenite::client_async(format!("ws://{hostname}:{port}/pub/6c1d798ec1c7cca4c62883807a9faf1623c02c26d8f03da5f4e6ae2322a72978"), server_stream)
                 .await
                 .expect("Failed to connect to server");
         println!(
@@ -112,12 +104,14 @@ async fn main() {
         }
 
         #[allow(unreachable_code)]
-        {println!("Server websocket closed");}
+        {
+            println!("Server websocket closed");
+        }
     } else {
         // Query the server for the address of a peer that has the file.
         let server_connection = reqwest::Client::new();
         let response = match server_connection
-            .get(format!("http://{ip}:{port}/sub/6c1d798ec1c7cca4c62883807a9faf1623c02c26d8f03da5f4e6ae2322a72978"))
+            .get(format!("http://{hostname}:{port}/sub/6c1d798ec1c7cca4c62883807a9faf1623c02c26d8f03da5f4e6ae2322a72978"))
             .send().await {
                 Ok(response) => response,
                 Err(e) => {
@@ -250,6 +244,37 @@ async fn connect_to_peer(
             return;
         }
     }
+}
+
+/// Helper to get the best intended server address info given the defaults and CLI parameters.
+fn get_server_connection_info(args: &Cli) -> (SocketAddr, String, u16) {
+    let port = args.server_port;
+
+    // Parse the server address if one was specified.
+    args.server_address
+        .as_ref()
+        .iter()
+        .find_map(|s| {
+            if s.is_empty() {
+                None
+            } else {
+                match (s.as_str(), port).to_socket_addrs() {
+                    Ok(mut addrs) => addrs.next().map(|addr| (addr, (*s).to_owned(), port)),
+                    Err(e) => {
+                        // If the user specified a server address that we could not parse, exit.
+                        eprintln!("Failed to parse server address: {e}");
+                        exit(1);
+                    }
+                }
+            }
+        })
+        .unwrap_or_else(|| {
+            (
+                (Ipv4Addr::LOCALHOST, port).into(),
+                Ipv4Addr::LOCALHOST.to_string(),
+                port,
+            )
+        })
 }
 
 /// Test loop that reads from stdin to write to the peer, and reads from the peer to print to stdout.
