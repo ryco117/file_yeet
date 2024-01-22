@@ -18,6 +18,15 @@ Options:
   -V, --version                Print version
 ```
 
+#### Docker
+I've also created a docker container specific to the server to simplify the deployment of the file yeet servers to different machines and clouds.
+An official container build is available at `ryco117/file_yeet_server:latest`. However, a local container instance can be built with:
+```bash
+docker build -t file_yeet_server:local .
+```
+**Note**: The docker container must be run with `--net=host` to ensure that the container hass visibility of the client's IP address, instead of a docker intermediary.
+
+
 ### Client
 *TODO*
 
