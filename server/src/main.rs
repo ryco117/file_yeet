@@ -104,8 +104,7 @@ async fn main() {
             .and(warp::addr::remote())
             .and(warp::header::optional("X-Forwarded-For"))
             .and(get_clients)
-            .and_then(
-                move |hash_hex, client_socket, forwarded_for, clients| async move {
+            .and_then(|hash_hex, client_socket, forwarded_for, clients| async move {
                     // Ensure a client socket address can be determined, otherwise return an error.
                     let client_socket =
                         match determine_client_address(client_socket, &forwarded_for) {
