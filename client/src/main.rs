@@ -12,7 +12,7 @@ use tokio::{
     net::{TcpSocket, TcpStream},
 };
 use tokio_tungstenite::{
-    tungstenite::{http, Message},
+    tungstenite::{self, Message},
     WebSocketStream,
 };
 
@@ -87,24 +87,37 @@ async fn main() {
 
     // Attempt to connect to the server using websockets and pass the API request address.
     let response = tokio_tungstenite::client_async(request_address, server_stream).await;
-    if let Err(tokio_tungstenite::tungstenite::error::Error::Http(response)) = &response {
-        // Attempt to parse the response body as UTF-8.
-        let body = if let Some(bytes) = response.body() { std::str::from_utf8(bytes).ok() } else { None };
-        eprintln!(
-            "{} The server could not find a peer sharing this file: {:#} {:?}",
-            Local::now(),
-            response.status(),
-            body,
-        );
+    let (mut socket, connect_response) = match response {
+        Ok(response) => response,
+        Err(e) => {
+            // Attempt to parse the response body as UTF-8.
+            let body = if let tungstenite::error::Error::Http(response) = &e {
+                if let Some(bytes) = response.body() {
+                    std::str::from_utf8(bytes)
+                        .map(|body| (response.status(), body))
+                        .ok()
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
 
-        // Check if the server failed to create a websocket for a known reason.
-        if !args.listen && response.status() == http::StatusCode::NOT_FOUND {
-            return;
+            if let Some((status, body)) = body {
+                return eprintln!(
+                    "{} The server responded with an error: {status} {body}",
+                    Local::now(),
+                );
+            }
+            return eprintln!(
+                "{} The server could not find a peer sharing this file: {:?}",
+                Local::now(),
+                e,
+            );
         }
-    }
+    };
 
-    // Attempt to connect to the server using websockets and pass the API request address.
-    let (mut socket, connect_response) = response.expect("Failed to connect to server");
+    //let (mut socket, connect_response) = response.expect("Failed to connect to server");
     println!(
         "{} Websocket connection made to server with status: {:#}",
         Local::now(),
