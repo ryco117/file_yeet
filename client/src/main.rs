@@ -88,13 +88,17 @@ async fn main() {
     // Attempt to connect to the server using websockets and pass the API request address.
     let response = tokio_tungstenite::client_async(request_address, server_stream).await;
     if let Err(tokio_tungstenite::tungstenite::error::Error::Http(response)) = &response {
+        // Attempt to parse the response body as UTF-8.
+        let body = if let Some(bytes) = response.body() { std::str::from_utf8(bytes).ok() } else { None };
+        eprintln!(
+            "{} The server could not find a peer sharing this file: {:#} {:?}",
+            Local::now(),
+            response.status(),
+            body,
+        );
+
         // Check if the server failed to create a websocket for a known reason.
         if !args.listen && response.status() == http::StatusCode::NOT_FOUND {
-            eprintln!(
-                "{} The server could not find a peer sharing this file: {:#}",
-                Local::now(),
-                response.status()
-            );
             return;
         }
     }
@@ -147,7 +151,7 @@ async fn main() {
         // Connect to the peer and assign the peer `TcpStream` lock when connected.
         let peer_tcp = tcp_holepunch(&args, local_address, peer_address)
             .await
-            .expect("Failed to connect to peer");
+            .expect("TCP hole punching failed");
 
         // TODO: Perform some handshake with the peer to inform them of the size of the file we're sending.
         test_rwpl(peer_tcp).await;
