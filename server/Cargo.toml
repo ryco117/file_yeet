@@ -5,10 +5,12 @@ edition = "2021"
 license = "MIT"
 
 [dependencies]
-chrono = "0.4.31"
+anyhow = "1.0.79"
+chrono = "0.4.32"
 clap = { version = "4.4.18", features = ["derive"] }
 faster-hex = "0.9.0"
 file_yeet_shared = { path = "../shared" }
 futures-util = "0.3.30"
+thiserror = "1.0.56"
 tokio = { version = "1.35.1", features = ["full"] }
 warp = { version="0.3.6", features = ["tls"] }

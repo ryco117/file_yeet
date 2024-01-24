@@ -1,15 +1,19 @@
 use std::{
-    net::{Ipv4Addr, SocketAddr, ToSocketAddrs},
-    process::exit,
+    net::SocketAddr,
     sync::{Arc, Mutex},
 };
 
 use chrono::Local;
-use file_yeet_shared::MAX_PAYLOAD_SIZE;
+use file_yeet_shared::{SocketAddrHelper, MAX_PAYLOAD_SIZE};
 use futures_util::StreamExt;
+use net2::TcpBuilder;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpSocket, TcpStream},
+    net::{TcpSocket, TcpStream},
+};
+use tokio_tungstenite::{
+    tungstenite::{http, Message},
+    WebSocketStream,
 };
 
 #[derive(clap::Parser)]
@@ -38,63 +42,92 @@ async fn main() {
     let args = Cli::parse();
 
     // Get the server address info.
-    let (server_address, hostname, port) = get_server_connection_info(&args);
+    let SocketAddrHelper {
+        addr: server_address,
+        hostname,
+    } = file_yeet_shared::get_server_or_default(&args.server_address, args.server_port)
+        .expect("Failed to parse server address");
 
-    // File publishing.
-    if args.listen {
-        // Open a reusable socket address.
-        let server_socket = TcpSocket::new_v4().expect("Failed to create TCP socket");
-        server_socket
-            .set_reuseaddr(true)
-            .expect("Failed to set SO_REUSEADDR on the socket, necessary for TCP hole punching");
+    // Open a reusable socket address.
+    let server_socket = if server_address.is_ipv4() {
+        TcpSocket::new_v4().expect("Failed to create IPv4 TCP socket")
+    } else {
+        TcpSocket::new_v6().expect("Failed to create IPv6 TCP socket")
+    };
+    server_socket
+        .set_reuseaddr(true)
+        .expect("Failed to set SO_REUSEADDR on the socket, necessary for TCP hole punching");
 
-        // Create a TCP stream to the server.
-        let server_stream = server_socket
-            .connect(server_address)
-            .await
-            .expect("Failed to connect to server");
+    // Create a TCP stream to the server.
+    let server_stream = server_socket
+        .connect(server_address)
+        .await
+        .expect("Failed to connect to server");
+    println!(
+        "{} TCP connection made to server at socket {server_address:?}",
+        Local::now()
+    );
 
-        // Get our local network address as a string.
-        // Needed for rebinding to the same address that NATs will forward for the server stream.
-        let local_address = server_stream
-            .local_addr()
-            .expect("Could not determine our local address");
+    // Get our local network address as a string.
+    // Needed for rebinding to the same address that NATs will forward for the server stream.
+    let local_address = server_stream
+        .local_addr()
+        .expect("Could not determine our local address");
 
-        // Connect to the server's websocket and specify .
-        let (mut socket, connect_response) =
-            tokio_tungstenite::client_async(format!("ws://{hostname}:{port}/pub/6c1d798ec1c7cca4c62883807a9faf1623c02c26d8f03da5f4e6ae2322a72978"), server_stream)
-                .await
-                .expect("Failed to connect to server");
-        println!(
-            "Websocket connection made to server with status: {:?}",
-            connect_response.status()
-        );
+    // Get the URL for our API call.
+    let request_address = format!(
+        "ws://{hostname}:{}/{}/6c1d798ec1c7cca4c62883807a9faf1623c02c26d8f03da5f4e6ae2322a72978",
+        server_address.port(),
+        if args.listen { "pub" } else { "sub" }
+    );
+    println!(
+        "{} Requesting websocket connection to server at: {request_address}",
+        Local::now()
+    );
 
-        // Perform a sanity check to ensure the server is responsive and allows us to verify that the server can determine our public address.
-        let sanity_check = socket
-            .next()
-            .await
-            .expect("Could not read from server websocket");
-        match sanity_check {
-            Ok(message) => {
-                let sock: SocketAddr = message
-                    .to_text()
-                    .expect("Server did not send a TEXT response for the sanity check")
-                    .parse()
-                    .expect("Server did not send a valid socket address for the sanity check");
-                println!("Server sanity check passed, server connected to us at: {sock:?}");
-            }
-            Err(e) => {
-                eprintln!("Server sanity check failed: {e}");
-                return;
-            }
+    // Attempt to connect to the server using websockets and pass the API request address.
+    let response = tokio_tungstenite::client_async(request_address, server_stream).await;
+    if let Err(tokio_tungstenite::tungstenite::error::Error::Http(response)) = &response {
+        // Check if the server failed to create a websocket for a known reason.
+        if !args.listen && response.status() == http::StatusCode::NOT_FOUND {
+            eprintln!(
+                "{} The server could not find a peer sharing this file: {:#}",
+                Local::now(),
+                response.status()
+            );
+            return;
         }
+    }
 
-        // TODO: Read peer socket addresses from the server.
-        // while let Some(_message) = socket.next().await {
-        loop {
+    // Attempt to connect to the server using websockets and pass the API request address.
+    let (mut socket, connect_response) = response.expect("Failed to connect to server");
+    println!(
+        "{} Websocket connection made to server with status: {:#}",
+        Local::now(),
+        connect_response.status(),
+    );
+
+    // Perform a sanity check to ensure the server is responsive.
+    // Also, this allows us to verify that the server can determine our public address.
+    let sanity_check = expect_server_text(&mut socket).await;
+    let _: SocketAddr = sanity_check
+        .parse()
+        .expect("Server did not send a valid socket address for the sanity check");
+
+    if args.listen {
+        // Enter a loop to listen for incoming peer connections.
+        while let Some(message) = socket.next().await {
+            // Parse the response as a peer socket address or skip this message.
+            let peer_address = match try_recv_peer_address(message) {
+                Ok(addr) => addr,
+                Err(e) => {
+                    eprintln!("Failed to parse peer address: {e}");
+                    continue;
+                }
+            };
+
             // Listen for a peer and assign the peer `TcpStream` lock when connected.
-            let Some(peer_tcp) = tcp_holepunch(&args, Some(local_address), None).await else {
+            let Some(peer_tcp) = tcp_holepunch(&args, local_address, peer_address).await else {
                 eprintln!("Failed to connect to peer");
                 continue;
             };
@@ -103,37 +136,16 @@ async fn main() {
             test_rwpl(peer_tcp).await;
         }
 
-        #[allow(unreachable_code)]
-        {
-            println!("Server websocket closed");
-        }
+        println!("Server websocket closed");
     } else {
-        // Query the server for the address of a peer that has the file.
-        let server_connection = reqwest::Client::new();
-        let response = match server_connection
-            .get(format!("http://{hostname}:{port}/sub/6c1d798ec1c7cca4c62883807a9faf1623c02c26d8f03da5f4e6ae2322a72978"))
-            .send().await {
-                Ok(response) => response,
-                Err(e) => {
-                    eprintln!("Failed to query server for peer address: {e}");
-                    return;
-                }
-            };
-
-        // Parse the response body as a peer socket address.
-        let peer_address_string = match response.text().await {
-            Ok(peer_address) => peer_address,
-            Err(e) => {
-                eprintln!("Failed to parse server response as socket address: {e}");
-                return;
-            }
-        };
-        let peer_address = peer_address_string
+        // Parse the response as a peer socket address.
+        let peer_address = expect_server_text(&mut socket)
+            .await
             .parse::<SocketAddr>()
             .expect("Server did not send a valid socket address for the peer");
 
         // Connect to the peer and assign the peer `TcpStream` lock when connected.
-        let peer_tcp = tcp_holepunch(&args, None, Some(peer_address))
+        let peer_tcp = tcp_holepunch(&args, local_address, peer_address)
             .await
             .expect("Failed to connect to peer");
 
@@ -142,56 +154,92 @@ async fn main() {
     }
 }
 
+async fn expect_server_text(socket: &mut WebSocketStream<TcpStream>) -> String {
+    const SERVER_CLOSED_EARLY: &str = "Server closed our websocket before sending expected text";
+
+    socket
+        .next()
+        .await
+        .expect(SERVER_CLOSED_EARLY)
+        .expect(SERVER_CLOSED_EARLY)
+        .into_text()
+        .expect("Server did not send a TEXT response")
+}
+
+/// Helper to attempt to parse a websocket message as a peer socket address in text.
+fn try_recv_peer_address(
+    response: Result<Message, tokio_tungstenite::tungstenite::error::Error>,
+) -> anyhow::Result<SocketAddr> {
+    // Attempt to receive a peer's socket address as text from the server.
+    Ok(response?.to_text()?.parse()?)
+}
+
 /// Attempt to connect to peer using TCP hole punching.
 async fn tcp_holepunch(
-    _args: &Cli,
-    local_address: Option<SocketAddr>,
-    peer_address: Option<SocketAddr>,
+    args: &Cli,
+    local_address: SocketAddr,
+    peer_address: SocketAddr,
 ) -> Option<TcpStream> {
     // Create a lock for where we will place the TCP stream used to communicate with our peer.
-    let peer_stream_lock: Arc<Mutex<Option<TcpStream>>> = Arc::default();
+    let peer_reached_lock: Arc<Mutex<bool>> = Arc::default();
 
     // TODO: Allow concurrent listening and connecting since it may be necessary for some TCP hole punching scenarios.
 
-    // Allow the caller to optionally listen during the TCP hole punching process.
-    if let Some(local_addr) = local_address {
-        // Spawn a thread that listens for a peer and will assign the peer `TcpStream` lock when connected.
-        listen_for_peer_async(local_addr, peer_stream_lock.clone()).await;
-    }
+    // Spawn a thread that listens for a peer and will assign the peer `TcpStream` lock when connected.
+    let peer_reached_listen = peer_reached_lock.clone();
+    let listen_future = tokio::time::timeout(
+        std::time::Duration::from_millis(5_000),
+        tokio::task::spawn_blocking(move || {
+            listen_for_peer_async(local_address, &peer_reached_listen)
+        }),
+    );
 
-    // Allow the caller to optionally attempt connections to the peer's public address.
-    if let Some(peer_address_string) = peer_address {
-        // Attempt to connect to the peer's public address.
-        connect_to_peer(peer_address_string, &peer_stream_lock).await;
-    }
+    // Attempt to connect to the peer's public address.
+    let connect_future = connect_to_peer(peer_address, &peer_reached_lock);
 
     // Return the peer stream if we have one.
-    let peer_stream = peer_stream_lock
-        .lock()
-        .expect("Could not obtain the mutex lock")
-        .take()
-        .unwrap();
-    Some(peer_stream)
+    let (listen_stream, connect_stream) = futures_util::join!(listen_future, connect_future);
+    let listen_stream = listen_stream.ok().and_then(Result::ok);
+    match u32::from(listen_stream.is_some()) + u32::from(connect_stream.is_some()) {
+        0 => None,
+        1 => listen_stream.or(connect_stream),
+        2 => {
+            // TODO: It could be interesting and possible to create a more general stream negotiation.
+            //       For example, if each peer sent a random nonce over each stream, and the nonces were XOR'd per stream,
+            //       the result could be used to determine which stream to use (highest/lowest resulting nonce after XOR).
+            if args.listen {
+                listen_stream
+            } else {
+                connect_stream
+            }
+        }
+        _ => unreachable!("Not possible to have more than two streams"),
+    }
 }
 
 /// Spawn a thread that listens for a peer and will assign the peer `TcpStream` lock when connected.
-async fn listen_for_peer_async(
-    local_addr: SocketAddr,
-    peer_stream_lock: Arc<Mutex<Option<TcpStream>>>,
-) {
+fn listen_for_peer_async(
+    local_address: SocketAddr,
+    peer_reached_lock: &Arc<Mutex<bool>>,
+) -> TcpStream {
     // Print and create binding from the local address.
     println!(
-        "{} Binding to the same local address connected to the server: {local_addr}",
+        "{} Listening on the same local address connected to the server: {local_address}",
         Local::now()
     );
-    let binding = TcpListener::bind(local_addr)
-        .await
+    let builder = tcp_builder(local_address.ip());
+    builder
+        .reuse_address(true)
+        .expect("Failed to set SO_REUSEADDR on the socket")
+        .bind(local_address)
         .expect("Failed to bind to our local address");
 
     // Accept a peer connection.
-    let (peer_listening_stream, peer_addr) = binding
+    // TODO: Refactor to allow publisher to have a long-lived listening stream.
+    let (peer_listening_stream, peer_addr) = builder
+        .listen(1)
+        .expect("Failed to listen on socket")
         .accept()
-        .await
         .expect("Failed to accept incoming connection");
 
     // Connected to a peer on the listening stream, print their address.
@@ -201,80 +249,55 @@ async fn listen_for_peer_async(
     );
 
     // Set the peer stream lock to the listening stream if there isn't already one present.
-    peer_stream_lock
+    *peer_reached_lock
         .lock()
-        .expect("Could not obtain the mutex lock")
-        .get_or_insert(peer_listening_stream);
+        .expect("Could not obtain the mutex lock") = true;
+
+    TcpStream::from_std(peer_listening_stream)
+        .expect("Failed to convert std::net::TcpStream to tokio::net::TcpStream")
 }
 
 /// Try to connect to a peer at the given address.
 async fn connect_to_peer(
     peer_address: SocketAddr,
-    peer_stream_lock: &Arc<Mutex<Option<TcpStream>>>,
-) {
+    peer_reached_lock: &Arc<Mutex<bool>>,
+) -> Option<TcpStream> {
     // Set a sane number of connection retries.
     let mut retries = MAX_CONNECTION_RETRIES;
 
     // Ensure we have retries left and there isn't already a peer `TcpStream` to use.
     loop {
-        // TODO: Support IPv6.
         match TcpStream::connect(peer_address).await {
             Ok(stream) => {
                 println!("{} Connected to peer at: {peer_address}", Local::now());
 
                 // Set the peer mutex to the connected stream if there isn't already one present.
-                let _ = peer_stream_lock
+                *peer_reached_lock
                     .lock()
-                    .expect("Could not obtain the mutex lock")
-                    .get_or_insert(stream);
-                return;
+                    .expect("Could not obtain the mutex lock") = true;
+                return Some(stream);
             }
             Err(e) => {
-                eprintln!("Failed to connect to peer: {e}");
+                eprintln!("{} Failed to connect to peer: {e}", Local::now());
                 retries -= 1;
             }
         }
 
         if retries == 0
-            || peer_stream_lock
+            || *peer_reached_lock
                 .lock()
                 .expect("Could not obtain the mutex lock")
-                .is_some()
         {
-            return;
+            return None;
         }
     }
 }
 
-/// Helper to get the best intended server address info given the defaults and CLI parameters.
-fn get_server_connection_info(args: &Cli) -> (SocketAddr, String, u16) {
-    let port = args.server_port;
-
-    // Parse the server address if one was specified.
-    args.server_address
-        .as_ref()
-        .iter()
-        .find_map(|s| {
-            if s.is_empty() {
-                None
-            } else {
-                match (s.as_str(), port).to_socket_addrs() {
-                    Ok(mut addrs) => addrs.next().map(|addr| (addr, (*s).to_owned(), port)),
-                    Err(e) => {
-                        // If the user specified a server address that we could not parse, exit.
-                        eprintln!("Failed to parse server address: {e}");
-                        exit(1);
-                    }
-                }
-            }
-        })
-        .unwrap_or_else(|| {
-            (
-                (Ipv4Addr::LOCALHOST, port).into(),
-                Ipv4Addr::LOCALHOST.to_string(),
-                port,
-            )
-        })
+fn tcp_builder(bind_address: std::net::IpAddr) -> TcpBuilder {
+    match bind_address {
+        std::net::IpAddr::V4(_) => TcpBuilder::new_v4().expect("Failed to create IPv4 TCP socket"),
+        std::net::IpAddr::V6(_) => TcpBuilder::new_v6().expect("Failed to create IPv6 TCP socket"),
+    }
 }
 
 /// Test loop that reads from stdin to write to the peer, and reads from the peer to print to stdout.

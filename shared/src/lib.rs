@@ -1,4 +1,4 @@
-use std::{net::TcpStream, num::NonZeroUsize};
+use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs as _};
 
 /// Magic number for the default port.
 pub const DEFAULT_PORT: u16 = 7828;
@@ -6,60 +6,46 @@ pub const DEFAULT_PORT: u16 = 7828;
 /// Define a sane maximum payload size for the client.
 pub const MAX_PAYLOAD_SIZE: usize = 1024;
 
-/// The error type when reading from a TCP stream with `read_stream(...)`.
-#[derive(Debug)]
-pub enum ReadStreamError {
-    /// The TCP stream has been closed.
-    ConnectionClosed,
+// TODO: Create a custom `chrono` datetime format
 
-    /// Error reading from stream. Guaranteed not to be `WouldBlock`.
-    IoError(std::io::Error),
+/// A helper to access often used socket address info.
+pub struct SocketAddrHelper {
+    pub addr: SocketAddr,
+    pub hostname: String,
 }
 
-/// Helper to read a positive number of bytes from a TCP or safely return an error.
+/// Helper to get either the socket address corresponding to the user's input, or the default of IPv4 localhost.
 ///
 /// # Errors
-/// * Returns a `ReadStreamError::ConnectionClosed` if the TCP stream has been closed.
-/// * Returns a `ReadStreamError::IoError` if an error occurs while reading from the stream. Guaranteed not to be `WouldBlock`.
-pub fn read_stream(
-    stream: &mut TcpStream,
-    buf: &mut [u8],
-) -> Result<NonZeroUsize, ReadStreamError> {
-    use std::io::Read as _;
-    loop {
-        let size = match stream.read(buf) {
-            // If we successfully got a number of bytes read, check that it is non-zero.
-            Ok(size) => {
-                match NonZeroUsize::try_from(size) {
-                    // Return the valid buffer size.
-                    Ok(size) => size,
-
-                    // Zero bytes indicates that the TCP stream has been closed.
-                    Err(_) => return Err(ReadStreamError::ConnectionClosed),
+/// If there is `Some(..)` non-empty server address, then it must be of the format `hostname:port`
+/// to be able to parse into a socket address using `ToSocketAddrs`. If the address cannot be parsed, it will
+/// fail with a `std::io::Error` instead of using the default.
+pub fn get_server_or_default(
+    server_address: &Option<String>,
+    port: u16,
+) -> Result<SocketAddrHelper, std::io::Error> {
+    // Parse the server address if one was specified.
+    server_address
+        .iter()
+        .find_map(|s| {
+            if s.is_empty() {
+                None
+            } else {
+                match (s.as_str(), port).to_socket_addrs() {
+                    Ok(mut addrs) => addrs.next().map(|addr| {
+                        Ok(SocketAddrHelper {
+                            addr,
+                            hostname: s.clone(),
+                        })
+                    }),
+                    Err(e) => Some(Err(e)),
                 }
             }
-            Err(e) => {
-                match e.kind() {
-                    // If we're not ready to read, just continue.
-                    std::io::ErrorKind::WouldBlock => continue,
-
-                    // Otherwise, something went wrong.
-                    _ => return Err(ReadStreamError::IoError(e)),
-                }
-            }
-        };
-
-        return Ok(size);
-    }
+        })
+        .unwrap_or_else(|| {
+            Ok(SocketAddrHelper {
+                addr: (Ipv4Addr::LOCALHOST, port).into(),
+                hostname: Ipv4Addr::LOCALHOST.to_string(),
+            })
+        })
 }
-
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-
-//     #[test]
-//     fn it_works() {
-//         let result = add(2, 2);
-//         assert_eq!(result, 4);
-//     }
-// }
