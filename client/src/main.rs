@@ -401,10 +401,19 @@ async fn test_rwpl(peer_connection: quinn::Connection, open: bool) {
     let mut buf = [0; MAX_PAYLOAD_SIZE];
 
     let (mut peer_send, mut peer_recv) = if open {
-        peer_connection
+        let mut streams = peer_connection
             .open_bi()
             .await
-            .expect("Failed to open a bi-directional QUIC stream to the peer")
+            .expect("Failed to open a bi-directional QUIC stream to the peer");
+
+        // The receiver will not know about the new stream request until data is sent.
+        // Thus, we send a hello packet to initialize the stream.
+        streams.0
+            .write_all("Hello peer!\n".as_bytes())
+            .await
+            .expect("Failed to write to peer stream");
+
+        streams
     } else {
         peer_connection
             .accept_bi()
@@ -412,14 +421,8 @@ async fn test_rwpl(peer_connection: quinn::Connection, open: bool) {
             .expect("Failed to accept a bi-directional QUIC stream to the peer")
     };
 
+    // Let the user know that the handshake is complete. Bi-directional streams are ready to use.
     println!("{} Peer connection established", Local::now());
-    if open {
-        // Streams are not created until data is sent.
-        peer_send
-            .write_all(b"Hello peer!")
-            .await
-            .expect("Failed to write to peer stream");
-    }
 
     // Testing.
     loop {
