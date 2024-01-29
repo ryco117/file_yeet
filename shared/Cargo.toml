@@ -7,3 +7,9 @@ license = "MIT"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+anyhow = "1.0.79"
+num_enum = "0.7.2"
+quinn = "0.10.2"
+rcgen = "0.12.1"
+rustls = { version = "0.21.10", features = ["dangerous_configuration", "quic"] }
+thiserror = "1.0.56"
