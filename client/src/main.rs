@@ -23,6 +23,11 @@ struct Cli {
     #[arg(short = 'o', long)]
     port_override: Option<u16>,
 
+    /// The IP address of local gateway to use when attempting the Port Control Protocol.
+    /// If not specified, a default gateway will be searched for.
+    #[arg(short, long)]
+    gateway: Option<String>,
+
     /// When enabled the client will listen for incoming peer connections.
     #[arg(short, long)]
     listen: bool,
@@ -40,66 +45,9 @@ async fn main() {
     use clap::Parser as _;
     let args = Cli::parse();
 
-    // Create a self-signed certificate for the peer communications.
-    let (server_cert, server_key) = file_yeet_shared::generate_self_signed_cert()
-        .expect("Failed to generate self-signed certificate");
-    let mut server_config = quinn::ServerConfig::with_single_cert(vec![server_cert], server_key)
-        .expect("Quinn failed to accept the server certificates");
-
-    // Set custom keep alive policies.
-    server_config.transport_config(file_yeet_shared::server_transport_config());
-
-    // Create our QUIC endpoint. Use an unspecified address and port since we don't have any preference.
-    let mut endpoint = quinn::Endpoint::server(
-        server_config,
-        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
-    )
-    .expect("Failed to open QUIC endpoint");
-
-    // Use an insecure client configuration when connecting to peers.
-    // TODO: Use a secure client configuration when connecting to the server.
-    endpoint.set_default_client_config(file_yeet_shared::configure_peer_verification());
-
     // Connect to the public file_yeet_server.
-    let (connection, local_address) = connect_to_server(&args, &endpoint).await;
-
-    // Create a bi-directional stream to the server.
-    let (mut server_send, mut server_recv) = connection
-        .open_bi()
-        .await
-        .expect("Failed to open a bi-directional QUIC stream to the server");
-
-    // Perform a sanity check by sending the server a socket ping request.
-    // This allows us to verify that the server can determine our public address.
-    server_send
-        .write_u16(file_yeet_shared::ClientApiRequest::SocketPing as u16)
-        .await
-        .expect("Failed to send a socket ping request to the server");
-
-    // Read the server's response to the sanity check.
-    let string_len = server_recv
-        .read_u16()
-        .await
-        .expect("Failed to read a u16 response from the server");
-    let sanity_check = expect_server_text(&mut server_recv, string_len)
-        .await
-        .expect("Failed to read a valid socket address from the server");
-    let _: SocketAddr = sanity_check
-        .parse()
-        .expect("Server did not send a valid socket address for the sanity check");
-    println!("{} Server sees us as {sanity_check}", Local::now());
-
-    if let Some(port) = args.port_override {
-        // Send the server a port override request.
-        server_send
-            .write_u16(file_yeet_shared::ClientApiRequest::PortOverride as u16)
-            .await
-            .expect("Failed to send a port override request to the server");
-        server_send
-            .write_u16(port)
-            .await
-            .expect("Failed to send the port override to the server");
-    }
+    let (endpoint, mut server_send, mut server_recv, _port_mapping) =
+        prepare_server_connection(&args).await;
 
     if args.listen {
         // Send the server a publish request.
@@ -161,8 +109,15 @@ async fn main() {
             };
 
             // Listen for a peer and assign the peer `TcpStream` lock when connected.
-            let Some(peer_tcp) =
-                tcp_holepunch(&args, endpoint.clone(), local_address, peer_address).await
+            let Some(peer_tcp) = tcp_holepunch(
+                &args,
+                endpoint.clone(),
+                endpoint
+                    .local_addr()
+                    .expect("Could not determine our local IP"),
+                peer_address,
+            )
+            .await
             else {
                 eprintln!("{} Failed to connect to peer", Local::now());
                 continue;
@@ -215,6 +170,9 @@ async fn main() {
             .expect("Server did not send a valid socket address for the peer");
 
         // Connect to the peer and assign the peer `TcpStream` lock when connected.
+        let local_address = endpoint
+            .local_addr()
+            .expect("Could not determine our local IP");
         let peer_tcp = tcp_holepunch(&args, endpoint, local_address, peer_address)
             .await
             .expect("TCP hole punching failed");
@@ -224,26 +182,130 @@ async fn main() {
     }
 }
 
-/// Connect to the server using QUIC.
-async fn connect_to_server(
+async fn prepare_server_connection(
     args: &Cli,
-    endpoint: &quinn::Endpoint,
-) -> (quinn::Connection, SocketAddr) {
+) -> (
+    quinn::Endpoint,
+    quinn::SendStream,
+    quinn::RecvStream,
+    Option<crab_nat::PortMapping>,
+) {
+    // Create a self-signed certificate for the peer communications.
+    let (server_cert, server_key) = file_yeet_shared::generate_self_signed_cert()
+        .expect("Failed to generate self-signed certificate");
+    let mut server_config = quinn::ServerConfig::with_single_cert(vec![server_cert], server_key)
+        .expect("Quinn failed to accept the server certificates");
+
+    // Set custom keep alive policies.
+    server_config.transport_config(file_yeet_shared::server_transport_config());
+
+    // Create our QUIC endpoint. Use an unspecified address and port since we don't have any preference.
+    let mut endpoint = quinn::Endpoint::server(
+        server_config,
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
+    )
+    .expect("Failed to open QUIC endpoint");
+
+    // Share debug information about the QUIC endpoints.
+    let mut local_address = endpoint
+        .local_addr()
+        .expect("Failed to get the local address of our QUIC endpoint");
+    if local_address.ip().is_unspecified() {
+        local_address.set_ip(
+            default_net::interface::get_local_ipaddr().expect("Failed to get our local address"),
+        );
+    }
+    println!(
+        "{} QUIC endpoint created with address: {local_address}",
+        Local::now()
+    );
+
+    // Attempt to get a port forwarding, starting with user's override and then attempting the Port Control Protocol.
+    let gateway = if let Some(g) = args.gateway.as_ref() {
+        g.parse().expect("Failed to parse gateway address")
+    } else {
+        default_net::get_default_gateway()
+            .expect("Failed to get the default gateway")
+            .ip_addr
+    };
+    let (port_mapping, port_override) = if let Some(p) = args.port_override {
+        (None, Some(p))
+    } else if let Ok(m) = crab_nat::try_port_mapping(
+        gateway,
+        local_address.ip(),
+        crab_nat::InternetProtocol::Udp,
+        local_address.port(),
+        None,
+        None,
+    )
+    .await
+    {
+        let p = m.external_port;
+        println!(
+            "{} Success mapping external port {p} -> internal {}",
+            Local::now(),
+            m.internal_port
+        );
+        (Some(m), Some(p))
+    } else {
+        (None, None)
+    };
+
+    // Use an insecure client configuration when connecting to peers.
+    // TODO: Use a secure client configuration when connecting to the server.
+    endpoint.set_default_client_config(file_yeet_shared::configure_peer_verification());
+    // Connect to the public file_yeet_server.
+    let connection = connect_to_server(args, &endpoint).await;
+
+    // Create a bi-directional stream to the server.
+    let (mut server_send, mut server_recv) = connection
+        .open_bi()
+        .await
+        .expect("Failed to open a bi-directional QUIC stream to the server");
+
+    // Perform a sanity check by sending the server a socket ping request.
+    // This allows us to verify that the server can determine our public address.
+    server_send
+        .write_u16(file_yeet_shared::ClientApiRequest::SocketPing as u16)
+        .await
+        .expect("Failed to send a socket ping request to the server");
+
+    // Read the server's response to the sanity check.
+    let string_len = server_recv
+        .read_u16()
+        .await
+        .expect("Failed to read a u16 response from the server");
+    let sanity_check = expect_server_text(&mut server_recv, string_len)
+        .await
+        .expect("Failed to read a valid socket address from the server");
+    let _: SocketAddr = sanity_check
+        .parse()
+        .expect("Server did not send a valid socket address for the sanity check");
+    println!("{} Server sees us as {sanity_check}", Local::now());
+
+    if let Some(port) = port_override {
+        // Send the server a port override request.
+        server_send
+            .write_u16(file_yeet_shared::ClientApiRequest::PortOverride as u16)
+            .await
+            .expect("Failed to send a port override request to the server");
+        server_send
+            .write_u16(port)
+            .await
+            .expect("Failed to send the port override to the server");
+    }
+
+    (endpoint, server_send, server_recv, port_mapping)
+}
+
+/// Connect to the server using QUIC.
+async fn connect_to_server(args: &Cli, endpoint: &quinn::Endpoint) -> quinn::Connection {
     // Get the server address info.
     let SocketAddrHelper {
         addr: server_address,
         hostname,
     } = file_yeet_shared::get_server_or_default(&args.server_address, args.server_port)
         .expect("Failed to parse server address");
-
-    // Share debug information about the QUIC endpoints.
-    let local_address = endpoint
-        .local_addr()
-        .expect("Failed to get the local address of our QUIC endpoint");
-    println!(
-        "{} QUIC endpoint created with address: {local_address}",
-        Local::now()
-    );
     println!(
         "{} Connecting to server {hostname} at socket address: {server_address}",
         Local::now()
@@ -256,7 +318,7 @@ async fn connect_to_server(
         .await
         .expect("Failed to establish a QUIC connection to the server");
     println!("{} QUIC connection made to the server", Local::now());
-    (connection, local_address)
+    connection
 }
 
 /// Read a valid UTF-8 from the server until
@@ -408,7 +470,8 @@ async fn test_rwpl(peer_connection: quinn::Connection, open: bool) {
 
         // The receiver will not know about the new stream request until data is sent.
         // Thus, we send a hello packet to initialize the stream.
-        streams.0
+        streams
+            .0
             .write_all("Hello peer!\n".as_bytes())
             .await
             .expect("Failed to write to peer stream");
