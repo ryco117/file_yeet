@@ -17,8 +17,6 @@ pub type HashBytes = [u8; 32];
 
 pub const QUIC_TIMEOUT_SECONDS: u64 = 120;
 
-// TODO: Create a custom `chrono` datetime format
-
 /// A helper to access often used socket address info.
 pub struct SocketAddrHelper {
     pub addr: SocketAddr,
@@ -39,11 +37,11 @@ pub enum ClientApiRequest {
 impl std::fmt::Display for ClientApiRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let str = match self {
-            ClientApiRequest::EmptyPing => "EMPTY_PING",
-            ClientApiRequest::SocketPing => "SOCKET_PING",
+            ClientApiRequest::EmptyPing => "EMPTY_PING   ",
+            ClientApiRequest::SocketPing => "SOCKET_PING  ",
             ClientApiRequest::PortOverride => "PORT_OVERRIDE",
-            ClientApiRequest::Publish => "PUBLISH",
-            ClientApiRequest::Subscribe => "SUBSCRIBE",
+            ClientApiRequest::Publish => "PUBLISH      ",
+            ClientApiRequest::Subscribe => "SUBSCRIBE    ",
         };
         write!(f, "REQ: {str}")
     }
@@ -88,6 +86,13 @@ pub fn get_server_or_default(
                 hostname: Ipv4Addr::LOCALHOST.to_string(),
             })
         })
+}
+
+/// Get the current local time in a human-readable, fixed length format.
+#[must_use]
+pub fn local_now_fmt() -> chrono::format::DelayedFormat<chrono::format::StrftimeItems<'static>> {
+    // E.g., "2024-02-06 22:01:04.913"
+    chrono::Local::now().format("%F %T%.3f")
 }
 
 /// Set reasonable transport config defaults for the server as well as peers when receiving connections.

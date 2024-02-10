@@ -6,12 +6,12 @@ license = "MIT"
 
 [dependencies]
 anyhow = "1.0.79"
-chrono = "0.4.33"
+bytes = "1.5.0"
 clap = { version = "4.4.18", features = ["derive"] }
-crab_nat = "0.2.0"
+crab_nat = "0.4.0"
 default-net = "0.21.0"
 file_yeet_shared = { path = "../shared" }
 futures-util = "0.3.30"
 quinn = "0.10.2"
 rustls = { version = "0.21.10", features = ["dangerous_configuration", "quic"] }
-tokio = "1.35.1"
+tokio = { version = "1.35.1", features = ["macros", "net", "rt-multi-thread"] }

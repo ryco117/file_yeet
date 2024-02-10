@@ -1,8 +1,11 @@
 use std::{collections::HashMap, sync::Arc};
 
-use chrono::Local;
+use bytes::BufMut as _;
 use clap::Parser;
-use file_yeet_shared::{ClientApiRequest, HashBytes, SocketAddrHelper, MAX_PAYLOAD_SIZE};
+use file_yeet_shared::{
+    local_now_fmt, ClientApiRequest, HashBytes, SocketAddrHelper, MAX_PAYLOAD_SIZE,
+};
+use smallvec::SmallVec;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     sync::{mpsc, RwLock},
@@ -27,11 +30,8 @@ struct Cli {
     bind_port: u16,
 }
 
-/// The type for mapping between file hashes and the addresses of connected peers that are publishing the file.
-#[derive(Default, Clone)]
-struct PublishersRef {
-    pub lock: Arc<RwLock<HashMap<HashBytes, Client>>>,
-}
+/// A mapping between file hashes and the addresses of connected peers that are publishing the file.
+type PublishersRef = Arc<RwLock<HashMap<HashBytes, SmallVec<[Client; 3]>>>>;
 
 #[tokio::main]
 async fn main() {
@@ -46,7 +46,7 @@ async fn main() {
         .expect("Failed to parse server address");
 
     // Print out the address we're going to bind to.
-    println!("{} Using bind address: {bind_address:?}", Local::now());
+    println!("{} Using bind address: {bind_address:?}", local_now_fmt());
 
     // Create a self-signed certificate for the peer communications.
     let (server_cert, server_key) = file_yeet_shared::generate_self_signed_cert()
@@ -72,7 +72,10 @@ async fn main() {
         let publishers = publishers.clone();
         tokio::spawn(async {
             if let Err(e) = handle_quic_connection(connecting, publishers).await {
-                eprintln!("{} Failed to handle client connection: {e}", Local::now());
+                eprintln!(
+                    "{} Failed to handle client connection: {e}",
+                    local_now_fmt()
+                );
             }
         });
     }
@@ -100,21 +103,23 @@ async fn handle_quic_connection(
     let socket_addr = connection.remote_address();
     let mut sock_string = socket_addr.to_string();
     let (mut quic_send, mut quic_recv) = connection.accept_bi().await?;
+    let mut bb = bytes::BytesMut::with_capacity(MAX_PAYLOAD_SIZE);
 
     loop {
         let api = ClientApiRequest::try_from(quic_recv.read_u16().await?)?;
-        println!("{} {api} from {sock_string}", Local::now());
+        println!("{} {api} from {sock_string}", local_now_fmt());
 
         match api {
             ClientApiRequest::EmptyPing => {}
             ClientApiRequest::SocketPing => {
-                quic_send
-                    .write_u16(
-                        u16::try_from(sock_string.len())
-                            .expect("Message content length is invalid"),
-                    )
-                    .await?;
-                quic_send.write_all(sock_string.as_bytes()).await?;
+                // Format the ping response as a length and UTF-8 string.
+                bb.put_u16(
+                    u16::try_from(sock_string.len()).expect("Message content length is invalid"),
+                );
+                bb.put(sock_string.as_bytes());
+
+                // Send the ping response to the client.
+                quic_send.write_all(&bb).await?;
             }
             ClientApiRequest::PortOverride => {
                 let port = quic_recv
@@ -127,7 +132,7 @@ async fn handle_quic_connection(
                     a.set_port(port);
                     a.to_string()
                 };
-                println!("{} Overriding port to {port}", Local::now());
+                println!("{} Overriding port to {port}", local_now_fmt());
             }
             ClientApiRequest::Publish => {
                 let mut hash = HashBytes::default();
@@ -138,12 +143,13 @@ async fn handle_quic_connection(
 
                 // Now that we have the peer's socket address and the file hash, we can handle the publish request.
                 if let Err(e) =
-                    handle_publish(connection, quic_send, sock_string, hash, publishers).await
+                    handle_publish(connection, quic_send, sock_string, hash, publishers, bb).await
                 {
-                    eprintln!("{} Failed to handle publish request: {e}", Local::now());
+                    eprintln!("{} Failed to handle publish request: {e}", local_now_fmt());
                 }
 
                 // Terminate our connection with the client.
+                // TODO: Consider allowing the client to publish more than one file hash, or subscribe simultaneously to a file.
                 return Ok(());
             }
             ClientApiRequest::Subscribe => {
@@ -154,14 +160,22 @@ async fn handle_quic_connection(
                     .map(|()| ClientRequestError::SubHashBytes)?;
 
                 // Now that we have the peer's socket address and the file hash, we can handle the subscribe request.
-                if let Err(e) = handle_subscribe(quic_send, sock_string, hash, publishers).await {
-                    eprintln!("{} Failed to handle subscribe request: {e}", Local::now());
+                if let Err(e) = handle_subscribe(quic_send, sock_string, hash, publishers, bb).await
+                {
+                    eprintln!(
+                        "{} Failed to handle subscribe request: {e}",
+                        local_now_fmt()
+                    );
                 }
 
                 // Terminate our connection with the client.
+                // TODO: Consider allowing the client to subscribe to more than one file hash, or publish simultaneously.
                 return Ok(());
             }
         }
+        // Clear the scratch space before the next iteration.
+        // This is a low cost operation because it only changes an internal index value.
+        bb.clear();
     }
 }
 
@@ -172,6 +186,7 @@ async fn handle_publish(
     sock_string: String,
     hash: HashBytes,
     clients: PublishersRef,
+    mut bb: bytes::BytesMut,
 ) -> anyhow::Result<()> {
     // Use a channel to handle buffering and flushing of messages.
     // Ensures that the stream doesn't need to be cloned or passed between threads.
@@ -179,21 +194,21 @@ async fn handle_publish(
     let sock_string_clone = sock_string.clone();
     tokio::task::spawn(async move {
         while let Some(message) = rx.recv().await {
-            if let Err(e) = quic_send
-                .write_u16(u16::try_from(message.len()).expect("Message content length is invalid"))
-                .await
-            {
-                eprintln!("{} Failed to send message to client: {e}", Local::now());
+            // Format the message as a length and UTF-8 string.
+            bb.put_u16(u16::try_from(message.len()).expect("Message content length is invalid"));
+            bb.put(message.as_bytes());
+
+            // Try to send the message to the client.
+            if let Err(e) = quic_send.write_all(&bb).await {
+                eprintln!("{} Failed to send message to client: {e}", local_now_fmt());
                 break;
             }
-            if let Err(e) = quic_send.write_all(message.as_bytes()).await {
-                eprintln!("{} Failed to send message to client: {e}", Local::now());
-                break;
-            }
+            // Clear the scratch space before the next iteration.
+            bb.clear();
         }
         println!(
             "{} Closed forwarding thread for client {sock_string_clone}",
-            Local::now()
+            local_now_fmt()
         );
     });
 
@@ -203,21 +218,26 @@ async fn handle_publish(
         stream: tx,
     };
 
-    // Add the client to the map of clients.
-    // TODO: If there is already a client for this hash, perhaps multple clients can be stored for a file hash.
-    if let Some(old_client) = clients.lock.write().await.insert(hash, client) {
-        println!("{} Replaced client: {}", Local::now(), old_client.address);
+    // Add the client to a list of peers publishing this hash.
+    let mut clients_lock = clients.write().await;
+    if let Some(client_list) = clients_lock.get_mut(&hash) {
+        client_list.push(client);
+    } else {
+        clients_lock.insert(hash, smallvec::smallvec![client]);
     }
 
     // Wait for the client to close the connection.
     let closed_reason = connection.closed().await;
     println!(
         "{} Client disconnected: {sock_string} {closed_reason:?}",
-        Local::now()
+        local_now_fmt()
     );
 
-    // TODO: Handle different client addresses for one file hash.
-    clients.lock.write().await.remove(&hash);
+    // Remove the client from the list of peers publishing this hash.
+    // TODO: Consider identifying clients by a unique ID in case of address collisions.
+    if let Some(clients_list) = clients.write().await.get_mut(&hash) {
+        clients_list.retain(|c| c.address != sock_string);
+    }
 
     Ok(())
 }
@@ -228,17 +248,25 @@ async fn handle_subscribe(
     sock_string: String,
     hash: HashBytes,
     clients: PublishersRef,
+    mut bb: bytes::BytesMut,
 ) -> anyhow::Result<()> {
     // Attempt to get the client from the map.
-    let read_lock = clients.lock.read().await;
-    let Some(pub_client) = read_lock.get(&hash) else {
-        eprintln!("{} Failed to find client for hash", Local::now());
+    let read_lock = clients.read().await;
+    let Some(client_list) = read_lock.get(&hash).filter(|v| !v.is_empty()) else {
+        println!(
+            "{} Failed to find client for hash {hash:x?}",
+            local_now_fmt()
+        );
 
-        // TODO: Allow a client to wait for a publishing peer to become available.
+        // Send the subscriber a message that no publishers are available.
         quic_send.write_u16(0).await?;
+
+        // TODO: Allow a client to wait for a publishing peer to become available instead of closing stream.
         quic_send.finish().await?;
         return Ok(());
     };
+    // TODO: Allow sending more than one client address for a file hash.
+    let pub_client = client_list.iter().next().unwrap();
 
     // Feed the publishing client socket address to the task that handles communicating with this client.
     pub_client
@@ -249,8 +277,11 @@ async fn handle_subscribe(
 
     // Send the publisher's socket address to the subscribing client.
     let n = u16::try_from(pub_client.address.len()).expect("Message content length is invalid");
-    quic_send.write_u16(n).await?;
-    quic_send.write_all(pub_client.address.as_bytes()).await?;
+    bb.put_u16(n);
+    bb.put(pub_client.address.as_bytes());
+
+    // Send the message to the client and close the stream.
+    quic_send.write_all(&bb).await?;
     quic_send.finish().await?;
 
     Ok(())
