@@ -1,11 +1,19 @@
 use std::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use bytes::BufMut as _;
 use file_yeet_shared::{local_now_fmt, HashBytes, SocketAddrHelper, MAX_PAYLOAD_SIZE};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use sha2::{Digest as _, Sha256};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+
+/// Use a sane default timeout for server connections.
+const SERVER_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Define a sane number of maximum retries.
+const MAX_PEER_CONNECTION_RETRIES: usize = 3;
 
 #[derive(clap::Parser)]
 #[command(author, version, about, long_about = None)]
@@ -28,20 +36,21 @@ struct Cli {
     #[arg(short, long)]
     gateway: Option<String>,
 
-    /// When enabled the client will listen for incoming peer connections.
-    #[arg(short, long)]
-    listen: bool,
-
     /// When enabled the client will attempt NAT-PMP and PCP port mapping protocols.
-    #[arg(short, long, default_value_t = true)]
+    #[arg(short, long)]
     nat_map: bool,
+
+    #[command(subcommand)]
+    cmd: FileYeetCommand,
 }
 
-/// Define a sane number of maximum retries.
-const MAX_CONNECTION_RETRIES: usize = 5;
-
-/// Zero bytes used for testing.
-const TEST_HASH: HashBytes = [0; 32];
+#[derive(clap::Subcommand)]
+enum FileYeetCommand {
+    /// Publish a file to the server.
+    Pub { file_path: String },
+    /// Subscribe to a file from the server.
+    Sub { sha256_hex: String },
+}
 
 #[tokio::main]
 async fn main() {
@@ -49,6 +58,7 @@ async fn main() {
     use clap::Parser as _;
     let args = Cli::parse();
 
+    // Create a buffer for sending and receiving data within the payload size for `file_yeet`.
     let mut bb = bytes::BytesMut::with_capacity(MAX_PAYLOAD_SIZE);
 
     // Connect to the public file_yeet_server.
@@ -56,10 +66,50 @@ async fn main() {
         prepare_server_connection(&args, &mut bb).await;
 
     // Determine if we are going to make a publish or subscribe request.
-    if args.listen {
-        publish_loop(&args, endpoint, server_send, server_recv, bb).await;
-    } else {
-        subscribe(&args, endpoint, server_send, server_recv, bb).await;
+    match &args.cmd {
+        // Try to hash and publish the file to the rendezvous server.
+        FileYeetCommand::Pub { file_path } => {
+            let file_path = std::path::Path::new(file_path);
+            let mut hasher = Sha256::new();
+            let mut reader = tokio::io::BufReader::new(
+                tokio::fs::File::open(file_path)
+                    .await
+                    .expect("Failed to open the file"),
+            );
+            let mut hash_byte_buffer = [0; 8192];
+            loop {
+                let n = reader
+                    .read(&mut hash_byte_buffer)
+                    .await
+                    .expect("Failed to read from the file");
+                if n == 0 {
+                    break;
+                }
+
+                hasher.update(&hash_byte_buffer[..n]);
+            }
+            let hash: HashBytes = hasher.finalize().into();
+            let mut hex_bytes = [0; 64];
+            println!(
+                "{} File {} has SHA-256 hash: {}",
+                local_now_fmt(),
+                file_path.display(),
+                faster_hex::hex_encode(&hash, &mut hex_bytes)
+                    .expect("Failed to use a valid hex buffer"),
+            );
+            reader.rewind().await.expect("Failed to rewind the file");
+
+            publish_loop(&args, endpoint, server_send, server_recv, bb, hash, reader).await;
+        }
+        // Try to get the file hash from the rendezvous server and peers.
+        FileYeetCommand::Sub { sha256_hex } => {
+            let mut hash = HashBytes::default();
+            if let Err(e) = faster_hex::hex_decode(sha256_hex.as_bytes(), &mut hash) {
+                eprintln!("{} Failed to parse hex hash: {e}", local_now_fmt());
+                return;
+            };
+            subscribe(&args, endpoint, server_send, server_recv, bb, hash).await;
+        }
     }
 
     // Clean up the port mapping and close the server connection.
@@ -67,14 +117,162 @@ async fn main() {
         // Try to safely delete the port mapping.
         if let Err((e, _)) = mapping.try_drop().await {
             eprintln!("{} Failed to delete the port mapping: {e}", local_now_fmt());
+        } else {
+            println!(
+                "{} Successfully deleted the created port mapping",
+                local_now_fmt()
+            );
         }
     }
     connection.close(quinn::VarInt::from_u32(0), &[]);
-    println!(
-        "{} Client connection stats: {:?}",
-        local_now_fmt(),
-        connection.stats()
-    );
+}
+
+/// Enter a loop to listen for the server to send peer socket addresses requesting our publish.
+async fn publish_loop(
+    args: &Cli,
+    endpoint: quinn::Endpoint,
+    mut server_send: quinn::SendStream,
+    mut server_recv: quinn::RecvStream,
+    mut bb: bytes::BytesMut,
+    hash: HashBytes,
+    mut _reader: tokio::io::BufReader<tokio::fs::File>,
+) {
+    // Format a publish request.
+    bb.put_u16(file_yeet_shared::ClientApiRequest::Publish as u16);
+    bb.put(&hash[..]);
+    // Send the server a publish request.
+    server_send
+        .write_all(&bb)
+        .await
+        .expect("Failed to send a publish request to the server");
+    drop(bb);
+
+    // Close the stream after completing the publish request.
+    let _ = server_send.finish().await;
+
+    // Enter a loop to listen for the server to send peer connections.
+    loop {
+        let data_len = server_recv
+            .read_u16()
+            .await
+            .expect("Failed to read a u16 response from the server")
+            as usize;
+        if data_len == 0 {
+            eprintln!("{} Server encountered and error", local_now_fmt());
+            break;
+        }
+        if data_len > file_yeet_shared::MAX_PAYLOAD_SIZE {
+            eprintln!("{} Server response length is invalid", local_now_fmt());
+            break;
+        }
+
+        let mut scratch_space = [0; file_yeet_shared::MAX_PAYLOAD_SIZE];
+        let peer_string_bytes = &mut scratch_space[..data_len];
+        if let Err(e) = server_recv.read_exact(peer_string_bytes).await {
+            eprintln!(
+                "{} Failed to read a response from the server: {e}",
+                local_now_fmt()
+            );
+            break;
+        }
+
+        // Parse the response as a peer socket address or skip this message.
+        let peer_string = match std::str::from_utf8(peer_string_bytes) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!(
+                    "{} Server did not send a valid UTF-8 response: {e}",
+                    local_now_fmt()
+                );
+                continue;
+            }
+        };
+        let peer_address = match peer_string.parse() {
+            Ok(addr) => addr,
+            Err(e) => {
+                eprintln!("{} Failed to parse peer address: {e}", local_now_fmt());
+                continue;
+            }
+        };
+
+        // Listen for a peer and assign the peer `Connection` lock when connected.
+        let Some(peer_connection) = udp_holepunch(
+            args,
+            endpoint.clone(),
+            endpoint
+                .local_addr()
+                .expect("Could not determine our local IP"),
+            peer_address,
+        )
+        .await
+        else {
+            eprintln!("{} Failed to connect to peer", local_now_fmt());
+            continue;
+        };
+
+        // TODO: Perform some handshake with the peer to inform them of the size of the file we're sending.
+        test_rwpl(peer_connection, false).await;
+    }
+
+    println!("Server connection closed");
+}
+
+async fn subscribe(
+    args: &Cli,
+    endpoint: quinn::Endpoint,
+    mut server_send: quinn::SendStream,
+    mut server_recv: quinn::RecvStream,
+    mut bb: bytes::BytesMut,
+    hash: HashBytes,
+) {
+    // Send the server a subscribe request.
+    bb.put_u16(file_yeet_shared::ClientApiRequest::Subscribe as u16);
+    bb.put(&hash[..]);
+    server_send
+        .write_all(&bb)
+        .await
+        .expect("Failed to send a subscribe request to the server");
+    drop(bb);
+
+    // Close the stream after completing the publish request.
+    let _ = server_send.finish().await;
+
+    // Determine if the server is responding with a success or failure.
+    let response_size = server_recv
+        .read_u16()
+        .await
+        .expect("Failed to read a u16 response from the server") as usize;
+    if response_size == 0 {
+        eprintln!("{} No publishers available for file hash", local_now_fmt());
+        return;
+    }
+    if response_size > file_yeet_shared::MAX_PAYLOAD_SIZE {
+        eprintln!("{} Server response length is invalid", local_now_fmt());
+        return;
+    }
+
+    // Parse the response as a peer socket address.
+    let mut scratch_space = [0; file_yeet_shared::MAX_PAYLOAD_SIZE];
+    let peer_string_bytes = &mut scratch_space[..response_size];
+    server_recv
+        .read_exact(peer_string_bytes)
+        .await
+        .expect("Failed to read a valid UTF-8 response from the server");
+    let peer_address: SocketAddr = std::str::from_utf8(peer_string_bytes)
+        .expect("Server did not send a valid UTF-8 response")
+        .parse::<SocketAddr>()
+        .expect("Server did not send a valid socket address for the peer");
+
+    // Connect to the peer and assign the peer `Connection` lock when connected.
+    let local_address = endpoint
+        .local_addr()
+        .expect("Could not determine our local IP");
+    let peer_connection = udp_holepunch(args, endpoint, local_address, peer_address)
+        .await
+        .expect("UDP hole punching failed");
+
+    // TODO: Perform some handshake with the peer to discover the size of the file we're retrieving.
+    test_rwpl(peer_connection, true).await;
 }
 
 /// Create a QUIC endpoint connected to the server and perform basic setup.
@@ -165,7 +363,7 @@ async fn prepare_server_connection(
 
     // Use an insecure client configuration when connecting to peers.
     // TODO: Use a secure client configuration when connecting to the server.
-    endpoint.set_default_client_config(file_yeet_shared::configure_peer_verification());
+    endpoint.set_default_client_config(configure_peer_verification());
     // Connect to the public file_yeet_server.
     let connection = connect_to_server(args, &endpoint).await;
 
@@ -215,6 +413,9 @@ async fn prepare_server_connection(
 
 /// Connect to the server using QUIC.
 async fn connect_to_server(args: &Cli, endpoint: &quinn::Endpoint) -> quinn::Connection {
+    // Reused error message string.
+    const SERVER_CONNECTION_ERR: &str = "Failed to establish a QUIC connection to the server";
+
     // Get the server address info.
     let SocketAddrHelper {
         addr: server_address,
@@ -227,182 +428,40 @@ async fn connect_to_server(args: &Cli, endpoint: &quinn::Endpoint) -> quinn::Con
     );
 
     // Attempt to connect to the server using QUIC.
-    let connection = endpoint
-        .connect(server_address, hostname.as_str())
-        .expect("Failed to start a QUIC connection to the server")
-        .await
-        .expect("Failed to establish a QUIC connection to the server");
+    let connection = match tokio::time::timeout(
+        SERVER_CONNECTION_TIMEOUT,
+        endpoint
+            .connect(server_address, hostname.as_str())
+            .expect("Failed to open a QUIC connection to the server"),
+    )
+    .await
+    {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => {
+            panic!("{} {SERVER_CONNECTION_ERR}: {e}", local_now_fmt());
+        }
+        Err(e) => {
+            panic!("{} {SERVER_CONNECTION_ERR}: Timeout {e:#}", local_now_fmt());
+        }
+    };
     println!("{} QUIC connection made to the server", local_now_fmt());
     connection
 }
 
-/// Try to read a valid UTF-8 from the server until the expected length is reached.
-async fn expect_server_text(stream: &mut quinn::RecvStream, len: u16) -> anyhow::Result<String> {
-    let mut raw_bytes = [0; file_yeet_shared::MAX_PAYLOAD_SIZE];
-    let expected_slice = &mut raw_bytes[..len as usize];
-    stream.read_exact(expected_slice).await?;
-    Ok(std::str::from_utf8(expected_slice)?.to_owned())
-}
-
-/// Enter a loop to listen for the server to send peer socket addresses requesting our publish.
-async fn publish_loop(
-    args: &Cli,
-    endpoint: quinn::Endpoint,
-    mut server_send: quinn::SendStream,
-    mut server_recv: quinn::RecvStream,
-    mut bb: bytes::BytesMut,
-) {
-    // Format a publish request.
-    bb.put_u16(file_yeet_shared::ClientApiRequest::Publish as u16);
-    bb.put(&TEST_HASH[..]);
-    // Send the server a publish request.
-    server_send
-        .write_all(&bb)
-        .await
-        .expect("Failed to send a publish request to the server");
-    drop(bb);
-
-    // Close the stream after completing the publish request.
-    let _ = server_send.finish().await;
-
-    // Enter a loop to listen for the server to send peer connections.
-    loop {
-        let data_len = server_recv
-            .read_u16()
-            .await
-            .expect("Failed to read a u16 response from the server")
-            as usize;
-        if data_len == 0 {
-            eprintln!("{} Server encountered and error", local_now_fmt());
-            break;
-        }
-        if data_len > file_yeet_shared::MAX_PAYLOAD_SIZE {
-            eprintln!("{} Server response length is invalid", local_now_fmt());
-            break;
-        }
-
-        let mut scratch_space = [0; file_yeet_shared::MAX_PAYLOAD_SIZE];
-        let peer_string_bytes = &mut scratch_space[..data_len];
-        if let Err(e) = server_recv.read_exact(peer_string_bytes).await {
-            eprintln!(
-                "{} Failed to read a response from the server: {e}",
-                local_now_fmt()
-            );
-            break;
-        }
-
-        // Parse the response as a peer socket address or skip this message.
-        let peer_string = match std::str::from_utf8(peer_string_bytes) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!(
-                    "{} Server did not send a valid UTF-8 response: {e}",
-                    local_now_fmt()
-                );
-                continue;
-            }
-        };
-        let peer_address = match peer_string.parse() {
-            Ok(addr) => addr,
-            Err(e) => {
-                eprintln!("{} Failed to parse peer address: {e}", local_now_fmt());
-                continue;
-            }
-        };
-
-        // Listen for a peer and assign the peer `TcpStream` lock when connected.
-        let Some(peer_tcp) = tcp_holepunch(
-            args,
-            endpoint.clone(),
-            endpoint
-                .local_addr()
-                .expect("Could not determine our local IP"),
-            peer_address,
-        )
-        .await
-        else {
-            eprintln!("{} Failed to connect to peer", local_now_fmt());
-            continue;
-        };
-
-        // TODO: Perform some handshake with the peer to inform them of the size of the file we're sending.
-        test_rwpl(peer_tcp, false).await;
-    }
-
-    println!("Server connection closed");
-}
-
-async fn subscribe(
-    args: &Cli,
-    endpoint: quinn::Endpoint,
-    mut server_send: quinn::SendStream,
-    mut server_recv: quinn::RecvStream,
-    mut bb: bytes::BytesMut,
-) {
-    // Send the server a subscribe request.
-    bb.put_u16(file_yeet_shared::ClientApiRequest::Subscribe as u16);
-    bb.put(&TEST_HASH[..]);
-    server_send
-        .write_all(&bb)
-        .await
-        .expect("Failed to send a subscribe request to the server");
-    drop(bb);
-
-    // Close the stream after completing the publish request.
-    let _ = server_send.finish().await;
-
-    // Determine if the server is responding with a success or failure.
-    let response_size = server_recv
-        .read_u16()
-        .await
-        .expect("Failed to read a u16 response from the server") as usize;
-    if response_size == 0 {
-        eprintln!("{} No publishers available for file hash", local_now_fmt());
-        return;
-    }
-    if response_size > file_yeet_shared::MAX_PAYLOAD_SIZE {
-        eprintln!("{} Server response length is invalid", local_now_fmt());
-        return;
-    }
-
-    // Parse the response as a peer socket address.
-    let mut scratch_space = [0; file_yeet_shared::MAX_PAYLOAD_SIZE];
-    let peer_string_bytes = &mut scratch_space[..response_size];
-    server_recv
-        .read_exact(peer_string_bytes)
-        .await
-        .expect("Failed to read a valid UTF-8 response from the server");
-    let peer_address: SocketAddr = std::str::from_utf8(peer_string_bytes)
-        .expect("Server did not send a valid UTF-8 response")
-        .parse::<SocketAddr>()
-        .expect("Server did not send a valid socket address for the peer");
-
-    // Connect to the peer and assign the peer `TcpStream` lock when connected.
-    let local_address = endpoint
-        .local_addr()
-        .expect("Could not determine our local IP");
-    let peer_tcp = tcp_holepunch(args, endpoint, local_address, peer_address)
-        .await
-        .expect("TCP hole punching failed");
-
-    // TODO: Perform some handshake with the peer to discover the size of the file we're retrieving.
-    test_rwpl(peer_tcp, true).await;
-}
-
-/// Attempt to connect to peer using TCP hole punching.
-async fn tcp_holepunch(
+/// Attempt to connect to peer using UDP hole punching.
+async fn udp_holepunch(
     args: &Cli,
     endpoint: quinn::Endpoint,
     local_address: SocketAddr,
     peer_address: SocketAddr,
 ) -> Option<quinn::Connection> {
-    // Create a lock for where we will place the TCP stream used to communicate with our peer.
+    // Create a lock for where we will place the QUIC connection used to communicate with our peer.
     let peer_reached_lock: Arc<Mutex<bool>> = Arc::default();
 
-    // Spawn a thread that listens for a peer and will assign the peer `TcpStream` lock when connected.
+    // Spawn a thread that listens for a peer and will set the boolean lock when connected.
     let peer_reached_listen = peer_reached_lock.clone();
     let endpoint_listen = endpoint.clone();
-    let listen_future = listen_for_peer_async(endpoint_listen, local_address, &peer_reached_listen);
+    let listen_future = listen_for_peer(endpoint_listen, local_address, &peer_reached_listen);
 
     // Attempt to connect to the peer's public address.
     let connect_future = connect_to_peer(endpoint, peer_address, &peer_reached_lock);
@@ -416,7 +475,7 @@ async fn tcp_holepunch(
             // TODO: It could be interesting and possible to create a more general stream negotiation.
             //       For example, if each peer sent a random nonce over each stream, and the nonces were XOR'd per stream,
             //       the result could be used to determine which stream to use (highest/lowest resulting nonce after XOR).
-            if args.listen {
+            if let FileYeetCommand::Pub { .. } = args.cmd {
                 listen_stream
             } else {
                 connect_stream
@@ -426,8 +485,8 @@ async fn tcp_holepunch(
     }
 }
 
-/// Spawn a thread that listens for a peer and will assign the peer `TcpStream` lock when connected.
-async fn listen_for_peer_async(
+/// Spawn a thread that listens for a peer and will assign the peer `Connection` lock when connected.
+async fn listen_for_peer(
     endpoint: quinn::Endpoint,
     local_address: SocketAddr,
     peer_reached_lock: &Arc<Mutex<bool>>,
@@ -439,11 +498,10 @@ async fn listen_for_peer_async(
     );
 
     // Accept a peer connection.
-    let connecting =
-        tokio::time::timeout(std::time::Duration::from_millis(5_000), endpoint.accept())
-            .await
-            .ok()? // Timeout.
-            .expect("Failed to accept on endpoint");
+    let connecting = tokio::time::timeout(std::time::Duration::from_secs(5), endpoint.accept())
+        .await
+        .ok()? // Timeout.
+        .expect("Failed to accept on endpoint");
     let connection = match connecting.await {
         Ok(connection) => connection,
         Err(e) => {
@@ -477,24 +535,27 @@ async fn connect_to_peer(
     peer_reached_lock: &Arc<Mutex<bool>>,
 ) -> Option<quinn::Connection> {
     // Set a sane number of connection retries.
-    let mut retries = MAX_CONNECTION_RETRIES;
+    let mut retries = MAX_PEER_CONNECTION_RETRIES;
 
-    // Ensure we have retries left and there isn't already a peer `TcpStream` to use.
+    // Ensure we have retries left and there isn't already a peer `Connection` to use.
     loop {
         println!("{} Connecting to peer at: {peer_address}", local_now_fmt());
         match endpoint.connect(peer_address, "peer") {
             Ok(connecting) => {
                 let connection =
-                    match tokio::time::timeout(std::time::Duration::from_millis(5_000), connecting)
-                        .await
-                    {
+                    match tokio::time::timeout(Duration::from_secs(5), connecting).await {
                         Ok(Ok(c)) => c,
                         Ok(Err(e)) => {
                             eprintln!("{} Failed to connect to peer: {e}", local_now_fmt());
                             retries -= 1;
                             continue;
                         }
-                        Err(_) => return None, // Timeout.
+                        Err(_) => {
+                            eprintln!("{} Failed to connect to peer: Timeout", local_now_fmt());
+
+                            // Do not retry on timeout.
+                            return None;
+                        }
                     };
                 // Set the peer mutex to the connected stream if there isn't already one present.
                 *peer_reached_lock
@@ -518,6 +579,58 @@ async fn connect_to_peer(
             return None;
         }
     }
+}
+
+/// Try to read a valid UTF-8 from the server until the expected length is reached.
+async fn expect_server_text(stream: &mut quinn::RecvStream, len: u16) -> anyhow::Result<String> {
+    let mut raw_bytes = [0; file_yeet_shared::MAX_PAYLOAD_SIZE];
+    let expected_slice = &mut raw_bytes[..len as usize];
+    stream.read_exact(expected_slice).await?;
+    Ok(std::str::from_utf8(expected_slice)?.to_owned())
+}
+
+/// Allow peers to connect using self-signed certificates.
+/// Necessary for using the QUIC protocol.
+#[derive(Debug)]
+struct SkipAllServerVerification;
+
+/// Skip all server verification.
+impl rustls::client::ServerCertVerifier for SkipAllServerVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::Certificate,
+        _intermediates: &[rustls::Certificate],
+        _server_name: &rustls::ServerName,
+        _scts: &mut dyn Iterator<Item = &[u8]>,
+        _ocsp_response: &[u8],
+        _now: std::time::SystemTime,
+    ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::ServerCertVerified::assertion())
+    }
+}
+
+/// Build a QUIC client config that will skip server verification.
+/// # Panics
+/// If the conversion from `Duration` to `IdleTimeout` fails.
+fn configure_peer_verification() -> quinn::ClientConfig {
+    let crypto = rustls::ClientConfig::builder()
+        .with_safe_defaults()
+        .with_custom_certificate_verifier(Arc::new(SkipAllServerVerification {}))
+        .with_no_client_auth();
+
+    let mut client_config = quinn::ClientConfig::new(Arc::new(crypto));
+
+    // Set custom keep alive policies.
+    let mut transport_config = quinn::TransportConfig::default();
+    transport_config.max_idle_timeout(Some(
+        Duration::from_secs(file_yeet_shared::QUIC_TIMEOUT_SECONDS)
+            .try_into()
+            .expect("Failed to convert `Duration` to `IdleTimeout`"),
+    ));
+    transport_config.keep_alive_interval(Some(Duration::from_secs(60)));
+    client_config.transport_config(Arc::new(transport_config));
+
+    client_config
 }
 
 /// Test loop that reads from stdin to write to the peer, and reads from the peer to print to stdout.

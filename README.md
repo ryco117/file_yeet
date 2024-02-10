@@ -9,6 +9,8 @@ Uses TCP hole punching techniques to allow peers to transfer data directly. Spec
 ### Server
 ```bash
 $ cargo r --release --bin file_yeet_server -- -h
+The command line arguments for the server
+
 Usage: file_yeet_server [OPTIONS]
 
 Options:
@@ -28,7 +30,31 @@ docker build -t file_yeet_server:local .
 
 
 ### Client
-*TODO*
+```bash
+$ cargo r --release --bin file_yeet_client -- -h
+Usage: file_yeet_client.exe [OPTIONS] <COMMAND>
+
+Commands:
+  pub   Publish a file to the server
+  sub   Subscribe to a file from the server
+  help  Print this message or the help of the given subcommand(s)
+
+Options:
+  -s, --server-address <SERVER_ADDRESS>
+          The address of the rendezvous server. Either an IP address or a hostname
+  -p, --server-port <SERVER_PORT>
+          The server port to connect to [default: 7828]
+  -o, --port-override <PORT_OVERRIDE>
+          Override the port seen by the server to communicate a custom port to peers. Useful when port-forwarding
+  -g, --gateway <GATEWAY>
+          The IP address of local gateway to use when attempting the Port Control Protocol. If not specified, a default gateway will be searched for
+  -n, --nat-map
+          When enabled the client will attempt NAT-PMP and PCP port mapping protocols
+  -h, --help
+          Print help
+  -V, --version
+          Print version
+```
 
 ## License
-This project is licensed under the MIT License
+This project is licensed under the MIT license.

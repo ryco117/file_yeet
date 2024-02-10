@@ -15,6 +15,8 @@ pub const MAX_PAYLOAD_SIZE: usize = 1024;
 /// A block of raw SHA-256 bytes.
 pub type HashBytes = [u8; 32];
 
+/// The maximum number of seconds of inactivity before a QUIC connection is closed.
+/// Same for both the server and the client.
 pub const QUIC_TIMEOUT_SECONDS: u64 = 120;
 
 /// A helper to access often used socket address info.
@@ -46,11 +48,6 @@ impl std::fmt::Display for ClientApiRequest {
         write!(f, "REQ: {str}")
     }
 }
-
-/// Allow peers to connect using self-signed certificates.
-/// Necessary for using the QUIC protocol.
-#[derive(Debug)]
-struct SkipAllServerVerification;
 
 /// Helper to get either the socket address corresponding to the user's input, or the default of IPv4 localhost.
 ///
@@ -118,45 +115,6 @@ pub fn generate_self_signed_cert() -> anyhow::Result<(rustls::Certificate, rustl
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])?;
     let key = rustls::PrivateKey(cert.serialize_private_key_der());
     Ok((rustls::Certificate(cert.serialize_der()?), key))
-}
-
-impl rustls::client::ServerCertVerifier for SkipAllServerVerification {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::Certificate,
-        _intermediates: &[rustls::Certificate],
-        _server_name: &rustls::ServerName,
-        _scts: &mut dyn Iterator<Item = &[u8]>,
-        _ocsp_response: &[u8],
-        _now: std::time::SystemTime,
-    ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::ServerCertVerified::assertion())
-    }
-}
-
-/// Build a QUIC client config that will skip server verification.
-/// # Panics
-/// If the conversion from `Duration` to `IdleTimeout` of the max idle timeout fails.
-#[must_use]
-pub fn configure_peer_verification() -> quinn::ClientConfig {
-    let crypto = rustls::ClientConfig::builder()
-        .with_safe_defaults()
-        .with_custom_certificate_verifier(Arc::new(SkipAllServerVerification {}))
-        .with_no_client_auth();
-
-    let mut client_config = quinn::ClientConfig::new(Arc::new(crypto));
-
-    // Set custom keep alive policies.
-    let mut transport_config = quinn::TransportConfig::default();
-    transport_config.max_idle_timeout(Some(
-        Duration::from_secs(QUIC_TIMEOUT_SECONDS)
-            .try_into()
-            .expect("Failed to convert `Duration` to `IdleTimeout`"),
-    ));
-    transport_config.keep_alive_interval(Some(Duration::from_secs(60)));
-    client_config.transport_config(Arc::new(transport_config));
-
-    client_config
 }
 
 // // Rustls 0.22.0 version of the above
