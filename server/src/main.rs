@@ -193,6 +193,12 @@ async fn handle_publish(
     let (tx, mut rx) = mpsc::channel::<String>(4 * MAX_PAYLOAD_SIZE);
     let sock_string_clone = sock_string.clone();
     tokio::task::spawn(async move {
+        #[cfg(debug_assertions)]
+        println!(
+            "{} Starting subscribe task for client {sock_string_clone}",
+            local_now_fmt()
+        );
+
         while let Some(message) = rx.recv().await {
             // Format the message as a length and UTF-8 string.
             bb.put_u16(u16::try_from(message.len()).expect("Message content length is invalid"));
@@ -205,7 +211,15 @@ async fn handle_publish(
             }
             // Clear the scratch space before the next iteration.
             bb.clear();
+
+            #[cfg(debug_assertions)]
+            println!(
+                "{} Introduced {message} to {sock_string_clone}",
+                local_now_fmt()
+            );
         }
+
+        #[cfg(debug_assertions)]
         println!(
             "{} Closed forwarding thread for client {sock_string_clone}",
             local_now_fmt()
@@ -219,11 +233,14 @@ async fn handle_publish(
     };
 
     // Add the client to a list of peers publishing this hash.
-    let mut clients_lock = clients.write().await;
-    if let Some(client_list) = clients_lock.get_mut(&hash) {
-        client_list.push(client);
-    } else {
-        clients_lock.insert(hash, smallvec::smallvec![client]);
+    // Ensure the clients lock is dropped before waiting for the client to close the connection.
+    {
+        let mut clients_lock = clients.write().await;
+        if let Some(client_list) = clients_lock.get_mut(&hash) {
+            client_list.push(client);
+        } else {
+            clients_lock.insert(hash, smallvec::smallvec![client]);
+        }
     }
 
     // Wait for the client to close the connection.
@@ -253,13 +270,16 @@ async fn handle_subscribe(
     // Attempt to get the client from the map.
     let read_lock = clients.read().await;
     let Some(client_list) = read_lock.get(&hash).filter(|v| !v.is_empty()) else {
-        let mut hex_hash_bytes = [0; 2 * file_yeet_shared::HASH_BYTE_COUNT];
-        println!(
-            "{} Failed to find client for hash {}",
-            local_now_fmt(),
-            faster_hex::hex_encode(&hash, &mut hex_hash_bytes)
-                .expect("Failed to hash as hexadecimal"),
-        );
+        #[cfg(debug_assertions)]
+        {
+            let mut hex_hash_bytes = [0; 2 * file_yeet_shared::HASH_BYTE_COUNT];
+            println!(
+                "{} Failed to find client for hash {}",
+                local_now_fmt(),
+                faster_hex::hex_encode(&hash, &mut hex_hash_bytes)
+                    .expect("Failed to hash as hexadecimal"),
+            );
+        }
 
         // Send the subscriber a message that no publishers are available.
         quic_send.write_u16(0).await?;
@@ -274,7 +294,7 @@ async fn handle_subscribe(
     // Feed the publishing client socket address to the task that handles communicating with this client.
     pub_client
         .stream
-        .send(sock_string)
+        .send(sock_string.clone())
         .await
         .expect("Could not feed the publish task thread");
 
@@ -286,6 +306,13 @@ async fn handle_subscribe(
     // Send the message to the client and close the stream.
     quic_send.write_all(&bb).await?;
     quic_send.finish().await?;
+
+    #[cfg(debug_assertions)]
+    println!(
+        "{} Introduced {} to {sock_string}",
+        local_now_fmt(),
+        pub_client.address
+    );
 
     Ok(())
 }

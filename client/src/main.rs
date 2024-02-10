@@ -50,8 +50,8 @@ enum FileYeetCommand {
     Pub { file_path: String },
     /// Subscribe to a file from the server.
     Sub {
-        file: Option<String>,
         sha256_hex: String,
+        output: Option<String>,
     },
 }
 
@@ -155,6 +155,11 @@ async fn publish_loop(
 
     // Enter a loop to listen for the server to send peer connections.
     loop {
+        println!(
+            "{} Waiting for the server to introduce a peer...",
+            local_now_fmt()
+        );
+
         let data_len = server_recv
             .read_u16()
             .await
@@ -239,6 +244,11 @@ async fn subscribe(
 
     // Close the stream after completing the publish request.
     let _ = server_send.finish().await;
+
+    println!(
+        "{} Requesting file with hash from the server...",
+        local_now_fmt()
+    );
 
     // Determine if the server is responding with a success or failure.
     let response_size = server_recv
