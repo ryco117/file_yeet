@@ -253,9 +253,12 @@ async fn handle_subscribe(
     // Attempt to get the client from the map.
     let read_lock = clients.read().await;
     let Some(client_list) = read_lock.get(&hash).filter(|v| !v.is_empty()) else {
+        let mut hex_hash_bytes = [0; 2 * file_yeet_shared::HASH_BYTE_COUNT];
         println!(
-            "{} Failed to find client for hash {hash:x?}",
-            local_now_fmt()
+            "{} Failed to find client for hash {}",
+            local_now_fmt(),
+            faster_hex::hex_encode(&hash, &mut hex_hash_bytes)
+                .expect("Failed to hash as hexadecimal"),
         );
 
         // Send the subscriber a message that no publishers are available.

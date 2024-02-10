@@ -12,8 +12,11 @@ pub const DEFAULT_PORT: u16 = 7828;
 /// Define a sane maximum payload size for the client.
 pub const MAX_PAYLOAD_SIZE: usize = 1024;
 
+/// Using SHA-256 for the hash; i.e., a 256 bit / 8 byte hash.
+pub const HASH_BYTE_COUNT: usize = 32;
+
 /// A block of raw SHA-256 bytes.
-pub type HashBytes = [u8; 32];
+pub type HashBytes = [u8; HASH_BYTE_COUNT];
 
 /// The maximum number of seconds of inactivity before a QUIC connection is closed.
 /// Same for both the server and the client.

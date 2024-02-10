@@ -49,7 +49,10 @@ enum FileYeetCommand {
     /// Publish a file to the server.
     Pub { file_path: String },
     /// Subscribe to a file from the server.
-    Sub { sha256_hex: String },
+    Sub {
+        file: Option<String>,
+        sha256_hex: String,
+    },
 }
 
 #[tokio::main]
@@ -89,7 +92,7 @@ async fn main() {
                 hasher.update(&hash_byte_buffer[..n]);
             }
             let hash: HashBytes = hasher.finalize().into();
-            let mut hex_bytes = [0; 64];
+            let mut hex_bytes = [0; 2 * file_yeet_shared::HASH_BYTE_COUNT];
             println!(
                 "{} File {} has SHA-256 hash: {}",
                 local_now_fmt(),
@@ -102,7 +105,7 @@ async fn main() {
             publish_loop(&args, endpoint, server_send, server_recv, bb, hash, reader).await;
         }
         // Try to get the file hash from the rendezvous server and peers.
-        FileYeetCommand::Sub { sha256_hex } => {
+        FileYeetCommand::Sub { sha256_hex, .. } => {
             let mut hash = HashBytes::default();
             if let Err(e) = faster_hex::hex_decode(sha256_hex.as_bytes(), &mut hash) {
                 eprintln!("{} Failed to parse hex hash: {e}", local_now_fmt());
