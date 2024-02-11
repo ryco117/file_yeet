@@ -15,4 +15,4 @@ quinn = "0.10.2"
 rustls = { version = "0.21.10", features = ["dangerous_configuration", "quic"] }
 smallvec = "1.13.1"
 thiserror = "1.0.56"
-tokio = { version = "1.35.1", features = ["macros", "net", "rt-multi-thread"] }
+tokio = { version = "1.36.0", features = ["io-util", "macros", "net", "rt-multi-thread"] }

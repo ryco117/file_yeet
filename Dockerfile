@@ -24,6 +24,6 @@ RUN apk add musl-dev
 RUN cargo install --bin file_yeet_server --path server
 
 # Expose the port that the server will be running on
-EXPOSE 7828 80
+EXPOSE 7828
 
 CMD ["file_yeet_server", "--bind-ip=0.0.0.0", "--bind-port=7828"]
