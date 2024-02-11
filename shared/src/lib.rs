@@ -9,8 +9,8 @@ use num_enum::TryFromPrimitive;
 /// Magic number for the default port.
 pub const DEFAULT_PORT: u16 = 7828;
 
-/// Define a sane maximum payload size for the client.
-pub const MAX_PAYLOAD_SIZE: usize = 1024;
+/// Define a sane maximum payload size for the client-server messages.
+pub const MAX_SERVER_COMMUNICATION_SIZE: usize = 1024;
 
 /// Using SHA-256 for the hash; i.e., a 256 bit / 8 byte hash.
 pub const HASH_BYTE_COUNT: usize = 32;

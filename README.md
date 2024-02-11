@@ -1,14 +1,14 @@
 # File Yeet
 
-A minimal client/server model to allow peers to share files directly by using the server for peer discovery to establish a peer-to-peer connection.
+A minimal client/server model to allow peers to share files directly by using a rendezvous server for peer discovery to establish a peer-to-peer connection.
 
-Uses TCP hole punching techniques to allow peers to transfer data directly. Special thanks to [TheOnlyArtz](https://github.com/TheOnlyArtz) for [this repo](https://github.com/TheOnlyArtz/rust-tcp-holepunch) because it served as a reference for hole punching techniques.
+Uses UDP hole punching and [port mapping techniques](https://crates.io/crates/crab_nat) to allow peers to transfer data directly. Special thanks to [TheOnlyArtz](https://github.com/TheOnlyArtz) for [this repo](https://github.com/TheOnlyArtz/rust-tcp-holepunch) because it served as a reference for hole punching techniques.
 
 ## Usage
 
 ### Server
 ```bash
-$ cargo r --release --bin file_yeet_server -- -h
+$ cargo r --bin file_yeet_server -- -h
 The command line arguments for the server
 
 Usage: file_yeet_server [OPTIONS]
@@ -31,7 +31,7 @@ docker build -t file_yeet_server:local .
 
 ### Client
 ```bash
-$ cargo r --release --bin file_yeet_client -- -h
+$ cargo r --bin file_yeet_client -- -h
 Usage: file_yeet_client.exe [OPTIONS] <COMMAND>
 
 Commands:

@@ -1,11 +1,13 @@
 use std::{
+    io::Write as _,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
 use bytes::BufMut as _;
-use file_yeet_shared::{local_now_fmt, HashBytes, SocketAddrHelper, MAX_PAYLOAD_SIZE};
+use file_yeet_shared::{local_now_fmt, HashBytes, SocketAddrHelper, MAX_SERVER_COMMUNICATION_SIZE};
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
@@ -14,6 +16,10 @@ const SERVER_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Define a sane number of maximum retries.
 const MAX_PEER_CONNECTION_RETRIES: usize = 3;
+
+/// Define the maximum size of a payload for peer communication.
+/// QUIC may choose to fragment the payload, but this isn't a concern.
+const MAX_PEER_COMMUNICATION_SIZE: usize = 8192;
 
 #[derive(clap::Parser)]
 #[command(author, version, about, long_about = None)]
@@ -62,7 +68,7 @@ async fn main() {
     let args = Cli::parse();
 
     // Create a buffer for sending and receiving data within the payload size for `file_yeet`.
-    let mut bb = bytes::BytesMut::with_capacity(MAX_PAYLOAD_SIZE);
+    let mut bb = bytes::BytesMut::with_capacity(MAX_SERVER_COMMUNICATION_SIZE);
 
     // Connect to the public file_yeet_server.
     let (endpoint, connection, server_send, server_recv, port_mapping) =
@@ -91,10 +97,14 @@ async fn main() {
 
                 hasher.update(&hash_byte_buffer[..n]);
             }
+            let file_size = reader
+                .seek(tokio::io::SeekFrom::End(0))
+                .await
+                .expect("Failed to seek to the end of the file");
             let hash: HashBytes = hasher.finalize().into();
             let mut hex_bytes = [0; 2 * file_yeet_shared::HASH_BYTE_COUNT];
             println!(
-                "{} File {} has SHA-256 hash: {}",
+                "{} File {} has SHA-256 hash {} and size {file_size} bytes",
                 local_now_fmt(),
                 file_path.display(),
                 faster_hex::hex_encode(&hash, &mut hex_bytes)
@@ -102,16 +112,42 @@ async fn main() {
             );
             reader.rewind().await.expect("Failed to rewind the file");
 
-            publish_loop(&args, endpoint, server_send, server_recv, bb, hash, reader).await;
+            publish_loop(
+                &args,
+                endpoint,
+                server_send,
+                server_recv,
+                bb,
+                hash,
+                file_size,
+                reader,
+            )
+            .await;
         }
+
         // Try to get the file hash from the rendezvous server and peers.
-        FileYeetCommand::Sub { sha256_hex, .. } => {
+        FileYeetCommand::Sub { sha256_hex, output } => {
             let mut hash = HashBytes::default();
             if let Err(e) = faster_hex::hex_decode(sha256_hex.as_bytes(), &mut hash) {
                 eprintln!("{} Failed to parse hex hash: {e}", local_now_fmt());
                 return;
             };
-            subscribe(&args, endpoint, server_send, server_recv, bb, hash).await;
+
+            // Determine the output file path to use.
+            let output = output.as_ref().filter(|s| !s.is_empty()).map_or_else(
+                || {
+                    let mut output = std::env::temp_dir();
+                    let mut hex_bytes = [0; 2 * file_yeet_shared::HASH_BYTE_COUNT];
+                    output.push(
+                        faster_hex::hex_encode(&hash, &mut hex_bytes)
+                            .expect("Failed to use a valid hex buffer"),
+                    );
+                    output
+                },
+                |o| o.clone().into(),
+            );
+
+            subscribe(&args, endpoint, server_send, server_recv, bb, hash, output).await;
         }
     }
 
@@ -138,7 +174,8 @@ async fn publish_loop(
     mut server_recv: quinn::RecvStream,
     mut bb: bytes::BytesMut,
     hash: HashBytes,
-    mut _reader: tokio::io::BufReader<tokio::fs::File>,
+    file_size: u64,
+    mut reader: tokio::io::BufReader<tokio::fs::File>,
 ) {
     // Format a publish request.
     bb.put_u16(file_yeet_shared::ClientApiRequest::Publish as u16);
@@ -169,12 +206,12 @@ async fn publish_loop(
             eprintln!("{} Server encountered and error", local_now_fmt());
             break;
         }
-        if data_len > file_yeet_shared::MAX_PAYLOAD_SIZE {
+        if data_len > MAX_SERVER_COMMUNICATION_SIZE {
             eprintln!("{} Server response length is invalid", local_now_fmt());
             break;
         }
 
-        let mut scratch_space = [0; file_yeet_shared::MAX_PAYLOAD_SIZE];
+        let mut scratch_space = [0; MAX_SERVER_COMMUNICATION_SIZE];
         let peer_string_bytes = &mut scratch_space[..data_len];
         if let Err(e) = server_recv.read_exact(peer_string_bytes).await {
             eprintln!(
@@ -218,8 +255,12 @@ async fn publish_loop(
             continue;
         };
 
-        // TODO: Perform some handshake with the peer to inform them of the size of the file we're sending.
-        test_rwpl(peer_connection, false).await;
+        // Try to upload the file to the peer connection.
+        if let Err(e) = upload_to_peer(peer_connection, file_size, &mut reader).await {
+            eprintln!("{} Failed to upload to peer: {e}", local_now_fmt());
+        }
+
+        // test_rwpl(peer_connection, false).await;
     }
 
     println!("Server connection closed");
@@ -232,6 +273,7 @@ async fn subscribe(
     mut server_recv: quinn::RecvStream,
     mut bb: bytes::BytesMut,
     hash: HashBytes,
+    output: PathBuf,
 ) {
     // Send the server a subscribe request.
     bb.put_u16(file_yeet_shared::ClientApiRequest::Subscribe as u16);
@@ -259,13 +301,13 @@ async fn subscribe(
         eprintln!("{} No publishers available for file hash", local_now_fmt());
         return;
     }
-    if response_size > file_yeet_shared::MAX_PAYLOAD_SIZE {
+    if response_size > MAX_SERVER_COMMUNICATION_SIZE {
         eprintln!("{} Server response length is invalid", local_now_fmt());
         return;
     }
 
     // Parse the response as a peer socket address.
-    let mut scratch_space = [0; file_yeet_shared::MAX_PAYLOAD_SIZE];
+    let mut scratch_space = [0; MAX_SERVER_COMMUNICATION_SIZE];
     let peer_string_bytes = &mut scratch_space[..response_size];
     server_recv
         .read_exact(peer_string_bytes)
@@ -284,8 +326,12 @@ async fn subscribe(
         .await
         .expect("UDP hole punching failed");
 
-    // TODO: Perform some handshake with the peer to discover the size of the file we're retrieving.
-    test_rwpl(peer_connection, true).await;
+    // Try to download the requested file using the peer connection.
+    if let Err(e) = download_from_peer(peer_connection, hash, output).await {
+        eprintln!("{} Failed to download from peer: {e}", local_now_fmt());
+    }
+
+    // test_rwpl(peer_connection, true).await;
 }
 
 /// Create a QUIC endpoint connected to the server and perform basic setup.
@@ -594,9 +640,153 @@ async fn connect_to_peer(
     }
 }
 
+/// Download a file from the peer.
+async fn download_from_peer(
+    connection: quinn::Connection,
+    hash: HashBytes,
+    output: PathBuf,
+) -> anyhow::Result<()> {
+    // Let the uploading peer open a bi-directional stream.
+    let (mut peer_send, mut peer_recv) = connection.accept_bi().await?;
+
+    // Let the user know that a connection is established. A bi-directional stream is ready to use.
+    println!("{} Peer connection established", local_now_fmt());
+
+    // Read the file size from the peer.
+    let file_size = peer_recv.read_u64().await?;
+
+    // Ensure the user consents to downloading the file.
+    if output.exists() {
+        print!(
+            "{} Download file of size {file_size} bytes and overwrite {}? <y/N>: ",
+            local_now_fmt(),
+            output.display()
+        );
+    } else {
+        print!(
+            "{} Download file of size {file_size} bytes to {}? <y/N>: ",
+            local_now_fmt(),
+            output.display()
+        );
+    }
+    // Ensure the prompt is printed before reading from stdin.
+    std::io::stdout().flush().expect("Failed to flush stdout");
+
+    let mut input = String::new();
+    std::io::stdin()
+        .read_line(&mut input)
+        .expect("Failed to read from stdin");
+    if !(input.trim_start().starts_with('y') || input.trim_start().starts_with('Y')) {
+        println!("{} Download cancelled", local_now_fmt());
+
+        // Let the peer know that we cancelled the download.
+        peer_send.write_u8(0).await?;
+
+        return Ok(());
+    }
+
+    // Open the file for writing.
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&output)
+        .await?;
+
+    // Let the peer know that we accepted the download.
+    peer_send.write_u8(1).await?;
+    peer_send.finish().await?;
+
+    // Create a scratch space for reading data from the stream.
+    let mut buf = [0; MAX_PEER_COMMUNICATION_SIZE];
+    // Read from the peer and write to the file.
+    let mut bytes_written = 0;
+    let mut hasher = Sha256::new();
+    while bytes_written < file_size {
+        // Read a natural amount of bytes from the peer.
+        let size = peer_recv
+            .read(&mut buf)
+            .await?
+            .expect("Peer cancelled the connection");
+        if size > 0 {
+            // Write the bytes to the file and update the hash.
+            let bb = &buf[..size];
+            let f = file.write_all(bb);
+            // Update hash while future may be pending.
+            hasher.update(bb);
+            f.await?;
+
+            // Update the number of bytes written.
+            bytes_written += size as u64;
+        }
+    }
+
+    // Ensure the file hash is correct.
+    let downloaded_hash = hasher.finalize();
+    if hash != Into::<HashBytes>::into(downloaded_hash) {
+        eprintln!(
+            "{} Downloaded file hash does not match the expected hash",
+            local_now_fmt()
+        );
+        anyhow::bail!(
+            "{} Downloaded file hash does not match the expected hash",
+            local_now_fmt()
+        );
+    }
+
+    // Let the user know that the download is complete.
+    println!(
+        "{} Download complete: {}",
+        local_now_fmt(),
+        output.display()
+    );
+    Ok(())
+}
+
+/// Download a file from the peer.
+async fn upload_to_peer(
+    connection: quinn::Connection,
+    file_size: u64,
+    reader: &mut tokio::io::BufReader<tokio::fs::File>,
+) -> anyhow::Result<()> {
+    // Open a bi-directional stream.
+    let (mut peer_send, mut peer_recv) = connection.open_bi().await?;
+
+    // Let the user know that a connection is established. A bi-directional stream is ready to use.
+    println!("{} Peer connection established ()", local_now_fmt());
+
+    // Send the file size to the peer.
+    peer_send.write_u64(file_size).await?;
+
+    // Read the peer's response to the file size.
+    let response = peer_recv.read_u8().await?;
+    if response == 0 {
+        println!("{} Peer cancelled the upload", local_now_fmt());
+        return Ok(());
+    }
+
+    // Create a scratch space for reading data from the stream.
+    let mut buf = [0; MAX_PEER_COMMUNICATION_SIZE];
+    // Read from the file and write to the peer.
+    loop {
+        // Read a natural amount of bytes from the file.
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+
+        // Write the bytes to the peer.
+        peer_send.write_all(&buf[..n]).await?;
+    }
+
+    // Let the user know that the upload is complete.
+    println!("{} Upload complete!", local_now_fmt());
+    Ok(())
+}
+
 /// Try to read a valid UTF-8 from the server until the expected length is reached.
 async fn expect_server_text(stream: &mut quinn::RecvStream, len: u16) -> anyhow::Result<String> {
-    let mut raw_bytes = [0; file_yeet_shared::MAX_PAYLOAD_SIZE];
+    let mut raw_bytes = [0; MAX_SERVER_COMMUNICATION_SIZE];
     let expected_slice = &mut raw_bytes[..len as usize];
     stream.read_exact(expected_slice).await?;
     Ok(std::str::from_utf8(expected_slice)?.to_owned())
@@ -647,9 +837,10 @@ fn configure_peer_verification() -> quinn::ClientConfig {
 }
 
 /// Test loop that reads from stdin to write to the peer, and reads from the peer to print to stdout.
+#[allow(dead_code)]
 async fn test_rwpl(peer_connection: quinn::Connection, open: bool) {
     // Create a scratch space for reading data from the stream.
-    let mut buf = [0; MAX_PAYLOAD_SIZE];
+    let mut buf = [0; MAX_SERVER_COMMUNICATION_SIZE];
 
     let (mut peer_send, mut peer_recv) = if open {
         let mut streams = peer_connection
@@ -670,7 +861,7 @@ async fn test_rwpl(peer_connection: quinn::Connection, open: bool) {
         peer_connection
             .accept_bi()
             .await
-            .expect("Failed to accept a bi-directional QUIC stream to the peer")
+            .expect("Failed to accept a bi-directional QUIC stream from the peer")
     };
 
     // Let the user know that the handshake is complete. Bi-directional streams are ready to use.

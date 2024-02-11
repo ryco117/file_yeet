@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::Arc};
 use bytes::BufMut as _;
 use clap::Parser;
 use file_yeet_shared::{
-    local_now_fmt, ClientApiRequest, HashBytes, SocketAddrHelper, MAX_PAYLOAD_SIZE,
+    local_now_fmt, ClientApiRequest, HashBytes, SocketAddrHelper, MAX_SERVER_COMMUNICATION_SIZE,
 };
 use smallvec::SmallVec;
 use tokio::{
@@ -103,7 +103,7 @@ async fn handle_quic_connection(
     let socket_addr = connection.remote_address();
     let mut sock_string = socket_addr.to_string();
     let (mut quic_send, mut quic_recv) = connection.accept_bi().await?;
-    let mut bb = bytes::BytesMut::with_capacity(MAX_PAYLOAD_SIZE);
+    let mut bb = bytes::BytesMut::with_capacity(MAX_SERVER_COMMUNICATION_SIZE);
 
     loop {
         let api = ClientApiRequest::try_from(quic_recv.read_u16().await?)?;
@@ -190,7 +190,7 @@ async fn handle_publish(
 ) -> anyhow::Result<()> {
     // Use a channel to handle buffering and flushing of messages.
     // Ensures that the stream doesn't need to be cloned or passed between threads.
-    let (tx, mut rx) = mpsc::channel::<String>(4 * MAX_PAYLOAD_SIZE);
+    let (tx, mut rx) = mpsc::channel::<String>(4 * MAX_SERVER_COMMUNICATION_SIZE);
     let sock_string_clone = sock_string.clone();
     tokio::task::spawn(async move {
         #[cfg(debug_assertions)]
