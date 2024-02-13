@@ -133,6 +133,9 @@ async fn handle_quic_connection(
                     a.to_string()
                 };
                 println!("{} Overriding port to {port}", local_now_fmt());
+
+                // TODO: If this client is publishing, these addresses will be stale.
+                // Store `sock_string` in a `RwLock` pass a thread-safe reference to callers.
             }
             ClientApiRequest::Publish => {
                 let mut hash = HashBytes::default();
@@ -160,17 +163,14 @@ async fn handle_quic_connection(
                     .map(|()| ClientRequestError::SubHashBytes)?;
 
                 // Now that we have the peer's socket address and the file hash, we can handle the subscribe request.
-                if let Err(e) = handle_subscribe(quic_send, sock_string, hash, publishers, bb).await
+                if let Err(e) =
+                    handle_subscribe(&mut quic_send, &sock_string, hash, &publishers, &mut bb).await
                 {
                     eprintln!(
                         "{} Failed to handle subscribe request: {e}",
                         local_now_fmt()
                     );
                 }
-
-                // Terminate our connection with the client.
-                // TODO: Consider allowing the client to subscribe to more than one file hash, or publish simultaneously.
-                return Ok(());
             }
         }
         // Clear the scratch space before the next iteration.
@@ -261,12 +261,12 @@ async fn handle_publish(
 
 /// Handle QUIC connections for clients that want to subscribe to a file hash.
 async fn handle_subscribe(
-    mut quic_send: quinn::SendStream,
-    sock_string: String,
+    quic_send: &mut quinn::SendStream,
+    sock_string: &String,
     hash: HashBytes,
-    clients: PublishersRef,
-    mut bb: bytes::BytesMut,
-) -> anyhow::Result<()> {
+    clients: &PublishersRef,
+    bb: &mut bytes::BytesMut,
+) -> Result<(), std::io::Error> {
     // Attempt to get the client from the map.
     let read_lock = clients.read().await;
     let Some(client_list) = read_lock.get(&hash).filter(|v| !v.is_empty()) else {
@@ -283,36 +283,45 @@ async fn handle_subscribe(
 
         // Send the subscriber a message that no publishers are available.
         quic_send.write_u16(0).await?;
-
-        // TODO: Allow a client to wait for a publishing peer to become available instead of closing stream.
-        quic_send.finish().await?;
         return Ok(());
     };
-    // TODO: Allow sending more than one client address for a file hash.
-    let pub_client = client_list.iter().next().unwrap();
 
-    // Feed the publishing client socket address to the task that handles communicating with this client.
-    pub_client
-        .stream
-        .send(sock_string.clone())
-        .await
-        .expect("Could not feed the publish task thread");
+    // Write a temporary zero to the buffer for space efficiency.
+    // This will be overwritten later.
+    bb.put_u16(0);
 
-    // Send the publisher's socket address to the subscribing client.
-    let n = u16::try_from(pub_client.address.len()).expect("Message content length is invalid");
-    bb.put_u16(n);
-    bb.put(pub_client.address.as_bytes());
+    let clients = client_list.iter();
+    let mut n: u16 = 0;
+    for pub_client in clients {
+        // Ensure that the message doesn't exceed the maximum size.
+        if bb.len() + 2 + pub_client.address.len() > MAX_SERVER_COMMUNICATION_SIZE {
+            break;
+        }
 
-    // Send the message to the client and close the stream.
-    quic_send.write_all(&bb).await?;
-    quic_send.finish().await?;
+        // Feed the publishing client socket address to the task that handles communicating with this client.
+        // Only include the peer if the message was successfully passed.
+        if let Ok(()) = pub_client.stream.send(sock_string.clone()).await {
+            // Send the publisher's socket address to the subscribing client.
+            bb.put_u16(u16::try_from(pub_client.address.len()).unwrap());
+            bb.put(pub_client.address.as_bytes());
+            n += 1;
+        }
+    }
+
+    // Overwrite the number of peers shared with the actual count, in big-endian.
+    bb[..2].copy_from_slice(&n.to_be_bytes());
+
+    // Send the message to the client.
+    quic_send.write_all(bb).await?;
 
     #[cfg(debug_assertions)]
-    println!(
-        "{} Introduced {} to {sock_string}",
-        local_now_fmt(),
-        pub_client.address
-    );
+    if n != 0 {
+        println!(
+            "{} Introduced {} peers to {sock_string}",
+            local_now_fmt(),
+            n
+        );
+    }
 
     Ok(())
 }

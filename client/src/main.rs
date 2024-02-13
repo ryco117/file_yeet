@@ -71,7 +71,7 @@ async fn main() {
     let mut bb = bytes::BytesMut::with_capacity(MAX_SERVER_COMMUNICATION_SIZE);
 
     // Connect to the public file_yeet_server.
-    let (endpoint, connection, server_send, server_recv, port_mapping) =
+    let (endpoint, connection, server_streams, port_mapping) =
         prepare_server_connection(&args, &mut bb).await;
 
     // Determine if we are going to make a publish or subscribe request.
@@ -112,17 +112,7 @@ async fn main() {
             );
             reader.rewind().await.expect("Failed to rewind the file");
 
-            publish_loop(
-                &args,
-                endpoint,
-                server_send,
-                server_recv,
-                bb,
-                hash,
-                file_size,
-                reader,
-            )
-            .await;
+            publish_loop(&args, endpoint, server_streams, bb, hash, file_size, reader).await;
         }
 
         // Try to get the file hash from the rendezvous server and peers.
@@ -147,7 +137,7 @@ async fn main() {
                 |o| o.clone().into(),
             );
 
-            subscribe(&args, endpoint, server_send, server_recv, bb, hash, output).await;
+            subscribe(&args, endpoint, server_streams, bb, hash, output).await;
         }
     }
 
@@ -170,8 +160,7 @@ async fn main() {
 async fn publish_loop(
     args: &Cli,
     endpoint: quinn::Endpoint,
-    mut server_send: quinn::SendStream,
-    mut server_recv: quinn::RecvStream,
+    mut server_streams: BiStream,
     mut bb: bytes::BytesMut,
     hash: HashBytes,
     file_size: u64,
@@ -181,14 +170,15 @@ async fn publish_loop(
     bb.put_u16(file_yeet_shared::ClientApiRequest::Publish as u16);
     bb.put(&hash[..]);
     // Send the server a publish request.
-    server_send
+    server_streams
+        .send
         .write_all(&bb)
         .await
         .expect("Failed to send a publish request to the server");
     drop(bb);
 
     // Close the stream after completing the publish request.
-    let _ = server_send.finish().await;
+    let _ = server_streams.send.finish().await;
 
     // Enter a loop to listen for the server to send peer connections.
     loop {
@@ -197,7 +187,8 @@ async fn publish_loop(
             local_now_fmt()
         );
 
-        let data_len = server_recv
+        let data_len = server_streams
+            .recv
             .read_u16()
             .await
             .expect("Failed to read a u16 response from the server")
@@ -213,7 +204,7 @@ async fn publish_loop(
 
         let mut scratch_space = [0; MAX_SERVER_COMMUNICATION_SIZE];
         let peer_string_bytes = &mut scratch_space[..data_len];
-        if let Err(e) = server_recv.read_exact(peer_string_bytes).await {
+        if let Err(e) = server_streams.recv.read_exact(peer_string_bytes).await {
             eprintln!(
                 "{} Failed to read a response from the server: {e}",
                 local_now_fmt()
@@ -269,8 +260,7 @@ async fn publish_loop(
 async fn subscribe(
     args: &Cli,
     endpoint: quinn::Endpoint,
-    mut server_send: quinn::SendStream,
-    mut server_recv: quinn::RecvStream,
+    mut server_streams: BiStream,
     mut bb: bytes::BytesMut,
     hash: HashBytes,
     output: PathBuf,
@@ -278,14 +268,12 @@ async fn subscribe(
     // Send the server a subscribe request.
     bb.put_u16(file_yeet_shared::ClientApiRequest::Subscribe as u16);
     bb.put(&hash[..]);
-    server_send
+    server_streams
+        .send
         .write_all(&bb)
         .await
         .expect("Failed to send a subscribe request to the server");
     drop(bb);
-
-    // Close the stream after completing the publish request.
-    let _ = server_send.finish().await;
 
     println!(
         "{} Requesting file with hash from the server...",
@@ -293,45 +281,75 @@ async fn subscribe(
     );
 
     // Determine if the server is responding with a success or failure.
-    let response_size = server_recv
+    let response_count = server_streams
+        .recv
         .read_u16()
         .await
         .expect("Failed to read a u16 response from the server") as usize;
-    if response_size == 0 {
+    if response_count == 0 {
         eprintln!("{} No publishers available for file hash", local_now_fmt());
-        return;
-    }
-    if response_size > MAX_SERVER_COMMUNICATION_SIZE {
-        eprintln!("{} Server response length is invalid", local_now_fmt());
         return;
     }
 
     // Parse the response as a peer socket address.
     let mut scratch_space = [0; MAX_SERVER_COMMUNICATION_SIZE];
-    let peer_string_bytes = &mut scratch_space[..response_size];
-    server_recv
-        .read_exact(peer_string_bytes)
-        .await
-        .expect("Failed to read a valid UTF-8 response from the server");
-    let peer_address: SocketAddr = std::str::from_utf8(peer_string_bytes)
-        .expect("Server did not send a valid UTF-8 response")
-        .parse::<SocketAddr>()
-        .expect("Server did not send a valid socket address for the peer");
+    let mut connection_attempts = Vec::with_capacity(response_count);
+    for _ in 0..response_count {
+        let address_len = server_streams
+            .recv
+            .read_u16()
+            .await
+            .expect("Failed to read response from server") as usize;
+        let peer_string_bytes = &mut scratch_space[..address_len];
+        server_streams
+            .recv
+            .read_exact(peer_string_bytes)
+            .await
+            .expect("Failed to read a valid UTF-8 response from the server");
+        let peer_address_str = std::str::from_utf8(peer_string_bytes)
+            .expect("Server did not send a valid UTF-8 response");
+        let peer_address = match peer_address_str.parse() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "{} Failed to parse peer address {peer_address_str}: {e}",
+                    local_now_fmt()
+                );
+                continue;
+            }
+        };
 
-    // Connect to the peer and assign the peer `Connection` lock when connected.
-    let local_address = endpoint
-        .local_addr()
-        .expect("Could not determine our local IP");
-    let peer_connection = udp_holepunch(args, endpoint, local_address, peer_address)
-        .await
-        .expect("UDP hole punching failed");
+        // Connect to the peer and assign the peer `Connection` lock when connected.
+        let local_address = endpoint
+            .local_addr()
+            .expect("Could not determine our local IP");
 
-    // Try to download the requested file using the peer connection.
-    if let Err(e) = download_from_peer(peer_connection, hash, output).await {
-        eprintln!("{} Failed to download from peer: {e}", local_now_fmt());
+        // Try to connect to multiple peers concurrently with a list of connection futures.
+        connection_attempts.push(udp_holepunch(
+            args,
+            endpoint.clone(),
+            local_address,
+            peer_address,
+        ));
     }
 
-    // test_rwpl(peer_connection, true).await;
+    // Wait for all connection attempts to compleste and use the first peer connection that is successful.
+    // TODO: Do not wait for all connections, return the first to be completed with a successful connection.
+    let peer_connection = futures_util::future::join_all(connection_attempts)
+        .await
+        .into_iter()
+        .find_map(std::convert::identity);
+
+    if let Some(peer_connection) = peer_connection {
+        // Try to download the requested file using the peer connection.
+        if let Err(e) = download_from_peer(peer_connection, hash, output).await {
+            eprintln!("{} Failed to download from peer: {e}", local_now_fmt());
+        }
+
+        // test_rwpl(peer_connection, true).await;
+    } else {
+        eprintln!("{} Failed to connect to any peers", local_now_fmt());
+    }
 }
 
 /// Create a QUIC endpoint connected to the server and perform basic setup.
@@ -341,8 +359,7 @@ async fn prepare_server_connection(
 ) -> (
     quinn::Endpoint,
     quinn::Connection,
-    quinn::SendStream,
-    quinn::RecvStream,
+    BiStream,
     Option<crab_nat::PortMapping>,
 ) {
     // Create a self-signed certificate for the peer communications.
@@ -427,24 +444,27 @@ async fn prepare_server_connection(
     let connection = connect_to_server(args, &endpoint).await;
 
     // Create a bi-directional stream to the server.
-    let (mut server_send, mut server_recv) = connection
+    let mut server_streams: BiStream = connection
         .open_bi()
         .await
-        .expect("Failed to open a bi-directional QUIC stream to the server");
+        .expect("Failed to open a bi-directional QUIC stream to the server")
+        .into();
 
     // Perform a sanity check by sending the server a socket ping request.
     // This allows us to verify that the server can determine our public address.
-    server_send
+    server_streams
+        .send
         .write_u16(file_yeet_shared::ClientApiRequest::SocketPing as u16)
         .await
         .expect("Failed to send a socket ping request to the server");
 
     // Read the server's response to the sanity check.
-    let string_len = server_recv
+    let string_len = server_streams
+        .recv
         .read_u16()
         .await
         .expect("Failed to read a u16 response from the server");
-    let sanity_check = expect_server_text(&mut server_recv, string_len)
+    let sanity_check = expect_server_text(&mut server_streams.recv, string_len)
         .await
         .expect("Failed to read a valid socket address from the server");
     let sanity_check_addr: SocketAddr = sanity_check
@@ -459,7 +479,8 @@ async fn prepare_server_connection(
             bb.put_u16(file_yeet_shared::ClientApiRequest::PortOverride as u16);
             bb.put_u16(port);
             // Send the port override request to the server and clear the buffer.
-            server_send
+            server_streams
+                .send
                 .write_all(bb)
                 .await
                 .expect("Failed to send the port override request to the server");
@@ -467,7 +488,7 @@ async fn prepare_server_connection(
         }
     }
 
-    (endpoint, connection, server_send, server_recv, port_mapping)
+    (endpoint, connection, server_streams, port_mapping)
 }
 
 /// Connect to the server using QUIC.
@@ -598,7 +619,7 @@ async fn connect_to_peer(
 
     // Ensure we have retries left and there isn't already a peer `Connection` to use.
     loop {
-        println!("{} Connecting to peer at: {peer_address}", local_now_fmt());
+        println!("{} Connecting to peer at {peer_address}", local_now_fmt());
         match endpoint.connect(peer_address, "peer") {
             Ok(connecting) => {
                 let connection =
@@ -621,7 +642,7 @@ async fn connect_to_peer(
                     .lock()
                     .expect("Could not obtain the mutex lock") = true;
 
-                println!("{} Connected to peer at: {peer_address}", local_now_fmt());
+                println!("{} Connected to peer at {peer_address}", local_now_fmt());
                 return Some(connection);
             }
             Err(e) => {
@@ -647,13 +668,13 @@ async fn download_from_peer(
     output: PathBuf,
 ) -> anyhow::Result<()> {
     // Let the uploading peer open a bi-directional stream.
-    let (mut peer_send, mut peer_recv) = connection.accept_bi().await?;
+    let mut peer_streams: BiStream = connection.accept_bi().await?.into();
 
     // Let the user know that a connection is established. A bi-directional stream is ready to use.
     println!("{} Peer connection established", local_now_fmt());
 
     // Read the file size from the peer.
-    let file_size = peer_recv.read_u64().await?;
+    let file_size = peer_streams.recv.read_u64().await?;
 
     // Ensure the user consents to downloading the file.
     if output.exists() {
@@ -680,7 +701,7 @@ async fn download_from_peer(
         println!("{} Download cancelled", local_now_fmt());
 
         // Let the peer know that we cancelled the download.
-        peer_send.write_u8(0).await?;
+        peer_streams.send.write_u8(0).await?;
 
         return Ok(());
     }
@@ -694,8 +715,8 @@ async fn download_from_peer(
         .await?;
 
     // Let the peer know that we accepted the download.
-    peer_send.write_u8(1).await?;
-    peer_send.finish().await?;
+    peer_streams.send.write_u8(1).await?;
+    peer_streams.send.finish().await?;
 
     // Create a scratch space for reading data from the stream.
     let mut buf = [0; MAX_PEER_COMMUNICATION_SIZE];
@@ -704,7 +725,8 @@ async fn download_from_peer(
     let mut hasher = Sha256::new();
     while bytes_written < file_size {
         // Read a natural amount of bytes from the peer.
-        let size = peer_recv
+        let size = peer_streams
+            .recv
             .read(&mut buf)
             .await?
             .expect("Peer cancelled the connection");
@@ -750,16 +772,16 @@ async fn upload_to_peer(
     reader: &mut tokio::io::BufReader<tokio::fs::File>,
 ) -> anyhow::Result<()> {
     // Open a bi-directional stream.
-    let (mut peer_send, mut peer_recv) = connection.open_bi().await?;
+    let mut peer_streams: BiStream = connection.open_bi().await?.into();
 
     // Let the user know that a connection is established. A bi-directional stream is ready to use.
     println!("{} Peer connection established ()", local_now_fmt());
 
     // Send the file size to the peer.
-    peer_send.write_u64(file_size).await?;
+    peer_streams.send.write_u64(file_size).await?;
 
     // Read the peer's response to the file size.
-    let response = peer_recv.read_u8().await?;
+    let response = peer_streams.recv.read_u8().await?;
     if response == 0 {
         println!("{} Peer cancelled the upload", local_now_fmt());
         return Ok(());
@@ -776,7 +798,7 @@ async fn upload_to_peer(
         }
 
         // Write the bytes to the peer.
-        peer_send.write_all(&buf[..n]).await?;
+        peer_streams.send.write_all(&buf[..n]).await?;
     }
 
     // Let the user know that the upload is complete.
@@ -889,5 +911,16 @@ async fn test_rwpl(peer_connection: quinn::Connection, open: bool) {
             Ok(peer_line) => print!("{peer_line}"),
             Err(e) => eprintln!("Received invalid UTF-8 from peer: {e}"),
         }
+    }
+}
+
+/// Helper type for grouping a bi-directional stream, instead of the default tuple type.
+struct BiStream {
+    pub send: quinn::SendStream,
+    pub recv: quinn::RecvStream,
+}
+impl From<(quinn::SendStream, quinn::RecvStream)> for BiStream {
+    fn from((send, recv): (quinn::SendStream, quinn::RecvStream)) -> Self {
+        Self { send, recv }
     }
 }
