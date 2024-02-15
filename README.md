@@ -7,7 +7,7 @@ Uses UDP hole punching and [port mapping techniques](https://crates.io/crates/cr
 ## Usage
 
 ### Server
-```bash
+```text
 $ cargo r --bin file_yeet_server -- -h
 The command line arguments for the server
 
@@ -30,7 +30,7 @@ docker build -t file_yeet_server:local .
 
 
 ### Client
-```bash
+```text
 $ cargo r --bin file_yeet_client -- -h
 Usage: file_yeet_client.exe [OPTIONS] <COMMAND>
 
