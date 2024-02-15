@@ -8,11 +8,14 @@ use std::{
 
 use bytes::BufMut as _;
 use file_yeet_shared::{local_now_fmt, HashBytes, SocketAddrHelper, MAX_SERVER_COMMUNICATION_SIZE};
+use futures_util::{stream::FuturesUnordered, StreamExt};
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 /// Use a sane default timeout for server connections.
 const SERVER_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
+const PEER_LISTEN_TIMEOUT: Duration = Duration::from_secs(5);
+const PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Define a sane number of maximum retries.
 const MAX_PEER_CONNECTION_RETRIES: usize = 3;
@@ -110,9 +113,8 @@ async fn main() {
                 faster_hex::hex_encode(&hash, &mut hex_bytes)
                     .expect("Failed to use a valid hex buffer"),
             );
-            reader.rewind().await.expect("Failed to rewind the file");
 
-            publish_loop(&args, endpoint, server_streams, bb, hash, file_size, reader).await;
+            publish_loop(endpoint, server_streams, bb, hash, file_size, reader).await;
         }
 
         // Try to get the file hash from the rendezvous server and peers.
@@ -137,7 +139,7 @@ async fn main() {
                 |o| o.clone().into(),
             );
 
-            subscribe(&args, endpoint, server_streams, bb, hash, output).await;
+            subscribe(endpoint, server_streams, bb, hash, output).await;
         }
     }
 
@@ -158,7 +160,6 @@ async fn main() {
 
 /// Enter a loop to listen for the server to send peer socket addresses requesting our publish.
 async fn publish_loop(
-    args: &Cli,
     endpoint: quinn::Endpoint,
     mut server_streams: BiStream,
     mut bb: bytes::BytesMut,
@@ -232,8 +233,8 @@ async fn publish_loop(
         };
 
         // Listen for a peer and assign the peer `Connection` lock when connected.
-        let Some(peer_connection) = udp_holepunch(
-            args,
+        let Some(peer_streams) = udp_holepunch(
+            FileYeetCommandType::Pub,
             endpoint.clone(),
             endpoint
                 .local_addr()
@@ -247,7 +248,7 @@ async fn publish_loop(
         };
 
         // Try to upload the file to the peer connection.
-        if let Err(e) = upload_to_peer(peer_connection, file_size, &mut reader).await {
+        if let Err(e) = upload_to_peer(peer_streams, file_size, &mut reader).await {
             eprintln!("{} Failed to upload to peer: {e}", local_now_fmt());
         }
 
@@ -258,7 +259,6 @@ async fn publish_loop(
 }
 
 async fn subscribe(
-    args: &Cli,
     endpoint: quinn::Endpoint,
     mut server_streams: BiStream,
     mut bb: bytes::BytesMut,
@@ -273,7 +273,6 @@ async fn subscribe(
         .write_all(&bb)
         .await
         .expect("Failed to send a subscribe request to the server");
-    drop(bb);
 
     println!(
         "{} Requesting file with hash from the server...",
@@ -285,15 +284,19 @@ async fn subscribe(
         .recv
         .read_u16()
         .await
-        .expect("Failed to read a u16 response from the server") as usize;
+        .expect("Failed to read a u16 response from the server");
     if response_count == 0 {
         eprintln!("{} No publishers available for file hash", local_now_fmt());
         return;
     }
 
-    // Parse the response as a peer socket address.
     let mut scratch_space = [0; MAX_SERVER_COMMUNICATION_SIZE];
-    let mut connection_attempts = Vec::with_capacity(response_count);
+    let mut connection_attempts = FuturesUnordered::new();
+    let local_address = endpoint
+        .local_addr()
+        .expect("Could not determine our local IP");
+
+    // Parse each peer socket address.
     for _ in 0..response_count {
         let address_len = server_streams
             .recv
@@ -319,26 +322,23 @@ async fn subscribe(
             }
         };
 
-        // Connect to the peer and assign the peer `Connection` lock when connected.
-        let local_address = endpoint
-            .local_addr()
-            .expect("Could not determine our local IP");
-
         // Try to connect to multiple peers concurrently with a list of connection futures.
         connection_attempts.push(udp_holepunch(
-            args,
+            FileYeetCommandType::Sub,
             endpoint.clone(),
             local_address,
             peer_address,
         ));
     }
 
-    // Wait for all connection attempts to compleste and use the first peer connection that is successful.
-    // TODO: Do not wait for all connections, return the first to be completed with a successful connection.
-    let peer_connection = futures_util::future::join_all(connection_attempts)
-        .await
-        .into_iter()
-        .find_map(std::convert::identity);
+    // Iterate through the connection attempts as they resolve and use the first successful connection.
+    let peer_connection = loop {
+        match connection_attempts.next().await {
+            Some(Some(b)) => break Some(b),
+            Some(None) => continue,
+            None => break None,
+        }
+    };
 
     if let Some(peer_connection) = peer_connection {
         // Try to download the requested file using the peer connection.
@@ -530,39 +530,73 @@ async fn connect_to_server(args: &Cli, endpoint: &quinn::Endpoint) -> quinn::Con
 
 /// Attempt to connect to peer using UDP hole punching.
 async fn udp_holepunch(
-    args: &Cli,
+    cmd: FileYeetCommandType,
     endpoint: quinn::Endpoint,
     local_address: SocketAddr,
     peer_address: SocketAddr,
-) -> Option<quinn::Connection> {
+) -> Option<BiStream> {
     // Create a lock for where we will place the QUIC connection used to communicate with our peer.
     let peer_reached_lock: Arc<Mutex<bool>> = Arc::default();
 
     // Spawn a thread that listens for a peer and will set the boolean lock when connected.
     let peer_reached_listen = peer_reached_lock.clone();
     let endpoint_listen = endpoint.clone();
-    let listen_future = listen_for_peer(endpoint_listen, local_address, &peer_reached_listen);
+    let listen_future = tokio::time::timeout(
+        PEER_LISTEN_TIMEOUT,
+        listen_for_peer(endpoint_listen, local_address, &peer_reached_listen),
+    );
 
     // Attempt to connect to the peer's public address.
-    let connect_future = connect_to_peer(endpoint, peer_address, &peer_reached_lock);
+    let connect_future = tokio::time::timeout(
+        PEER_CONNECT_TIMEOUT,
+        connect_to_peer(endpoint, peer_address, &peer_reached_lock),
+    );
 
     // Return the peer stream if we have one.
     let (listen_stream, connect_stream) = futures_util::join!(listen_future, connect_future);
-    match u32::from(listen_stream.is_some()) + u32::from(connect_stream.is_some()) {
+    let listen_stream = listen_stream.ok().flatten();
+    let connect_stream = connect_stream.ok().flatten();
+    let connection = match u32::from(listen_stream.is_some()) + u32::from(connect_stream.is_some())
+    {
         0 => None,
         1 => listen_stream.or(connect_stream),
         2 => {
             // TODO: It could be interesting and possible to create a more general stream negotiation.
             //       For example, if each peer sent a random nonce over each stream, and the nonces were XOR'd per stream,
             //       the result could be used to determine which stream to use (highest/lowest resulting nonce after XOR).
-            if let FileYeetCommand::Pub { .. } = args.cmd {
-                listen_stream
-            } else {
-                connect_stream
+            match cmd {
+                FileYeetCommandType::Pub => listen_stream,
+                FileYeetCommandType::Sub => connect_stream,
             }
         }
         _ => unreachable!("Not possible to have more than two streams"),
-    }
+    }?;
+
+    let peer_streams: BiStream = tokio::time::timeout(Duration::from_millis(400), async {
+        let streams = match cmd {
+            FileYeetCommandType::Pub => {
+                // Open a bi-directional stream.
+                connection.open_bi().await
+            }
+            FileYeetCommandType::Sub => {
+                // Let the uploading peer open a bi-directional stream.
+                connection.accept_bi().await
+            }
+        };
+        if let Ok(streams) = streams {
+            Some(streams.into())
+        } else {
+            None
+        }
+    })
+    .await
+    .ok()
+    .flatten()?;
+
+    // Let the user know that a connection is established. A bi-directional stream is ready to use.
+    println!("{} Peer connection established", local_now_fmt());
+
+    Some(peer_streams)
 }
 
 /// Spawn a thread that listens for a peer and will assign the peer `Connection` lock when connected.
@@ -573,15 +607,12 @@ async fn listen_for_peer(
 ) -> Option<quinn::Connection> {
     // Print and create binding from the local address.
     println!(
-        "{} Listening for peer on the same endpoint connected to the server: {local_address}",
+        "{} Listening for peer on the QUIC endpoint: {local_address}",
         local_now_fmt()
     );
 
     // Accept a peer connection.
-    let connecting = tokio::time::timeout(std::time::Duration::from_secs(5), endpoint.accept())
-        .await
-        .ok()? // Timeout.
-        .expect("Failed to accept on endpoint");
+    let connecting = endpoint.accept().await?;
     let connection = match connecting.await {
         Ok(connection) => connection,
         Err(e) => {
@@ -601,7 +632,7 @@ async fn listen_for_peer(
     // Connected to a peer on the listening stream, print their address.
     let peer_addr = connection.remote_address();
     println!(
-        "{} New connection from peer at: {peer_addr:?}",
+        "{} New connection accepted from peer at: {peer_addr:?}",
         local_now_fmt()
     );
 
@@ -618,25 +649,22 @@ async fn connect_to_peer(
     let mut retries = MAX_PEER_CONNECTION_RETRIES;
 
     // Ensure we have retries left and there isn't already a peer `Connection` to use.
-    loop {
+    while retries > 0
+        && !*peer_reached_lock
+            .lock()
+            .expect("Could not obtain the mutex lock")
+    {
         println!("{} Connecting to peer at {peer_address}", local_now_fmt());
         match endpoint.connect(peer_address, "peer") {
             Ok(connecting) => {
-                let connection =
-                    match tokio::time::timeout(Duration::from_secs(5), connecting).await {
-                        Ok(Ok(c)) => c,
-                        Ok(Err(e)) => {
-                            eprintln!("{} Failed to connect to peer: {e}", local_now_fmt());
-                            retries -= 1;
-                            continue;
-                        }
-                        Err(_) => {
-                            eprintln!("{} Failed to connect to peer: Timeout", local_now_fmt());
-
-                            // Do not retry on timeout.
-                            return None;
-                        }
-                    };
+                let connection = match connecting.await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("{} Failed to connect to peer: {e}", local_now_fmt());
+                        retries -= 1;
+                        continue;
+                    }
+                };
                 // Set the peer mutex to the connected stream if there isn't already one present.
                 *peer_reached_lock
                     .lock()
@@ -650,28 +678,18 @@ async fn connect_to_peer(
                 retries -= 1;
             }
         }
-
-        if retries == 0
-            || *peer_reached_lock
-                .lock()
-                .expect("Could not obtain the mutex lock")
-        {
-            return None;
-        }
     }
+
+    None
 }
 
 /// Download a file from the peer.
 async fn download_from_peer(
-    connection: quinn::Connection,
+    mut peer_streams: BiStream,
     hash: HashBytes,
     output: PathBuf,
 ) -> anyhow::Result<()> {
-    // Let the uploading peer open a bi-directional stream.
-    let mut peer_streams: BiStream = connection.accept_bi().await?.into();
-
-    // Let the user know that a connection is established. A bi-directional stream is ready to use.
-    println!("{} Peer connection established", local_now_fmt());
+    println!("{} Getting file size from peer...", local_now_fmt());
 
     // Read the file size from the peer.
     let file_size = peer_streams.recv.read_u64().await?;
@@ -746,10 +764,6 @@ async fn download_from_peer(
     // Ensure the file hash is correct.
     let downloaded_hash = hasher.finalize();
     if hash != Into::<HashBytes>::into(downloaded_hash) {
-        eprintln!(
-            "{} Downloaded file hash does not match the expected hash",
-            local_now_fmt()
-        );
         anyhow::bail!(
             "{} Downloaded file hash does not match the expected hash",
             local_now_fmt()
@@ -767,15 +781,12 @@ async fn download_from_peer(
 
 /// Download a file from the peer.
 async fn upload_to_peer(
-    connection: quinn::Connection,
+    mut peer_streams: BiStream,
     file_size: u64,
     reader: &mut tokio::io::BufReader<tokio::fs::File>,
 ) -> anyhow::Result<()> {
-    // Open a bi-directional stream.
-    let mut peer_streams: BiStream = connection.open_bi().await?.into();
-
-    // Let the user know that a connection is established. A bi-directional stream is ready to use.
-    println!("{} Peer connection established ()", local_now_fmt());
+    // Ensure that the file reader is at the start of the file before each upload.
+    reader.rewind().await.expect("Failed to rewind the file");
 
     // Send the file size to the peer.
     peer_streams.send.write_u64(file_size).await?;
@@ -799,6 +810,11 @@ async fn upload_to_peer(
 
         // Write the bytes to the peer.
         peer_streams.send.write_all(&buf[..n]).await?;
+    }
+
+    // Greacefully close our connection after all data has been sent.
+    if let Err(e) = peer_streams.send.finish().await {
+        eprintln!("{} Failed to close the peer stream gracefully: {e}", local_now_fmt());
     }
 
     // Let the user know that the upload is complete.
@@ -923,4 +939,11 @@ impl From<(quinn::SendStream, quinn::RecvStream)> for BiStream {
     fn from((send, recv): (quinn::SendStream, quinn::RecvStream)) -> Self {
         Self { send, recv }
     }
+}
+
+/// The command being executed, without additional data.
+#[derive(Clone, Copy)]
+enum FileYeetCommandType {
+    Pub,
+    Sub,
 }
