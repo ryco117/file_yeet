@@ -119,7 +119,7 @@ async fn main() {
                 _ = tokio::signal::ctrl_c() => {
                     println!("{} Ctrl-C detected, cancelling the publish", local_now_fmt());
                 }
-                _ = publish_loop(endpoint, server_streams, bb, hash, file_size, reader) => {}
+                () = publish_loop(endpoint, server_streams, bb, hash, file_size, reader) => {}
             }
         }
 
@@ -257,8 +257,6 @@ async fn publish_loop(
         if let Err(e) = upload_to_peer(peer_streams, file_size, &mut reader).await {
             eprintln!("{} Failed to upload to peer: {e}", local_now_fmt());
         }
-
-        // test_rwpl(peer_connection, false).await;
     }
 
     println!("Server connection closed");
@@ -351,8 +349,6 @@ async fn subscribe(
         if let Err(e) = download_from_peer(peer_connection, hash, output).await {
             eprintln!("{} Failed to download from peer: {e}", local_now_fmt());
         }
-
-        // test_rwpl(peer_connection, true).await;
     } else {
         eprintln!("{} Failed to connect to any peers", local_now_fmt());
     }
@@ -820,7 +816,10 @@ async fn upload_to_peer(
 
     // Greacefully close our connection after all data has been sent.
     if let Err(e) = peer_streams.send.finish().await {
-        eprintln!("{} Failed to close the peer stream gracefully: {e}", local_now_fmt());
+        eprintln!(
+            "{} Failed to close the peer stream gracefully: {e}",
+            local_now_fmt()
+        );
     }
 
     // Let the user know that the upload is complete.
@@ -878,62 +877,6 @@ fn configure_peer_verification() -> quinn::ClientConfig {
     client_config.transport_config(Arc::new(transport_config));
 
     client_config
-}
-
-/// Test loop that reads from stdin to write to the peer, and reads from the peer to print to stdout.
-#[allow(dead_code)]
-async fn test_rwpl(peer_connection: quinn::Connection, open: bool) {
-    // Create a scratch space for reading data from the stream.
-    let mut buf = [0; MAX_SERVER_COMMUNICATION_SIZE];
-
-    let (mut peer_send, mut peer_recv) = if open {
-        let mut streams = peer_connection
-            .open_bi()
-            .await
-            .expect("Failed to open a bi-directional QUIC stream to the peer");
-
-        // The receiver will not know about the new stream request until data is sent.
-        // Thus, we send a hello packet to initialize the stream.
-        streams
-            .0
-            .write_all("Hello peer!\n".as_bytes())
-            .await
-            .expect("Failed to write to peer stream");
-
-        streams
-    } else {
-        peer_connection
-            .accept_bi()
-            .await
-            .expect("Failed to accept a bi-directional QUIC stream from the peer")
-    };
-
-    // Let the user know that the handshake is complete. Bi-directional streams are ready to use.
-    println!("{} Peer connection established", local_now_fmt());
-
-    // Testing.
-    loop {
-        // Read from stdin and write to the peer.
-        let mut line = String::new();
-        std::io::stdin()
-            .read_line(&mut line)
-            .expect("Failed to read valid UTF-8 from stdin");
-        peer_send
-            .write_all(line.as_bytes())
-            .await
-            .expect("Failed to write to peer stream");
-
-        // Read from the peer and print to stdout.
-        let size = peer_recv
-            .read(&mut buf)
-            .await
-            .expect("Could not read from peer stream")
-            .expect("Peer stream closed");
-        match std::str::from_utf8(&buf[..size]) {
-            Ok(peer_line) => print!("{peer_line}"),
-            Err(e) => eprintln!("Received invalid UTF-8 from peer: {e}"),
-        }
-    }
 }
 
 /// Helper type for grouping a bi-directional stream, instead of the default tuple type.

@@ -383,9 +383,9 @@ dependencies = [
 name = "file_yeet_server"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "bytes",
  "clap",
+ "displaydoc",
  "faster-hex",
  "file_yeet_shared",
  "futures-util",

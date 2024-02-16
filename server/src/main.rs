@@ -86,26 +86,31 @@ async fn main() {
             cancellation_token.cancel();
 
             // Close the QUIC endpoint with the DEADBEEF status.
-            local_end.close(quinn::VarInt::from_u32(0xDEADBEEF), &[]);
+            local_end.close(quinn::VarInt::from_u32(0xDEAD_BEEF), &[]);
 
             // Wait for the server's tasks to finish.
             task_master.close();
         }
-        _ = handle_incoming_loop(local_end.clone(), publishers, cancellation_token.clone(), task_master.clone()) => {}
+        () = handle_incoming_loop(local_end.clone(), publishers, cancellation_token.clone(), task_master.clone()) => {}
     }
 
     println!("{} Server has shut down", local_now_fmt());
 }
 
 /// Process incoming QUIC connections into their own tasks, allowing for client-task cancellation.
-async fn handle_incoming_loop(local_end: quinn::Endpoint, publishers: PublishersRef, cancellation_token: CancellationToken, task_master: TaskTracker) {
+async fn handle_incoming_loop(
+    local_end: quinn::Endpoint,
+    publishers: PublishersRef,
+    cancellation_token: CancellationToken,
+    task_master: TaskTracker,
+) {
     while let Some(connecting) = local_end.accept().await {
         let cancellation_token = cancellation_token.clone();
         let publishers = publishers.clone();
         task_master.spawn(async move {
             tokio::select! {
                 // Allow the server to cancel client tasks.
-                _ = cancellation_token.cancelled() => {}
+                () = cancellation_token.cancelled() => {}
 
                 // Handle this client's connection.
                 r = handle_quic_connection(connecting, publishers) => {
@@ -122,31 +127,43 @@ async fn handle_incoming_loop(local_end: quinn::Endpoint, publishers: Publishers
 }
 
 /// Errors encountered while handling a client request.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, displaydoc::Display, thiserror::Error)]
 enum ClientRequestError {
-    #[error("Failed to read a port override from the stream")]
-    PortOverride,
+    /// QUIC connection error: {0}.
+    Connection(quinn::ConnectionError),
 
-    #[error("Failed to read SHA-256 hash for publishing")]
-    PubHashBytes,
+    /// Invalid API request code {0}.
+    InvalidApiRequestCode(u16),
 
-    #[error("Failed to read SHA-256 hash for subscribing")]
-    SubHashBytes,
+    /// Failed to read expected bytes from the stream.
+    FailedRead,
+
+    /// Failed to write to the stream.
+    FailedWrite,
 }
 
 /// Handle the initial QUIC connection and attempt to determine whether the client wants to publish or subscribe.
 async fn handle_quic_connection(
     connecting: quinn::Connecting,
     publishers: PublishersRef,
-) -> anyhow::Result<()> {
-    let connection = connecting.await?;
+) -> Result<(), ClientRequestError> {
+    let connection = connecting.await.map_err(ClientRequestError::Connection)?;
     let socket_addr = connection.remote_address();
     let mut sock_string = socket_addr.to_string();
-    let (mut quic_send, mut quic_recv) = connection.accept_bi().await?;
+    let (mut quic_send, mut quic_recv) = connection
+        .accept_bi()
+        .await
+        .map_err(ClientRequestError::Connection)?;
     let mut bb = bytes::BytesMut::with_capacity(MAX_SERVER_COMMUNICATION_SIZE);
 
     loop {
-        let api = ClientApiRequest::try_from(quic_recv.read_u16().await?)?;
+        let api = ClientApiRequest::try_from(
+            quic_recv
+                .read_u16()
+                .await
+                .map_err(|_| ClientRequestError::FailedRead)?,
+        )
+        .map_err(|e| ClientRequestError::InvalidApiRequestCode(e.number))?;
         println!("{} {api} from {sock_string}", local_now_fmt());
 
         match api {
@@ -159,13 +176,16 @@ async fn handle_quic_connection(
                 bb.put(sock_string.as_bytes());
 
                 // Send the ping response to the client.
-                quic_send.write_all(&bb).await?;
+                quic_send
+                    .write_all(&bb)
+                    .await
+                    .map_err(|_| ClientRequestError::FailedWrite)?;
             }
             ClientApiRequest::PortOverride => {
                 let port = quic_recv
                     .read_u16()
                     .await
-                    .map_err(|_| ClientRequestError::PortOverride)?;
+                    .map_err(|_| ClientRequestError::FailedRead)?;
 
                 sock_string = {
                     let mut a = socket_addr;
@@ -182,14 +202,10 @@ async fn handle_quic_connection(
                 quic_recv
                     .read_exact(&mut hash)
                     .await
-                    .map(|()| ClientRequestError::PubHashBytes)?;
+                    .map_err(|_| ClientRequestError::FailedRead)?;
 
                 // Now that we have the peer's socket address and the file hash, we can handle the publish request.
-                if let Err(e) =
-                    handle_publish(connection, quic_send, sock_string, hash, publishers, bb).await
-                {
-                    eprintln!("{} Failed to handle publish request: {e}", local_now_fmt());
-                }
+                handle_publish(connection, quic_send, sock_string, hash, publishers, bb).await;
 
                 // Terminate our connection with the client.
                 // TODO: Consider allowing the client to publish more than one file hash, or subscribe simultaneously to a file.
@@ -200,7 +216,7 @@ async fn handle_quic_connection(
                 quic_recv
                     .read_exact(&mut hash)
                     .await
-                    .map(|()| ClientRequestError::SubHashBytes)?;
+                    .map_err(|_| ClientRequestError::FailedRead)?;
 
                 // Now that we have the peer's socket address and the file hash, we can handle the subscribe request.
                 if let Err(e) =
@@ -227,7 +243,7 @@ async fn handle_publish(
     hash: HashBytes,
     clients: PublishersRef,
     mut bb: bytes::BytesMut,
-) -> anyhow::Result<()> {
+) {
     // Use a channel to handle buffering and flushing of messages.
     // Ensures that the stream doesn't need to be cloned or passed between threads.
     let (tx, mut rx) = mpsc::channel::<String>(4 * MAX_SERVER_COMMUNICATION_SIZE);
@@ -286,7 +302,7 @@ async fn handle_publish(
     // Wait for the client to close the connection.
     let closed_reason = connection.closed().await;
     println!(
-        "{} Client disconnected: {sock_string} {closed_reason:?}",
+        "{} Client {sock_string} disconnected: {closed_reason:?}",
         local_now_fmt()
     );
 
@@ -295,8 +311,6 @@ async fn handle_publish(
     if let Some(clients_list) = clients.write().await.get_mut(&hash) {
         clients_list.retain(|c| c.address != sock_string);
     }
-
-    Ok(())
 }
 
 /// Handle QUIC connections for clients that want to subscribe to a file hash.
@@ -306,7 +320,7 @@ async fn handle_subscribe(
     hash: HashBytes,
     clients: &PublishersRef,
     bb: &mut bytes::BytesMut,
-) -> Result<(), std::io::Error> {
+) -> Result<(), ClientRequestError> {
     // Attempt to get the client from the map.
     let read_lock = clients.read().await;
     let Some(client_list) = read_lock.get(&hash).filter(|v| !v.is_empty()) else {
@@ -317,12 +331,15 @@ async fn handle_subscribe(
                 "{} Failed to find client for hash {}",
                 local_now_fmt(),
                 faster_hex::hex_encode(&hash, &mut hex_hash_bytes)
-                    .expect("Failed to hash as hexadecimal"),
+                    .expect("Failed to encode hash in hexadecimal"),
             );
         }
 
         // Send the subscriber a message that no publishers are available.
-        quic_send.write_u16(0).await?;
+        quic_send
+            .write_u16(0)
+            .await
+            .map_err(|_| ClientRequestError::FailedWrite)?;
         return Ok(());
     };
 
@@ -352,7 +369,10 @@ async fn handle_subscribe(
     bb[..2].copy_from_slice(&n.to_be_bytes());
 
     // Send the message to the client.
-    quic_send.write_all(bb).await?;
+    quic_send
+        .write_all(bb)
+        .await
+        .map_err(|_| ClientRequestError::FailedWrite)?;
 
     #[cfg(debug_assertions)]
     if n != 0 {
