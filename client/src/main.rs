@@ -53,6 +53,7 @@ struct Cli {
     cmd: FileYeetCommand,
 }
 
+/// The subcommands for `file_yeet_client`.
 #[derive(clap::Subcommand)]
 enum FileYeetCommand {
     /// Publish a file to the server.
@@ -114,7 +115,12 @@ async fn main() {
                     .expect("Failed to use a valid hex buffer"),
             );
 
-            publish_loop(endpoint, server_streams, bb, hash, file_size, reader).await;
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    println!("{} Ctrl-C detected, cancelling the publish", local_now_fmt());
+                }
+                _ = publish_loop(endpoint, server_streams, bb, hash, file_size, reader) => {}
+            }
         }
 
         // Try to get the file hash from the rendezvous server and peers.
