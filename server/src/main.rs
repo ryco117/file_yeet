@@ -10,6 +10,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     sync::{mpsc, RwLock},
 };
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 /// A client that has connected to the server.
 struct Client {
@@ -58,6 +59,7 @@ async fn main() {
     server_config.transport_config(file_yeet_shared::server_transport_config());
 
     // Tell the clients that they cannot change their socket address mid connection since it will disrupt peer-to-peer connecting.
+    // TODO: Investigate whether migrations can be captured to update their addresses in the server's map.
     server_config.migration(false);
 
     // Create a new QUIC endpoint.
@@ -67,15 +69,53 @@ async fn main() {
     // Create a map between file hashes and the addresses of peers that have the file.
     let publishers: PublishersRef = PublishersRef::default();
 
-    // Create a loop to handle QUIC connections.
+    // Create a cancellation token and set of tasks to allow the server to shut down gracefully.
+    let cancellation_token = CancellationToken::new();
+    let task_master = TaskTracker::new();
+
+    // Create a loop to handle QUIC connections, but allow cancelling the loop.
+    tokio::select! {
+        r = tokio::signal::ctrl_c() => {
+            if let Err(e) = r {
+                eprintln!("{} Failed to handle SIGINT, aborting: {e}", local_now_fmt());
+            } else {
+                println!("{} Shutting down server", local_now_fmt());
+            }
+
+            // Cancel the server's tasks.
+            cancellation_token.cancel();
+
+            // Close the QUIC endpoint with the DEADBEEF status.
+            local_end.close(quinn::VarInt::from_u32(0xDEADBEEF), &[]);
+
+            // Wait for the server's tasks to finish.
+            task_master.close();
+        }
+        _ = handle_incoming_loop(local_end.clone(), publishers, cancellation_token.clone(), task_master.clone()) => {}
+    }
+
+    println!("{} Server has shut down", local_now_fmt());
+}
+
+/// Process incoming QUIC connections into their own tasks, allowing for client-task cancellation.
+async fn handle_incoming_loop(local_end: quinn::Endpoint, publishers: PublishersRef, cancellation_token: CancellationToken, task_master: TaskTracker) {
     while let Some(connecting) = local_end.accept().await {
+        let cancellation_token = cancellation_token.clone();
         let publishers = publishers.clone();
-        tokio::spawn(async {
-            if let Err(e) = handle_quic_connection(connecting, publishers).await {
-                eprintln!(
-                    "{} Failed to handle client connection: {e}",
-                    local_now_fmt()
-                );
+        task_master.spawn(async move {
+            tokio::select! {
+                // Allow the server to cancel client tasks.
+                _ = cancellation_token.cancelled() => {}
+
+                // Handle this client's connection.
+                r = handle_quic_connection(connecting, publishers) => {
+                    if let Err(e) = r {
+                        eprintln!(
+                            "{} Failed to handle client connection: {e}",
+                            local_now_fmt()
+                        );
+                    }
+                }
             }
         });
     }
