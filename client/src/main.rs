@@ -1,7 +1,7 @@
 use std::{
     io::Write as _,
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-    path::PathBuf,
+    net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -238,8 +238,9 @@ async fn publish_loop(
             }
         };
 
-        // Listen for a peer and assign the peer `Connection` lock when connected.
-        let Some(peer_streams) = udp_holepunch(
+        // Attempt to connect to the peer using UDP hole punching.
+        // TODO: Use tasks to handle multiple publish requests concurrently.
+        let Some((_peer_connection, peer_streams)) = udp_holepunch(
             FileYeetCommandType::Pub,
             endpoint.clone(),
             endpoint
@@ -338,15 +339,34 @@ async fn subscribe(
     // Iterate through the connection attempts as they resolve and use the first successful connection.
     let peer_connection = loop {
         match connection_attempts.next().await {
-            Some(Some(b)) => break Some(b),
+            Some(Some((c, mut b))) => {
+                println!("{} Getting file size from peer...", local_now_fmt());
+
+                // Read the file size from the peer.
+                let Ok(file_size) = b.recv.read_u64().await else {
+                    continue;
+                };
+                let Ok(consent) = file_consent_cli(file_size, &output) else {
+                    continue;
+                };
+                if consent {
+                    break Some((c, b, file_size));
+                }
+
+                println!("{} Download cancelled", local_now_fmt());
+
+                // Try to let the peer know that we cancelled the download.
+                // Don't worry about the result since we are done with this peer.
+                let _ = tokio::time::timeout(Duration::from_millis(200), b.send.write_u8(0)).await;
+            }
             Some(None) => continue,
             None => break None,
         }
     };
 
-    if let Some(peer_connection) = peer_connection {
+    if let Some((_peer_connection, peer_streams, file_size)) = peer_connection {
         // Try to download the requested file using the peer connection.
-        if let Err(e) = download_from_peer(peer_connection, hash, output).await {
+        if let Err(e) = download_from_peer(hash, peer_streams, file_size, output).await {
             eprintln!("{} Failed to download from peer: {e}", local_now_fmt());
         }
     } else {
@@ -407,16 +427,7 @@ async fn prepare_server_connection(
     } else {
         // Allow the user to skip port mapping.
         let map_option = if args.nat_map {
-            match crab_nat::PortMapping::new(
-                gateway,
-                local_address.ip(),
-                crab_nat::InternetProtocol::Udp,
-                std::num::NonZeroU16::new(local_address.port())
-                    .expect("Socket address has no port"),
-                crab_nat::PortMappingOptions::default(),
-            )
-            .await
-            {
+            match try_port_mapping(gateway, local_address).await {
                 Ok(m) => Some(m),
                 Err(e) => {
                     eprintln!("{} Failed to create a port mapping: {e}", local_now_fmt());
@@ -493,6 +504,21 @@ async fn prepare_server_connection(
     (endpoint, connection, server_streams, port_mapping)
 }
 
+/// Attempt to create a port mapping using NAT-PMP or PCP.
+async fn try_port_mapping(
+    gateway: IpAddr,
+    local_address: SocketAddr,
+) -> Result<crab_nat::PortMapping, crab_nat::MappingFailure> {
+    crab_nat::PortMapping::new(
+        gateway,
+        local_address.ip(),
+        crab_nat::InternetProtocol::Udp,
+        std::num::NonZeroU16::new(local_address.port()).expect("Socket address has no port"),
+        crab_nat::PortMappingOptions::default(),
+    )
+    .await
+}
+
 /// Connect to the server using QUIC.
 async fn connect_to_server(args: &Cli, endpoint: &quinn::Endpoint) -> quinn::Connection {
     // Reused error message string.
@@ -536,7 +562,7 @@ async fn udp_holepunch(
     endpoint: quinn::Endpoint,
     local_address: SocketAddr,
     peer_address: SocketAddr,
-) -> Option<BiStream> {
+) -> Option<(quinn::Connection, BiStream)> {
     // Create a lock for where we will place the QUIC connection used to communicate with our peer.
     let peer_reached_lock: Arc<Mutex<bool>> = Arc::default();
 
@@ -598,7 +624,7 @@ async fn udp_holepunch(
     // Let the user know that a connection is established. A bi-directional stream is ready to use.
     println!("{} Peer connection established", local_now_fmt());
 
-    Some(peer_streams)
+    Some((connection, peer_streams))
 }
 
 /// Spawn a thread that listens for a peer and will assign the peer `Connection` lock when connected.
@@ -685,17 +711,8 @@ async fn connect_to_peer(
     None
 }
 
-/// Download a file from the peer.
-async fn download_from_peer(
-    mut peer_streams: BiStream,
-    hash: HashBytes,
-    output: PathBuf,
-) -> anyhow::Result<()> {
-    println!("{} Getting file size from peer...", local_now_fmt());
-
-    // Read the file size from the peer.
-    let file_size = peer_streams.recv.read_u64().await?;
-
+/// Prompt the user for consent to download a file.
+fn file_consent_cli(file_size: u64, output: &Path) -> Result<bool, std::io::Error> {
     // Ensure the user consents to downloading the file.
     if output.exists() {
         print!(
@@ -711,32 +728,51 @@ async fn download_from_peer(
         );
     }
     // Ensure the prompt is printed before reading from stdin.
-    std::io::stdout().flush().expect("Failed to flush stdout");
+    std::io::stdout().flush()?;
 
     let mut input = String::new();
-    std::io::stdin()
-        .read_line(&mut input)
-        .expect("Failed to read from stdin");
-    if !(input.trim_start().starts_with('y') || input.trim_start().starts_with('Y')) {
-        println!("{} Download cancelled", local_now_fmt());
+    std::io::stdin().read_line(&mut input)?;
 
-        // Let the peer know that we cancelled the download.
-        peer_streams.send.write_u8(0).await?;
+    // Return the user's consent.
+    return Ok(input.trim_start().starts_with('y') || input.trim_start().starts_with('Y'));
+}
 
-        return Ok(());
-    }
+/// Errors that may occur when downloading a file from a peer.
+#[derive(Debug, thiserror::Error)]
+enum DownloadError {
+    #[error("An I/O error occurred: {0}")]
+    IoError(std::io::Error),
+    #[error("The downloaded file hash does not match the expected hash")]
+    HashMismatch,
+}
 
+/// Download a file from the peer. Initiates the download by consenting to the peer to receive the file.
+async fn download_from_peer(
+    hash: HashBytes,
+    mut peer_streams: BiStream,
+    file_size: u64,
+    output: PathBuf,
+) -> Result<(), DownloadError> {
     // Open the file for writing.
     let mut file = tokio::fs::OpenOptions::new()
         .create(true)
         .truncate(true)
         .write(true)
         .open(&output)
-        .await?;
+        .await
+        .map_err(DownloadError::IoError)?;
 
     // Let the peer know that we accepted the download.
-    peer_streams.send.write_u8(1).await?;
-    peer_streams.send.finish().await?;
+    peer_streams
+        .send
+        .write_u8(1)
+        .await
+        .map_err(DownloadError::IoError)?;
+    peer_streams
+        .send
+        .finish()
+        .await
+        .map_err(|e| DownloadError::IoError(e.into()))?;
 
     // Create a scratch space for reading data from the stream.
     let mut buf = [0; MAX_PEER_COMMUNICATION_SIZE];
@@ -748,15 +784,19 @@ async fn download_from_peer(
         let size = peer_streams
             .recv
             .read(&mut buf)
-            .await?
-            .expect("Peer cancelled the connection");
+            .await
+            .map_err(|e| DownloadError::IoError(e.into()))?
+            .ok_or(DownloadError::IoError(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "Peer closed the upload early",
+            )))?;
         if size > 0 {
             // Write the bytes to the file and update the hash.
             let bb = &buf[..size];
             let f = file.write_all(bb);
             // Update hash while future may be pending.
             hasher.update(bb);
-            f.await?;
+            f.await.map_err(DownloadError::IoError)?;
 
             // Update the number of bytes written.
             bytes_written += size as u64;
@@ -766,10 +806,7 @@ async fn download_from_peer(
     // Ensure the file hash is correct.
     let downloaded_hash = hasher.finalize();
     if hash != Into::<HashBytes>::into(downloaded_hash) {
-        anyhow::bail!(
-            "{} Downloaded file hash does not match the expected hash",
-            local_now_fmt()
-        );
+        return Err(DownloadError::HashMismatch);
     }
 
     // Let the user know that the download is complete.
