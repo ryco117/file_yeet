@@ -1,28 +1,18 @@
+use core::BiStream;
 use std::{
     io::Write as _,
-    net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
+    num::NonZeroU16,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
     time::Duration,
 };
 
 use bytes::BufMut as _;
-use file_yeet_shared::{local_now_fmt, HashBytes, SocketAddrHelper, MAX_SERVER_COMMUNICATION_SIZE};
+use file_yeet_shared::{local_now_fmt, HashBytes, MAX_SERVER_COMMUNICATION_SIZE};
 use futures_util::{stream::FuturesUnordered, StreamExt};
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
-/// Use a sane default timeout for server connections.
-const SERVER_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
-const PEER_LISTEN_TIMEOUT: Duration = Duration::from_secs(5);
-const PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
-
-/// Define a sane number of maximum retries.
-const MAX_PEER_CONNECTION_RETRIES: usize = 3;
-
-/// Define the maximum size of a payload for peer communication.
-/// QUIC may choose to fragment the payload, but this isn't a concern.
-const MAX_PEER_COMMUNICATION_SIZE: usize = 8192;
+mod core;
 
 #[derive(clap::Parser)]
 #[command(author, version, about, long_about = None)]
@@ -32,13 +22,13 @@ struct Cli {
     server_address: Option<String>,
 
     /// The server port to connect to.
-    #[arg(short='p', long, default_value_t = file_yeet_shared::DEFAULT_PORT)]
-    server_port: u16,
+    #[arg(short='p', long, default_value_t = NonZeroU16::new(file_yeet_shared::DEFAULT_PORT).unwrap())]
+    server_port: NonZeroU16,
 
     /// Override the port seen by the server to communicate a custom port to peers.
     /// Useful when port-forwarding.
     #[arg(short = 'o', long)]
-    port_override: Option<u16>,
+    port_override: Option<NonZeroU16>,
 
     /// The IP address of local gateway to use when attempting the Port Control Protocol.
     /// If not specified, a default gateway will be searched for.
@@ -75,8 +65,20 @@ async fn main() {
     let mut bb = bytes::BytesMut::with_capacity(MAX_SERVER_COMMUNICATION_SIZE);
 
     // Connect to the public file_yeet_server.
-    let (endpoint, connection, server_streams, port_mapping) =
-        prepare_server_connection(&args, &mut bb).await;
+    let (endpoint, connection, port_mapping) = core::prepare_server_connection(
+        args.server_address.as_deref(),
+        args.server_port,
+        args.gateway.as_deref(),
+        if let Some(g) = args.port_override {
+            core::PortMappingConfig::PortForwarding(g)
+        } else if args.nat_map {
+            core::PortMappingConfig::TryNatPmp
+        } else {
+            core::PortMappingConfig::None
+        },
+        &mut bb,
+    )
+    .await;
 
     // Determine if we are going to make a publish or subscribe request.
     match &args.cmd {
@@ -119,7 +121,7 @@ async fn main() {
                 _ = tokio::signal::ctrl_c() => {
                     println!("{} Ctrl-C detected, cancelling the publish", local_now_fmt());
                 }
-                () = publish_loop(endpoint, server_streams, bb, hash, file_size, reader) => {}
+                () = publish_loop(endpoint, connection.clone(), bb, hash, file_size, reader) => {}
             }
         }
 
@@ -145,15 +147,21 @@ async fn main() {
                 |o| o.clone().into(),
             );
 
-            subscribe(endpoint, server_streams, bb, hash, output).await;
+            subscribe(endpoint, &connection, bb, hash, output).await;
         }
     }
 
-    // Clean up the port mapping and close the server connection.
+    // Close our connection to the server. Send a goodbye to be polite.
+    connection.close(quinn::VarInt::from_u32(0), "Goodbye!".as_bytes());
+
+    // Try to clean up the port mapping if one was made.
     if let Some(mapping) = port_mapping {
-        // Try to safely delete the port mapping.
-        if let Err((e, _)) = mapping.try_drop().await {
-            eprintln!("{} Failed to delete the port mapping: {e}", local_now_fmt());
+        if let Err((e, m)) = mapping.try_drop().await {
+            eprintln!(
+                "{} Failed to delete the port mapping with expiration {:?} : {e}",
+                local_now_fmt(),
+                m.expiration()
+            );
         } else {
             println!(
                 "{} Successfully deleted the created port mapping",
@@ -161,18 +169,24 @@ async fn main() {
             );
         }
     }
-    connection.close(quinn::VarInt::from_u32(0), &[]);
 }
 
 /// Enter a loop to listen for the server to send peer socket addresses requesting our publish.
 async fn publish_loop(
     endpoint: quinn::Endpoint,
-    mut server_streams: BiStream,
+    server_connection: quinn::Connection,
     mut bb: bytes::BytesMut,
     hash: HashBytes,
     file_size: u64,
     mut reader: tokio::io::BufReader<tokio::fs::File>,
 ) {
+    // Create a bi-directional stream to the server.
+    let mut server_streams: BiStream = server_connection
+        .open_bi()
+        .await
+        .expect("Failed to open a bi-directional QUIC stream for a socket ping request")
+        .into();
+
     // Format a publish request.
     bb.put_u16(file_yeet_shared::ClientApiRequest::Publish as u16);
     bb.put(&hash[..]);
@@ -240,8 +254,8 @@ async fn publish_loop(
 
         // Attempt to connect to the peer using UDP hole punching.
         // TODO: Use tasks to handle multiple publish requests concurrently.
-        let Some((_peer_connection, peer_streams)) = udp_holepunch(
-            FileYeetCommandType::Pub,
+        let Some((_peer_connection, peer_streams)) = core::udp_holepunch(
+            core::FileYeetCommandType::Pub,
             endpoint.clone(),
             endpoint
                 .local_addr()
@@ -265,11 +279,18 @@ async fn publish_loop(
 
 async fn subscribe(
     endpoint: quinn::Endpoint,
-    mut server_streams: BiStream,
+    server_connection: &quinn::Connection,
     mut bb: bytes::BytesMut,
     hash: HashBytes,
     output: PathBuf,
 ) {
+    // Create a bi-directional stream to the server.
+    let mut server_streams: BiStream = server_connection
+        .open_bi()
+        .await
+        .expect("Failed to open a bi-directional QUIC stream for a socket ping request")
+        .into();
+
     // Send the server a subscribe request.
     bb.put_u16(file_yeet_shared::ClientApiRequest::Subscribe as u16);
     bb.put(&hash[..]);
@@ -328,8 +349,8 @@ async fn subscribe(
         };
 
         // Try to connect to multiple peers concurrently with a list of connection futures.
-        connection_attempts.push(udp_holepunch(
-            FileYeetCommandType::Sub,
+        connection_attempts.push(core::udp_holepunch(
+            core::FileYeetCommandType::Sub,
             endpoint.clone(),
             local_address,
             peer_address,
@@ -372,343 +393,6 @@ async fn subscribe(
     } else {
         eprintln!("{} Failed to connect to any peers", local_now_fmt());
     }
-}
-
-/// Create a QUIC endpoint connected to the server and perform basic setup.
-async fn prepare_server_connection(
-    args: &Cli,
-    bb: &mut bytes::BytesMut,
-) -> (
-    quinn::Endpoint,
-    quinn::Connection,
-    BiStream,
-    Option<crab_nat::PortMapping>,
-) {
-    // Create a self-signed certificate for the peer communications.
-    let (server_cert, server_key) = file_yeet_shared::generate_self_signed_cert()
-        .expect("Failed to generate self-signed certificate");
-    let mut server_config = quinn::ServerConfig::with_single_cert(vec![server_cert], server_key)
-        .expect("Quinn failed to accept the server certificates");
-
-    // Set custom keep alive policies.
-    server_config.transport_config(file_yeet_shared::server_transport_config());
-
-    // Create our QUIC endpoint. Use an unspecified address and port since we don't have any preference.
-    let mut endpoint = quinn::Endpoint::server(
-        server_config,
-        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
-    )
-    .expect("Failed to open QUIC endpoint");
-
-    // Share debug information about the QUIC endpoints.
-    let mut local_address = endpoint
-        .local_addr()
-        .expect("Failed to get the local address of our QUIC endpoint");
-    if local_address.ip().is_unspecified() {
-        local_address.set_ip(
-            default_net::interface::get_local_ipaddr().expect("Failed to get our local address"),
-        );
-    }
-    println!(
-        "{} QUIC endpoint created with address: {local_address}",
-        local_now_fmt()
-    );
-
-    // Attempt to get a port forwarding, starting with user's override and then attempting NAT-PMP and PCP.
-    let gateway = if let Some(g) = args.gateway.as_ref() {
-        g.parse().expect("Failed to parse gateway address")
-    } else {
-        default_net::get_default_gateway()
-            .expect("Failed to get the default gateway")
-            .ip_addr
-    };
-    let (port_mapping, port_override) = if let Some(p) = args.port_override {
-        (None, Some(p))
-    } else {
-        // Allow the user to skip port mapping.
-        let map_option = if args.nat_map {
-            match try_port_mapping(gateway, local_address).await {
-                Ok(m) => Some(m),
-                Err(e) => {
-                    eprintln!("{} Failed to create a port mapping: {e}", local_now_fmt());
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        if let Some(m) = map_option {
-            let p = m.external_port();
-            println!(
-                "{} Success mapping external port {p} -> internal {}",
-                local_now_fmt(),
-                m.internal_port(),
-            );
-            (Some(m), Some(p))
-        } else {
-            (None, None)
-        }
-    };
-
-    // Use an insecure client configuration when connecting to peers.
-    // TODO: Use a secure client configuration when connecting to the server.
-    endpoint.set_default_client_config(configure_peer_verification());
-    // Connect to the public file_yeet_server.
-    let connection = connect_to_server(args, &endpoint).await;
-
-    // Create a bi-directional stream to the server.
-    let mut server_streams: BiStream = connection
-        .open_bi()
-        .await
-        .expect("Failed to open a bi-directional QUIC stream to the server")
-        .into();
-
-    // Perform a sanity check by sending the server a socket ping request.
-    // This allows us to verify that the server can determine our public address.
-    server_streams
-        .send
-        .write_u16(file_yeet_shared::ClientApiRequest::SocketPing as u16)
-        .await
-        .expect("Failed to send a socket ping request to the server");
-
-    // Read the server's response to the sanity check.
-    let string_len = server_streams
-        .recv
-        .read_u16()
-        .await
-        .expect("Failed to read a u16 response from the server");
-    let sanity_check = expect_server_text(&mut server_streams.recv, string_len)
-        .await
-        .expect("Failed to read a valid socket address from the server");
-    let sanity_check_addr: SocketAddr = sanity_check
-        .parse()
-        .expect("Server did not send a valid socket address for the sanity check");
-    println!("{} Server sees us as {sanity_check}", local_now_fmt());
-
-    if let Some(port) = port_override {
-        // Only send a port override request if the server sees us through a different port.
-        if sanity_check_addr.port() != port {
-            // Format a port override request.
-            bb.put_u16(file_yeet_shared::ClientApiRequest::PortOverride as u16);
-            bb.put_u16(port);
-            // Send the port override request to the server and clear the buffer.
-            server_streams
-                .send
-                .write_all(bb)
-                .await
-                .expect("Failed to send the port override request to the server");
-            bb.clear();
-        }
-    }
-
-    (endpoint, connection, server_streams, port_mapping)
-}
-
-/// Attempt to create a port mapping using NAT-PMP or PCP.
-async fn try_port_mapping(
-    gateway: IpAddr,
-    local_address: SocketAddr,
-) -> Result<crab_nat::PortMapping, crab_nat::MappingFailure> {
-    crab_nat::PortMapping::new(
-        gateway,
-        local_address.ip(),
-        crab_nat::InternetProtocol::Udp,
-        std::num::NonZeroU16::new(local_address.port()).expect("Socket address has no port"),
-        crab_nat::PortMappingOptions::default(),
-    )
-    .await
-}
-
-/// Connect to the server using QUIC.
-async fn connect_to_server(args: &Cli, endpoint: &quinn::Endpoint) -> quinn::Connection {
-    // Reused error message string.
-    const SERVER_CONNECTION_ERR: &str = "Failed to establish a QUIC connection to the server";
-
-    // Get the server address info.
-    let SocketAddrHelper {
-        addr: server_address,
-        hostname,
-    } = file_yeet_shared::get_server_or_default(&args.server_address, args.server_port)
-        .expect("Failed to parse server address");
-    println!(
-        "{} Connecting to server {hostname} at socket address: {server_address}",
-        local_now_fmt()
-    );
-
-    // Attempt to connect to the server using QUIC.
-    let connection = match tokio::time::timeout(
-        SERVER_CONNECTION_TIMEOUT,
-        endpoint
-            .connect(server_address, hostname.as_str())
-            .expect("Failed to open a QUIC connection to the server"),
-    )
-    .await
-    {
-        Ok(Ok(c)) => c,
-        Ok(Err(e)) => {
-            panic!("{} {SERVER_CONNECTION_ERR}: {e}", local_now_fmt());
-        }
-        Err(e) => {
-            panic!("{} {SERVER_CONNECTION_ERR}: Timeout {e:#}", local_now_fmt());
-        }
-    };
-    println!("{} QUIC connection made to the server", local_now_fmt());
-    connection
-}
-
-/// Attempt to connect to peer using UDP hole punching.
-async fn udp_holepunch(
-    cmd: FileYeetCommandType,
-    endpoint: quinn::Endpoint,
-    local_address: SocketAddr,
-    peer_address: SocketAddr,
-) -> Option<(quinn::Connection, BiStream)> {
-    // Create a lock for where we will place the QUIC connection used to communicate with our peer.
-    let peer_reached_lock: Arc<Mutex<bool>> = Arc::default();
-
-    // Spawn a thread that listens for a peer and will set the boolean lock when connected.
-    let peer_reached_listen = peer_reached_lock.clone();
-    let endpoint_listen = endpoint.clone();
-    let listen_future = tokio::time::timeout(
-        PEER_LISTEN_TIMEOUT,
-        listen_for_peer(endpoint_listen, local_address, &peer_reached_listen),
-    );
-
-    // Attempt to connect to the peer's public address.
-    let connect_future = tokio::time::timeout(
-        PEER_CONNECT_TIMEOUT,
-        connect_to_peer(endpoint, peer_address, &peer_reached_lock),
-    );
-
-    // Return the peer stream if we have one.
-    let (listen_stream, connect_stream) = futures_util::join!(listen_future, connect_future);
-    let listen_stream = listen_stream.ok().flatten();
-    let connect_stream = connect_stream.ok().flatten();
-    let connection = match u32::from(listen_stream.is_some()) + u32::from(connect_stream.is_some())
-    {
-        0 => None,
-        1 => listen_stream.or(connect_stream),
-        2 => {
-            // TODO: It could be interesting and possible to create a more general stream negotiation.
-            //       For example, if each peer sent a random nonce over each stream, and the nonces were XOR'd per stream,
-            //       the result could be used to determine which stream to use (highest/lowest resulting nonce after XOR).
-            match cmd {
-                FileYeetCommandType::Pub => listen_stream,
-                FileYeetCommandType::Sub => connect_stream,
-            }
-        }
-        _ => unreachable!("Not possible to have more than two streams"),
-    }?;
-
-    let peer_streams: BiStream = tokio::time::timeout(Duration::from_millis(400), async {
-        let streams = match cmd {
-            FileYeetCommandType::Pub => {
-                // Open a bi-directional stream.
-                connection.open_bi().await
-            }
-            FileYeetCommandType::Sub => {
-                // Let the uploading peer open a bi-directional stream.
-                connection.accept_bi().await
-            }
-        };
-        if let Ok(streams) = streams {
-            Some(streams.into())
-        } else {
-            None
-        }
-    })
-    .await
-    .ok()
-    .flatten()?;
-
-    // Let the user know that a connection is established. A bi-directional stream is ready to use.
-    println!("{} Peer connection established", local_now_fmt());
-
-    Some((connection, peer_streams))
-}
-
-/// Spawn a thread that listens for a peer and will assign the peer `Connection` lock when connected.
-async fn listen_for_peer(
-    endpoint: quinn::Endpoint,
-    local_address: SocketAddr,
-    peer_reached_lock: &Arc<Mutex<bool>>,
-) -> Option<quinn::Connection> {
-    // Print and create binding from the local address.
-    println!(
-        "{} Listening for peer on the QUIC endpoint: {local_address}",
-        local_now_fmt()
-    );
-
-    // Accept a peer connection.
-    let connecting = endpoint.accept().await?;
-    let connection = match connecting.await {
-        Ok(connection) => connection,
-        Err(e) => {
-            eprintln!(
-                "{} Failed to accept a peer connection: {e}",
-                local_now_fmt()
-            );
-            return None;
-        }
-    };
-
-    // Set the peer stream lock to the listening stream if there isn't already one present.
-    *peer_reached_lock
-        .lock()
-        .expect("Could not obtain the mutex lock") = true;
-
-    // Connected to a peer on the listening stream, print their address.
-    let peer_addr = connection.remote_address();
-    println!(
-        "{} New connection accepted from peer at: {peer_addr:?}",
-        local_now_fmt()
-    );
-
-    Some(connection)
-}
-
-/// Try to connect to a peer at the given address.
-async fn connect_to_peer(
-    endpoint: quinn::Endpoint,
-    peer_address: SocketAddr,
-    peer_reached_lock: &Arc<Mutex<bool>>,
-) -> Option<quinn::Connection> {
-    // Set a sane number of connection retries.
-    let mut retries = MAX_PEER_CONNECTION_RETRIES;
-
-    // Ensure we have retries left and there isn't already a peer `Connection` to use.
-    while retries > 0
-        && !*peer_reached_lock
-            .lock()
-            .expect("Could not obtain the mutex lock")
-    {
-        println!("{} Connecting to peer at {peer_address}", local_now_fmt());
-        match endpoint.connect(peer_address, "peer") {
-            Ok(connecting) => {
-                let connection = match connecting.await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        eprintln!("{} Failed to connect to peer: {e}", local_now_fmt());
-                        retries -= 1;
-                        continue;
-                    }
-                };
-                // Set the peer mutex to the connected stream if there isn't already one present.
-                *peer_reached_lock
-                    .lock()
-                    .expect("Could not obtain the mutex lock") = true;
-
-                println!("{} Connected to peer at {peer_address}", local_now_fmt());
-                return Some(connection);
-            }
-            Err(e) => {
-                eprintln!("{} Failed to connect to peer: {e}", local_now_fmt());
-                retries -= 1;
-            }
-        }
-    }
-
-    None
 }
 
 /// Prompt the user for consent to download a file.
@@ -775,7 +459,7 @@ async fn download_from_peer(
         .map_err(|e| DownloadError::IoError(e.into()))?;
 
     // Create a scratch space for reading data from the stream.
-    let mut buf = [0; MAX_PEER_COMMUNICATION_SIZE];
+    let mut buf = [0; core::MAX_PEER_COMMUNICATION_SIZE];
     // Read from the peer and write to the file.
     let mut bytes_written = 0;
     let mut hasher = Sha256::new();
@@ -838,7 +522,7 @@ async fn upload_to_peer(
     }
 
     // Create a scratch space for reading data from the stream.
-    let mut buf = [0; MAX_PEER_COMMUNICATION_SIZE];
+    let mut buf = [0; core::MAX_PEER_COMMUNICATION_SIZE];
     // Read from the file and write to the peer.
     loop {
         // Read a natural amount of bytes from the file.
@@ -862,74 +546,4 @@ async fn upload_to_peer(
     // Let the user know that the upload is complete.
     println!("{} Upload complete!", local_now_fmt());
     Ok(())
-}
-
-/// Try to read a valid UTF-8 from the server until the expected length is reached.
-async fn expect_server_text(stream: &mut quinn::RecvStream, len: u16) -> anyhow::Result<String> {
-    let mut raw_bytes = [0; MAX_SERVER_COMMUNICATION_SIZE];
-    let expected_slice = &mut raw_bytes[..len as usize];
-    stream.read_exact(expected_slice).await?;
-    Ok(std::str::from_utf8(expected_slice)?.to_owned())
-}
-
-/// Allow peers to connect using self-signed certificates.
-/// Necessary for using the QUIC protocol.
-#[derive(Debug)]
-struct SkipAllServerVerification;
-
-/// Skip all server verification.
-impl rustls::client::ServerCertVerifier for SkipAllServerVerification {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::Certificate,
-        _intermediates: &[rustls::Certificate],
-        _server_name: &rustls::ServerName,
-        _scts: &mut dyn Iterator<Item = &[u8]>,
-        _ocsp_response: &[u8],
-        _now: std::time::SystemTime,
-    ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::ServerCertVerified::assertion())
-    }
-}
-
-/// Build a QUIC client config that will skip server verification.
-/// # Panics
-/// If the conversion from `Duration` to `IdleTimeout` fails.
-fn configure_peer_verification() -> quinn::ClientConfig {
-    let crypto = rustls::ClientConfig::builder()
-        .with_safe_defaults()
-        .with_custom_certificate_verifier(Arc::new(SkipAllServerVerification {}))
-        .with_no_client_auth();
-
-    let mut client_config = quinn::ClientConfig::new(Arc::new(crypto));
-
-    // Set custom keep alive policies.
-    let mut transport_config = quinn::TransportConfig::default();
-    transport_config.max_idle_timeout(Some(
-        Duration::from_secs(file_yeet_shared::QUIC_TIMEOUT_SECONDS)
-            .try_into()
-            .expect("Failed to convert `Duration` to `IdleTimeout`"),
-    ));
-    transport_config.keep_alive_interval(Some(Duration::from_secs(60)));
-    client_config.transport_config(Arc::new(transport_config));
-
-    client_config
-}
-
-/// Helper type for grouping a bi-directional stream, instead of the default tuple type.
-struct BiStream {
-    pub send: quinn::SendStream,
-    pub recv: quinn::RecvStream,
-}
-impl From<(quinn::SendStream, quinn::RecvStream)> for BiStream {
-    fn from((send, recv): (quinn::SendStream, quinn::RecvStream)) -> Self {
-        Self { send, recv }
-    }
-}
-
-/// The command being executed, without additional data.
-#[derive(Clone, Copy)]
-enum FileYeetCommandType {
-    Pub,
-    Sub,
 }

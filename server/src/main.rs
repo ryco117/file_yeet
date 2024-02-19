@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, num::NonZeroU16, sync::Arc};
 
 use bytes::BufMut as _;
 use clap::Parser;
@@ -27,12 +27,12 @@ struct Cli {
     bind_ip: Option<String>,
 
     /// The port the server will bind to.
-    #[arg(short='p', long, default_value_t = file_yeet_shared::DEFAULT_PORT)]
-    bind_port: u16,
+    #[arg(short='p', long, default_value_t = NonZeroU16::new(file_yeet_shared::DEFAULT_PORT).unwrap())]
+    bind_port: NonZeroU16,
 }
 
 /// A mapping between file hashes and the addresses of connected peers that are publishing the file.
-type PublishersRef = Arc<RwLock<HashMap<HashBytes, SmallVec<[Client; 3]>>>>;
+type PublishersRef = Arc<RwLock<HashMap<HashBytes, SmallVec<[Arc<RwLock<Client>>; 3]>>>>;
 
 #[tokio::main]
 async fn main() {
@@ -43,7 +43,7 @@ async fn main() {
     let SocketAddrHelper {
         addr: bind_address,
         hostname: _,
-    } = file_yeet_shared::get_server_or_default(&args.bind_ip, args.bind_port)
+    } = file_yeet_shared::get_server_or_default(args.bind_ip.as_deref(), args.bind_port)
         .expect("Failed to parse server address");
 
     // Print out the address we're going to bind to.
@@ -127,19 +127,19 @@ async fn handle_incoming_loop(
 }
 
 /// Errors encountered while handling a client request.
-#[derive(Debug, displaydoc::Display, thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 enum ClientRequestError {
-    /// QUIC connection error: {0}.
+    /// Failed to establish a QUIC connection or stream.
+    #[error("QUIC connection error: {0}")]
     Connection(quinn::ConnectionError),
 
-    /// Invalid API request code {0}.
+    /// An invalid API request code was received from a client.
+    #[error("Invalid API request code: {0}")]
     InvalidApiRequestCode(u16),
 
-    /// Failed to read expected bytes from the stream.
-    FailedRead,
-
-    /// Failed to write to the stream.
-    FailedWrite,
+    /// An I/O error on occurred when reading or writing to a QUIC stream.
+    #[error("I/O error on peer stream: {0}")]
+    IoError(std::io::Error),
 }
 
 /// Handle the initial QUIC connection and attempt to determine whether the client wants to publish or subscribe.
@@ -150,24 +150,28 @@ async fn handle_quic_connection(
     let connection = connecting.await.map_err(ClientRequestError::Connection)?;
     let socket_addr = connection.remote_address();
     let mut sock_string = socket_addr.to_string();
-    let (mut quic_send, mut quic_recv) = connection
-        .accept_bi()
-        .await
-        .map_err(ClientRequestError::Connection)?;
+    let mut port_used = socket_addr.port();
+    let mut client_lock: Option<Arc<RwLock<Client>>> = None;
     let mut bb = bytes::BytesMut::with_capacity(MAX_SERVER_COMMUNICATION_SIZE);
 
     loop {
+        // Accept a new stream for each client request.
+        // QUIC streams are very cheap and multiple streams lends itself to concurrent requests.
+        let (mut quic_send, mut quic_recv) = connection
+            .accept_bi()
+            .await
+            .map_err(ClientRequestError::Connection)?;
+
         let api = ClientApiRequest::try_from(
             quic_recv
                 .read_u16()
                 .await
-                .map_err(|_| ClientRequestError::FailedRead)?,
+                .map_err(ClientRequestError::IoError)?,
         )
         .map_err(|e| ClientRequestError::InvalidApiRequestCode(e.number))?;
         println!("{} {api} from {sock_string}", local_now_fmt());
 
         match api {
-            ClientApiRequest::EmptyPing => {}
             ClientApiRequest::SocketPing => {
                 // Format the ping response as a length and UTF-8 string.
                 bb.put_u16(
@@ -179,13 +183,18 @@ async fn handle_quic_connection(
                 quic_send
                     .write_all(&bb)
                     .await
-                    .map_err(|_| ClientRequestError::FailedWrite)?;
+                    .map_err(|e| ClientRequestError::IoError(e.into()))?;
             }
             ClientApiRequest::PortOverride => {
                 let port = quic_recv
                     .read_u16()
                     .await
-                    .map_err(|_| ClientRequestError::FailedRead)?;
+                    .map_err(ClientRequestError::IoError)?;
+
+                // Avoid unnecessary string allocations.
+                if port == port_used {
+                    continue;
+                }
 
                 sock_string = {
                     let mut a = socket_addr;
@@ -193,30 +202,39 @@ async fn handle_quic_connection(
                     a.to_string()
                 };
                 println!("{} Overriding port to {port}", local_now_fmt());
+                port_used = port;
 
-                // TODO: If this client is publishing, these addresses will be stale.
-                // Store `sock_string` in a `RwLock` pass a thread-safe reference to callers.
+                if let Some(lock) = client_lock.as_ref() {
+                    let mut client = lock.write().await;
+                    client.address = sock_string.clone();
+                }
             }
             ClientApiRequest::Publish => {
                 let mut hash = HashBytes::default();
-                quic_recv
-                    .read_exact(&mut hash)
-                    .await
-                    .map_err(|_| ClientRequestError::FailedRead)?;
+                quic_recv.read_exact(&mut hash).await.map_err(|_| {
+                    ClientRequestError::IoError(std::io::Error::from(
+                        std::io::ErrorKind::UnexpectedEof,
+                    ))
+                })?;
 
                 // Now that we have the peer's socket address and the file hash, we can handle the publish request.
-                handle_publish(connection, quic_send, sock_string, hash, publishers, bb).await;
-
-                // Terminate our connection with the client.
-                // TODO: Consider allowing the client to publish more than one file hash, or subscribe simultaneously to a file.
-                return Ok(());
+                handle_publish(
+                    connection.clone(),
+                    quic_send,
+                    sock_string.clone(),
+                    hash,
+                    &mut client_lock,
+                    publishers.clone(),
+                )
+                .await;
             }
             ClientApiRequest::Subscribe => {
                 let mut hash = HashBytes::default();
-                quic_recv
-                    .read_exact(&mut hash)
-                    .await
-                    .map_err(|_| ClientRequestError::FailedRead)?;
+                quic_recv.read_exact(&mut hash).await.map_err(|_| {
+                    ClientRequestError::IoError(std::io::Error::from(
+                        std::io::ErrorKind::UnexpectedEof,
+                    ))
+                })?;
 
                 // Now that we have the peer's socket address and the file hash, we can handle the subscribe request.
                 if let Err(e) =
@@ -241,19 +259,38 @@ async fn handle_publish(
     mut quic_send: quinn::SendStream,
     sock_string: String,
     hash: HashBytes,
-    clients: PublishersRef,
-    mut bb: bytes::BytesMut,
+    client_lock: &mut Option<Arc<RwLock<Client>>>,
+    publishers: PublishersRef,
 ) {
     // Use a channel to handle buffering and flushing of messages.
     // Ensures that the stream doesn't need to be cloned or passed between threads.
     let (tx, mut rx) = mpsc::channel::<String>(4 * MAX_SERVER_COMMUNICATION_SIZE);
-    let sock_string_clone = sock_string.clone();
+
+    let client = client_lock.get_or_insert_with(|| {
+        Arc::new(RwLock::new(Client {
+            address: sock_string.clone(),
+            stream: tx,
+        }))
+    });
+
+    // Add the client to a list of peers publishing this hash.
+    // Wrap the lock in a block to ensure it is released quickly.
+    {
+        let mut publishers_lock = publishers.write().await;
+        if let Some(client_list) = publishers_lock.get_mut(&hash) {
+            client_list.push(client.clone());
+        } else {
+            publishers_lock.insert(hash, smallvec::smallvec![client.clone()]);
+        }
+    }
+
     tokio::task::spawn(async move {
         #[cfg(debug_assertions)]
         println!(
-            "{} Starting subscribe task for client {sock_string_clone}",
+            "{} Starting subscribe task for client {sock_string}",
             local_now_fmt()
         );
+        let mut bb = bytes::BytesMut::with_capacity(MAX_SERVER_COMMUNICATION_SIZE);
 
         while let Some(message) = rx.recv().await {
             // Format the message as a length and UTF-8 string.
@@ -269,48 +306,22 @@ async fn handle_publish(
             bb.clear();
 
             #[cfg(debug_assertions)]
-            println!(
-                "{} Introduced {message} to {sock_string_clone}",
-                local_now_fmt()
-            );
+            println!("{} Introduced {message} to {sock_string}", local_now_fmt());
         }
 
-        #[cfg(debug_assertions)]
+        // Wait for the client to close the connection.
+        let closed_reason = connection.closed().await;
         println!(
-            "{} Closed forwarding thread for client {sock_string_clone}",
+            "{} Client {sock_string} disconnected: {closed_reason:?}",
             local_now_fmt()
         );
-    });
 
-    let address = sock_string.clone();
-    let client = Client {
-        address,
-        stream: tx,
-    };
-
-    // Add the client to a list of peers publishing this hash.
-    // Ensure the clients lock is dropped before waiting for the client to close the connection.
-    {
-        let mut clients_lock = clients.write().await;
-        if let Some(client_list) = clients_lock.get_mut(&hash) {
-            client_list.push(client);
-        } else {
-            clients_lock.insert(hash, smallvec::smallvec![client]);
+        // Remove the client from the list of peers publishing this hash.
+        // TODO: Consider identifying clients by a unique ID in case of address collisions.
+        if let Some(clients_list) = publishers.write().await.get_mut(&hash) {
+            clients_list.retain(|c| c.blocking_read().address != sock_string);
         }
-    }
-
-    // Wait for the client to close the connection.
-    let closed_reason = connection.closed().await;
-    println!(
-        "{} Client {sock_string} disconnected: {closed_reason:?}",
-        local_now_fmt()
-    );
-
-    // Remove the client from the list of peers publishing this hash.
-    // TODO: Consider identifying clients by a unique ID in case of address collisions.
-    if let Some(clients_list) = clients.write().await.get_mut(&hash) {
-        clients_list.retain(|c| c.address != sock_string);
-    }
+    });
 }
 
 /// Handle QUIC connections for clients that want to subscribe to a file hash.
@@ -339,7 +350,7 @@ async fn handle_subscribe(
         quic_send
             .write_u16(0)
             .await
-            .map_err(|_| ClientRequestError::FailedWrite)?;
+            .map_err(ClientRequestError::IoError)?;
         return Ok(());
     };
 
@@ -350,6 +361,9 @@ async fn handle_subscribe(
     let clients = client_list.iter();
     let mut n: u16 = 0;
     for pub_client in clients {
+        // Get read access on client lock.
+        let pub_client = pub_client.read().await;
+
         // Ensure that the message doesn't exceed the maximum size.
         if bb.len() + 2 + pub_client.address.len() > MAX_SERVER_COMMUNICATION_SIZE {
             break;
@@ -372,7 +386,7 @@ async fn handle_subscribe(
     quic_send
         .write_all(bb)
         .await
-        .map_err(|_| ClientRequestError::FailedWrite)?;
+        .map_err(|e| ClientRequestError::IoError(e.into()))?;
 
     #[cfg(debug_assertions)]
     if n != 0 {

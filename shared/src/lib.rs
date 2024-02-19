@@ -1,5 +1,6 @@
 use std::{
     net::{Ipv4Addr, SocketAddr, ToSocketAddrs as _},
+    num::NonZeroU16,
     sync::Arc,
     time::Duration,
 };
@@ -33,16 +34,21 @@ pub struct SocketAddrHelper {
 #[derive(Debug, TryFromPrimitive)]
 #[repr(u16)]
 pub enum ClientApiRequest {
-    EmptyPing,
+    /// A ping request for the server to respond with the socket address they see the client as.
     SocketPing,
+
+    /// A request specifying which port the server will direct peers to connect to.
     PortOverride,
+
+    /// Specify a file hash that this client wants to publish.
     Publish,
+
+    /// Specify a file hash that this client wants to subscribe to.
     Subscribe,
 }
 impl std::fmt::Display for ClientApiRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let str = match self {
-            ClientApiRequest::EmptyPing => "EMPTY_PING   ",
             ClientApiRequest::SocketPing => "SOCKET_PING  ",
             ClientApiRequest::PortOverride => "PORT_OVERRIDE",
             ClientApiRequest::Publish => "PUBLISH      ",
@@ -59,21 +65,21 @@ impl std::fmt::Display for ClientApiRequest {
 /// to be able to parse into a socket address using `ToSocketAddrs`. If the address cannot be parsed, it will
 /// fail with a `std::io::Error` instead of using the default.
 pub fn get_server_or_default(
-    server_address: &Option<String>,
-    port: u16,
+    server_address: Option<&str>,
+    port: NonZeroU16,
 ) -> Result<SocketAddrHelper, std::io::Error> {
     // Parse the server address if one was specified.
     server_address
         .iter()
-        .find_map(|s| {
+        .find_map(|&s| {
             if s.is_empty() {
                 None
             } else {
-                match (s.as_str(), port).to_socket_addrs() {
+                match (s, port.get()).to_socket_addrs() {
                     Ok(mut addrs) => addrs.next().map(|addr| {
                         Ok(SocketAddrHelper {
                             addr,
-                            hostname: s.clone(),
+                            hostname: s.to_string(),
                         })
                     }),
                     Err(e) => Some(Err(e)),
@@ -82,7 +88,7 @@ pub fn get_server_or_default(
         })
         .unwrap_or_else(|| {
             Ok(SocketAddrHelper {
-                addr: (Ipv4Addr::LOCALHOST, port).into(),
+                addr: (Ipv4Addr::LOCALHOST, port.get()).into(),
                 hostname: Ipv4Addr::LOCALHOST.to_string(),
             })
         })
