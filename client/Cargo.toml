@@ -5,16 +5,18 @@ edition = "2021"
 license = "MIT"
 
 [dependencies]
-anyhow = "1.0.79"
-bytes = "1.5.0"
-clap = { version = "4.4.18", features = ["derive"] }
-crab_nat = "0.5.2"
-default-net = "0.21.0"
-faster-hex = "0.9.0"
+anyhow = "1.0"
+bytes = "1.5"
+clap = { version = "4.4", features = ["derive"] }
+crab_nat = "0.6"
+default-net = "0.22"
+faster-hex = "0.9"
 file_yeet_shared = { path = "../shared" }
-futures-util = "0.3.30"
-quinn = "0.10.2"
-rustls = { version = "0.21.10", features = ["dangerous_configuration", "quic"] }
-sha2 = "0.10.8"
-thiserror = "1.0.57"
-tokio = { version = "1.36.0", features = ["fs", "macros", "net", "rt-multi-thread", "signal"] }
+futures-util = "0.3"
+iced = { version = "0.12", features = ["tokio"] }
+quinn = "0.10"
+rfd = "0.14"
+rustls = { version = "0.21", features = ["dangerous_configuration", "quic"] }
+sha2 = "0.10"
+thiserror = "1.0"
+tokio = { version = "1.36", features = ["fs", "macros", "net", "rt-multi-thread", "signal"] }

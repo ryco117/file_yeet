@@ -8,7 +8,7 @@ use std::{
 use num_enum::TryFromPrimitive;
 
 /// Magic number for the default port.
-pub const DEFAULT_PORT: u16 = 7828;
+pub const DEFAULT_PORT: NonZeroU16 = unsafe { std::num::NonZeroU16::new_unchecked(7828) };
 
 /// Define a sane maximum payload size for the client-server messages.
 pub const MAX_SERVER_COMMUNICATION_SIZE: usize = 1024;
@@ -21,11 +21,11 @@ pub type HashBytes = [u8; HASH_BYTE_COUNT];
 
 /// The maximum number of seconds of inactivity before a QUIC connection is closed.
 /// Same for both the server and the client.
-pub const QUIC_TIMEOUT_SECONDS: u64 = 120;
+pub const QUIC_TIMEOUT_SECONDS: u64 = 60;
 
 /// A helper to access often used socket address info.
 pub struct SocketAddrHelper {
-    pub addr: SocketAddr,
+    pub address: SocketAddr,
     pub hostname: String,
 }
 
@@ -76,9 +76,9 @@ pub fn get_server_or_default(
                 None
             } else {
                 match (s, port.get()).to_socket_addrs() {
-                    Ok(mut addrs) => addrs.next().map(|addr| {
+                    Ok(mut addrs) => addrs.next().map(|address| {
                         Ok(SocketAddrHelper {
-                            addr,
+                            address,
                             hostname: s.to_string(),
                         })
                     }),
@@ -88,7 +88,7 @@ pub fn get_server_or_default(
         })
         .unwrap_or_else(|| {
             Ok(SocketAddrHelper {
-                addr: (Ipv4Addr::LOCALHOST, port.get()).into(),
+                address: (Ipv4Addr::LOCALHOST, port.get()).into(),
                 hostname: Ipv4Addr::LOCALHOST.to_string(),
             })
         })

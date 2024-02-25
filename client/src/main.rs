@@ -1,19 +1,17 @@
 use core::BiStream;
-use std::{
-    io::Write as _,
-    num::NonZeroU16,
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use std::{io::Write as _, num::NonZeroU16, path::Path, time::Duration};
 
 use bytes::BufMut as _;
 use file_yeet_shared::{local_now_fmt, HashBytes, MAX_SERVER_COMMUNICATION_SIZE};
 use futures_util::{stream::FuturesUnordered, StreamExt};
+use iced::Application;
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 mod core;
+mod gui;
 
+/// The command line interface for `file_yeet_client`.
 #[derive(clap::Parser)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
@@ -22,7 +20,7 @@ struct Cli {
     server_address: Option<String>,
 
     /// The server port to connect to.
-    #[arg(short='p', long, default_value_t = NonZeroU16::new(file_yeet_shared::DEFAULT_PORT).unwrap())]
+    #[arg(short='p', long, default_value_t = file_yeet_shared::DEFAULT_PORT)]
     server_port: NonZeroU16,
 
     /// Override the port seen by the server to communicate a custom port to peers.
@@ -40,7 +38,7 @@ struct Cli {
     nat_map: bool,
 
     #[command(subcommand)]
-    cmd: FileYeetCommand,
+    cmd: Option<FileYeetCommand>,
 }
 
 /// The subcommands for `file_yeet_client`.
@@ -61,11 +59,24 @@ async fn main() {
     use clap::Parser as _;
     let args = Cli::parse();
 
+    // If no subcommand was provided, run the GUI.
+    let Some(cmd) = args.cmd else {
+        if let Err(e) = gui::AppState::run(iced::Settings::default()) {
+            eprintln!("{} GUI failed to run: {e}", local_now_fmt());
+        }
+
+        return;
+    };
+
     // Create a buffer for sending and receiving data within the payload size for `file_yeet`.
     let mut bb = bytes::BytesMut::with_capacity(MAX_SERVER_COMMUNICATION_SIZE);
 
     // Connect to the public file_yeet_server.
-    let (endpoint, connection, port_mapping) = core::prepare_server_connection(
+    let core::PreparedConnection {
+        endpoint,
+        server_connection,
+        port_mapping,
+    } = core::prepare_server_connection(
         args.server_address.as_deref(),
         args.server_port,
         args.gateway.as_deref(),
@@ -78,13 +89,14 @@ async fn main() {
         },
         &mut bb,
     )
-    .await;
+    .await
+    .expect("Failed to perform basic connection setup");
 
     // Determine if we are going to make a publish or subscribe request.
-    match &args.cmd {
+    match cmd {
         // Try to hash and publish the file to the rendezvous server.
         FileYeetCommand::Pub { file_path } => {
-            let file_path = std::path::Path::new(file_path);
+            let file_path = std::path::Path::new(&file_path);
             let mut hasher = Sha256::new();
             let mut reader = tokio::io::BufReader::new(
                 tokio::fs::File::open(file_path)
@@ -121,7 +133,7 @@ async fn main() {
                 _ = tokio::signal::ctrl_c() => {
                     println!("{} Ctrl-C detected, cancelling the publish", local_now_fmt());
                 }
-                () = publish_loop(endpoint, connection.clone(), bb, hash, file_size, reader) => {}
+                () = publish_loop(endpoint, server_connection.clone(), bb, hash, file_size, file_path) => {}
             }
         }
 
@@ -147,12 +159,12 @@ async fn main() {
                 |o| o.clone().into(),
             );
 
-            subscribe(endpoint, &connection, bb, hash, output).await;
+            subscribe(endpoint, &server_connection, bb, hash, &output).await;
         }
     }
 
     // Close our connection to the server. Send a goodbye to be polite.
-    connection.close(quinn::VarInt::from_u32(0), "Goodbye!".as_bytes());
+    server_connection.close(quinn::VarInt::from_u32(0), "Goodbye!".as_bytes());
 
     // Try to clean up the port mapping if one was made.
     if let Some(mapping) = port_mapping {
@@ -178,7 +190,7 @@ async fn publish_loop(
     mut bb: bytes::BytesMut,
     hash: HashBytes,
     file_size: u64,
-    mut reader: tokio::io::BufReader<tokio::fs::File>,
+    file_path: &Path,
 ) {
     // Create a bi-directional stream to the server.
     let mut server_streams: BiStream = server_connection
@@ -268,8 +280,15 @@ async fn publish_loop(
             continue;
         };
 
+        // Prepare a reader for the file to upload.
+        let reader = tokio::io::BufReader::new(
+            tokio::fs::File::open(file_path)
+                .await
+                .expect("Failed to open the file"),
+        );
+
         // Try to upload the file to the peer connection.
-        if let Err(e) = upload_to_peer(peer_streams, file_size, &mut reader).await {
+        if let Err(e) = Box::pin(core::upload_to_peer(peer_streams, file_size, reader)).await {
             eprintln!("{} Failed to upload to peer: {e}", local_now_fmt());
         }
     }
@@ -282,7 +301,7 @@ async fn subscribe(
     server_connection: &quinn::Connection,
     mut bb: bytes::BytesMut,
     hash: HashBytes,
-    output: PathBuf,
+    output: &Path,
 ) {
     // Create a bi-directional stream to the server.
     let mut server_streams: BiStream = server_connection
@@ -367,7 +386,7 @@ async fn subscribe(
                 let Ok(file_size) = b.recv.read_u64().await else {
                     continue;
                 };
-                let Ok(consent) = file_consent_cli(file_size, &output) else {
+                let Ok(consent) = file_consent_cli(file_size, output) else {
                     continue;
                 };
                 if consent {
@@ -387,7 +406,14 @@ async fn subscribe(
 
     if let Some((_peer_connection, peer_streams, file_size)) = peer_connection {
         // Try to download the requested file using the peer connection.
-        if let Err(e) = download_from_peer(hash, peer_streams, file_size, output).await {
+        if let Err(e) = Box::pin(core::download_from_peer(
+            hash,
+            peer_streams,
+            file_size,
+            output,
+        ))
+        .await
+        {
             eprintln!("{} Failed to download from peer: {e}", local_now_fmt());
         }
     } else {
@@ -419,131 +445,4 @@ fn file_consent_cli(file_size: u64, output: &Path) -> Result<bool, std::io::Erro
 
     // Return the user's consent.
     return Ok(input.trim_start().starts_with('y') || input.trim_start().starts_with('Y'));
-}
-
-/// Errors that may occur when downloading a file from a peer.
-#[derive(Debug, thiserror::Error)]
-enum DownloadError {
-    #[error("An I/O error occurred: {0}")]
-    IoError(std::io::Error),
-    #[error("The downloaded file hash does not match the expected hash")]
-    HashMismatch,
-}
-
-/// Download a file from the peer. Initiates the download by consenting to the peer to receive the file.
-async fn download_from_peer(
-    hash: HashBytes,
-    mut peer_streams: BiStream,
-    file_size: u64,
-    output: PathBuf,
-) -> Result<(), DownloadError> {
-    // Open the file for writing.
-    let mut file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&output)
-        .await
-        .map_err(DownloadError::IoError)?;
-
-    // Let the peer know that we accepted the download.
-    peer_streams
-        .send
-        .write_u8(1)
-        .await
-        .map_err(DownloadError::IoError)?;
-    peer_streams
-        .send
-        .finish()
-        .await
-        .map_err(|e| DownloadError::IoError(e.into()))?;
-
-    // Create a scratch space for reading data from the stream.
-    let mut buf = [0; core::MAX_PEER_COMMUNICATION_SIZE];
-    // Read from the peer and write to the file.
-    let mut bytes_written = 0;
-    let mut hasher = Sha256::new();
-    while bytes_written < file_size {
-        // Read a natural amount of bytes from the peer.
-        let size = peer_streams
-            .recv
-            .read(&mut buf)
-            .await
-            .map_err(|e| DownloadError::IoError(e.into()))?
-            .ok_or(DownloadError::IoError(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "Peer closed the upload early",
-            )))?;
-        if size > 0 {
-            // Write the bytes to the file and update the hash.
-            let bb = &buf[..size];
-            let f = file.write_all(bb);
-            // Update hash while future may be pending.
-            hasher.update(bb);
-            f.await.map_err(DownloadError::IoError)?;
-
-            // Update the number of bytes written.
-            bytes_written += size as u64;
-        }
-    }
-
-    // Ensure the file hash is correct.
-    let downloaded_hash = hasher.finalize();
-    if hash != Into::<HashBytes>::into(downloaded_hash) {
-        return Err(DownloadError::HashMismatch);
-    }
-
-    // Let the user know that the download is complete.
-    println!(
-        "{} Download complete: {}",
-        local_now_fmt(),
-        output.display()
-    );
-    Ok(())
-}
-
-/// Download a file from the peer.
-async fn upload_to_peer(
-    mut peer_streams: BiStream,
-    file_size: u64,
-    reader: &mut tokio::io::BufReader<tokio::fs::File>,
-) -> anyhow::Result<()> {
-    // Ensure that the file reader is at the start of the file before each upload.
-    reader.rewind().await.expect("Failed to rewind the file");
-
-    // Send the file size to the peer.
-    peer_streams.send.write_u64(file_size).await?;
-
-    // Read the peer's response to the file size.
-    let response = peer_streams.recv.read_u8().await?;
-    if response == 0 {
-        println!("{} Peer cancelled the upload", local_now_fmt());
-        return Ok(());
-    }
-
-    // Create a scratch space for reading data from the stream.
-    let mut buf = [0; core::MAX_PEER_COMMUNICATION_SIZE];
-    // Read from the file and write to the peer.
-    loop {
-        // Read a natural amount of bytes from the file.
-        let n = reader.read(&mut buf).await?;
-        if n == 0 {
-            break;
-        }
-
-        // Write the bytes to the peer.
-        peer_streams.send.write_all(&buf[..n]).await?;
-    }
-
-    // Greacefully close our connection after all data has been sent.
-    if let Err(e) = peer_streams.send.finish().await {
-        eprintln!(
-            "{} Failed to close the peer stream gracefully: {e}",
-            local_now_fmt()
-        );
-    }
-
-    // Let the user know that the upload is complete.
-    println!("{} Upload complete!", local_now_fmt());
-    Ok(())
 }

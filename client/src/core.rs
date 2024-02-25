@@ -1,25 +1,30 @@
 use std::{
-    net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
     num::NonZeroU16,
+    path::Path,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
 use bytes::BufMut as _;
-use file_yeet_shared::{local_now_fmt, SocketAddrHelper, MAX_SERVER_COMMUNICATION_SIZE};
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use file_yeet_shared::{local_now_fmt, HashBytes, SocketAddrHelper, MAX_SERVER_COMMUNICATION_SIZE};
+use sha2::Digest as _;
+use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
 
 /// Use a sane default timeout for server connections.
 pub const SERVER_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
-pub const PEER_LISTEN_TIMEOUT: Duration = Duration::from_secs(5);
-pub const PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// Sane default timeout for listening for a peer.
+pub const PEER_LISTEN_TIMEOUT: Duration = Duration::from_secs(3);
+/// Sane default timeout for peer connection attempts. Should try to connect for a longer time than listening.
+pub const PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// Define a sane number of maximum retries.
 pub const MAX_PEER_CONNECTION_RETRIES: usize = 3;
 
 /// Define the maximum size of a payload for peer communication.
-/// QUIC may choose to fragment the payload, but this isn't a concern.
-pub const MAX_PEER_COMMUNICATION_SIZE: usize = 8192;
+/// QUIC may choose to fragment the payload when sending raw packets, but this isn't a concern.
+/// The limit is mainly meant to set reasonable memory usage for a stream.
+pub const MAX_PEER_COMMUNICATION_SIZE: usize = 16 * 1024;
 
 /// Specify whether any existing port forwarding can be used or if a new mapping should be attempted.
 pub enum PortMappingConfig {
@@ -35,6 +40,14 @@ pub enum FileYeetCommandType {
     Sub,
 }
 
+/// A prepared server connection, local QUIC endpoint, and optional port mapping.
+#[derive(Clone, Debug)]
+pub struct PreparedConnection {
+    pub endpoint: quinn::Endpoint,
+    pub server_connection: quinn::Connection,
+    pub port_mapping: Option<crab_nat::PortMapping>,
+}
+
 /// Create a QUIC endpoint connected to the server and perform basic setup.
 pub async fn prepare_server_connection(
     server_address: Option<&str>,
@@ -42,11 +55,7 @@ pub async fn prepare_server_connection(
     suggested_gateway: Option<&str>,
     port_config: PortMappingConfig,
     bb: &mut bytes::BytesMut,
-) -> (
-    quinn::Endpoint,
-    quinn::Connection,
-    Option<crab_nat::PortMapping>,
-) {
+) -> anyhow::Result<PreparedConnection> {
     // Create a self-signed certificate for the peer communications.
     let (server_cert, server_key) = file_yeet_shared::generate_self_signed_cert()
         .expect("Failed to generate self-signed certificate");
@@ -56,21 +65,59 @@ pub async fn prepare_server_connection(
     // Set custom keep alive policies.
     server_config.transport_config(file_yeet_shared::server_transport_config());
 
+    // Get the server address info.
+    let server_socket = file_yeet_shared::get_server_or_default(server_address, server_port)?;
+    println!(
+        "{} Connecting to server {} at socket address: {}",
+        local_now_fmt(),
+        server_socket.hostname,
+        server_socket.address,
+    );
+
+    let using_ipv4 = server_socket.address.is_ipv4();
+
     // Create our QUIC endpoint. Use an unspecified address and port since we don't have any preference.
     let mut endpoint = quinn::Endpoint::server(
         server_config,
-        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
-    )
-    .expect("Failed to open QUIC endpoint");
+        if using_ipv4 {
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
+        } else {
+            SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0))
+        },
+    )?;
+
+    // Use an insecure client configuration when connecting to peers.
+    // TODO: Use a secure client configuration when connecting to the server.
+    endpoint.set_default_client_config(configure_peer_verification());
+    // Connect to the public file_yeet_server.
+    let connection = connect_to_server(server_socket, &endpoint).await?;
 
     // Share debug information about the QUIC endpoints.
     let mut local_address = endpoint
         .local_addr()
         .expect("Failed to get the local address of our QUIC endpoint");
     if local_address.ip().is_unspecified() {
-        local_address.set_ip(
-            default_net::interface::get_local_ipaddr().expect("Failed to get our local address"),
-        );
+        local_address.set_ip({
+            let interface =
+                default_net::get_default_interface().expect("Failed to get our default interface");
+            if using_ipv4 {
+                IpAddr::V4(
+                    interface
+                        .ipv4
+                        .first()
+                        .expect("Failed to get our default IPv4 address")
+                        .addr,
+                )
+            } else {
+                IpAddr::V6(
+                    interface
+                        .ipv6
+                        .first()
+                        .expect("Failed to get our default IPv6 address")
+                        .addr,
+                )
+            }
+        });
     }
     println!(
         "{} QUIC endpoint created with address: {local_address}",
@@ -79,10 +126,10 @@ pub async fn prepare_server_connection(
 
     // Attempt to get a port forwarding, starting with user's override and then attempting NAT-PMP and PCP.
     let gateway = if let Some(g) = suggested_gateway {
-        g.parse().expect("Failed to parse gateway address")
+        g.parse()?
     } else {
         default_net::get_default_gateway()
-            .expect("Failed to get the default gateway")
+            .map_err(|s| anyhow::anyhow!(s))?
             .ip_addr
     };
     let (port_mapping, port_override) = match port_config {
@@ -91,7 +138,7 @@ pub async fn prepare_server_connection(
         // Allow the user to skip port mapping.
         PortMappingConfig::TryNatPmp => match try_port_mapping(gateway, local_address).await {
             Ok(m) => {
-                let p = NonZeroU16::new(m.external_port()).expect("Failed to get a non-zero port");
+                let p = m.external_port();
                 println!(
                     "{} Success mapping external port {p} -> internal {}",
                     local_now_fmt(),
@@ -107,24 +154,22 @@ pub async fn prepare_server_connection(
         PortMappingConfig::None => (None, None),
     };
 
-    // Use an insecure client configuration when connecting to peers.
-    // TODO: Use a secure client configuration when connecting to the server.
-    endpoint.set_default_client_config(configure_peer_verification());
-    // Connect to the public file_yeet_server.
-    let connection = connect_to_server(server_address, server_port, &endpoint).await;
-
     // Read the server's response to the sanity check.
-    let (sanity_check_addr, sanity_check) = socket_ping_request(&connection).await;
+    let (sanity_check_addr, sanity_check) = socket_ping_request(&connection).await?;
     println!("{} Server sees us as {sanity_check}", local_now_fmt());
 
     if let Some(port) = port_override {
         // Only send a port override request if the server sees us through a different port.
         if sanity_check_addr.port() != port.get() {
-            port_override_request(&connection, port, bb).await;
+            port_override_request(&connection, port, bb).await?;
         }
     }
 
-    (endpoint, connection, port_mapping)
+    Ok(PreparedConnection {
+        endpoint,
+        server_connection: connection,
+        port_mapping,
+    })
 }
 
 /// Attempt to create a port mapping using NAT-PMP or PCP.
@@ -144,101 +189,70 @@ async fn try_port_mapping(
 
 /// Connect to the server using QUIC.
 async fn connect_to_server(
-    server_address: Option<&str>,
-    server_port: NonZeroU16,
+    server_socket: SocketAddrHelper,
     endpoint: &quinn::Endpoint,
-) -> quinn::Connection {
+) -> anyhow::Result<quinn::Connection> {
     // Reused error message string.
     const SERVER_CONNECTION_ERR: &str = "Failed to establish a QUIC connection to the server";
-
-    // Get the server address info.
-    let SocketAddrHelper {
-        addr: server_address,
-        hostname,
-    } = file_yeet_shared::get_server_or_default(server_address, server_port)
-        .expect("Failed to parse server address");
-    println!(
-        "{} Connecting to server {hostname} at socket address: {server_address}",
-        local_now_fmt()
-    );
 
     // Attempt to connect to the server using QUIC.
     let connection = match tokio::time::timeout(
         SERVER_CONNECTION_TIMEOUT,
-        endpoint
-            .connect(server_address, hostname.as_str())
-            .expect("Failed to open a QUIC connection to the server"),
+        endpoint.connect(server_socket.address, server_socket.hostname.as_str())?,
     )
     .await
     {
         Ok(Ok(c)) => c,
         Ok(Err(e)) => {
-            panic!("{} {SERVER_CONNECTION_ERR}: {e}", local_now_fmt());
+            anyhow::bail!("{SERVER_CONNECTION_ERR}: {e}");
         }
         Err(e) => {
-            panic!("{} {SERVER_CONNECTION_ERR}: Timeout {e:#}", local_now_fmt());
+            anyhow::bail!("{SERVER_CONNECTION_ERR}: Timeout {e:#}");
         }
     };
     println!("{} QUIC connection made to the server", local_now_fmt());
-    connection
+    Ok(connection)
 }
 
 /// Perform a socket ping request to the server and sanity chech the response.
 /// Returns the server's address and the string encoding it was sent as.
-pub async fn socket_ping_request(server_connection: &quinn::Connection) -> (SocketAddr, String) {
+pub async fn socket_ping_request(
+    server_connection: &quinn::Connection,
+) -> anyhow::Result<(SocketAddr, String)> {
     // Create a bi-directional stream to the server.
-    let mut server_streams: BiStream = server_connection
-        .open_bi()
-        .await
-        .expect("Failed to open a bi-directional QUIC stream for a socket ping request")
-        .into();
+    let mut server_streams: BiStream = server_connection.open_bi().await?.into();
 
     // Perform a sanity check by sending the server a socket ping request.
     // This allows us to verify that the server can determine our public address.
     server_streams
         .send
         .write_u16(file_yeet_shared::ClientApiRequest::SocketPing as u16)
-        .await
-        .expect("Failed to send a socket ping request to the server");
+        .await?;
 
     // Read the server's response to the sanity check.
-    let string_len = server_streams
-        .recv
-        .read_u16()
-        .await
-        .expect("Failed to read a u16 response from the server");
-    let sanity_check = expect_server_text(&mut server_streams.recv, string_len)
-        .await
-        .expect("Failed to read a valid socket address from the server");
-    let sanity_check_addr: SocketAddr = sanity_check
-        .parse()
-        .expect("Server did not send a valid socket address for the sanity check");
+    let string_len = server_streams.recv.read_u16().await?;
+    let sanity_check = expect_server_text(&mut server_streams.recv, string_len).await?;
+    let sanity_check_addr: SocketAddr = sanity_check.parse()?;
 
-    (sanity_check_addr, sanity_check)
+    Ok((sanity_check_addr, sanity_check))
 }
 
 pub async fn port_override_request(
     server_connection: &quinn::Connection,
     port: NonZeroU16,
     bb: &mut bytes::BytesMut,
-) {
+) -> anyhow::Result<()> {
     // Create a bi-directional stream to the server.
-    let mut server_streams: BiStream = server_connection
-        .open_bi()
-        .await
-        .expect("Failed to open a bi-directional QUIC stream for a socket ping request")
-        .into();
+    let mut server_streams: BiStream = server_connection.open_bi().await?.into();
 
     // Format a port override request.
     bb.put_u16(file_yeet_shared::ClientApiRequest::PortOverride as u16);
     bb.put_u16(port.get());
     // Send the port override request to the server and clear the buffer.
-    server_streams
-        .send
-        .write_all(bb)
-        .await
-        .expect("Failed to send the port override request to the server");
+    server_streams.send.write_all(bb).await?;
     bb.clear();
+
+    Ok(())
 }
 
 /// Try to read a valid UTF-8 from the server until the expected length is reached.
@@ -404,6 +418,133 @@ async fn connect_to_peer(
     None
 }
 
+/// Errors that may occur when downloading a file from a peer.
+#[derive(Debug, thiserror::Error)]
+pub enum DownloadError {
+    #[error("An I/O error occurred: {0}")]
+    IoError(std::io::Error),
+    #[error("The downloaded file hash does not match the expected hash")]
+    HashMismatch,
+}
+
+/// Download a file from the peer. Initiates the download by consenting to the peer to receive the file.
+pub async fn download_from_peer(
+    hash: HashBytes,
+    mut peer_streams: BiStream,
+    file_size: u64,
+    output: &Path,
+) -> Result<(), DownloadError> {
+    // Open the file for writing.
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&output)
+        .await
+        .map_err(DownloadError::IoError)?;
+
+    // Let the peer know that we accepted the download.
+    peer_streams
+        .send
+        .write_u8(1)
+        .await
+        .map_err(DownloadError::IoError)?;
+    peer_streams
+        .send
+        .finish()
+        .await
+        .map_err(|e| DownloadError::IoError(e.into()))?;
+
+    // Create a scratch space for reading data from the stream.
+    let mut buf = [0; MAX_PEER_COMMUNICATION_SIZE];
+    // Read from the peer and write to the file.
+    let mut bytes_written = 0;
+    let mut hasher = sha2::Sha256::new();
+    while bytes_written < file_size {
+        // Read a natural amount of bytes from the peer.
+        let size = peer_streams
+            .recv
+            .read(&mut buf)
+            .await
+            .map_err(|e| DownloadError::IoError(e.into()))?
+            .ok_or(DownloadError::IoError(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "Peer closed the upload early",
+            )))?;
+        if size > 0 {
+            // Write the bytes to the file and update the hash.
+            let bb = &buf[..size];
+            let f = file.write_all(bb);
+            // Update hash while future may be pending.
+            hasher.update(bb);
+            f.await.map_err(DownloadError::IoError)?;
+
+            // Update the number of bytes written.
+            bytes_written += size as u64;
+        }
+    }
+
+    // Ensure the file hash is correct.
+    let downloaded_hash = hasher.finalize();
+    if hash != Into::<HashBytes>::into(downloaded_hash) {
+        return Err(DownloadError::HashMismatch);
+    }
+
+    // Let the user know that the download is complete.
+    println!(
+        "{} Download complete: {}",
+        local_now_fmt(),
+        output.display()
+    );
+    Ok(())
+}
+
+/// Upload the file to the peer. Ensure they consent to the file size before sending the file.
+pub async fn upload_to_peer(
+    mut peer_streams: BiStream,
+    file_size: u64,
+    mut reader: tokio::io::BufReader<tokio::fs::File>,
+) -> anyhow::Result<()> {
+    // Ensure that the file reader is at the start before the upload.
+    reader.rewind().await?;
+
+    // Send the file size to the peer.
+    peer_streams.send.write_u64(file_size).await?;
+
+    // Read the peer's response to the file size.
+    let response = peer_streams.recv.read_u8().await?;
+    if response == 0 {
+        println!("{} Peer cancelled the upload", local_now_fmt());
+        return Ok(());
+    }
+
+    // Create a scratch space for reading data from the stream.
+    let mut buf = [0; MAX_PEER_COMMUNICATION_SIZE];
+    // Read from the file and write to the peer.
+    loop {
+        // Read a natural amount of bytes from the file.
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+
+        // Write the bytes to the peer.
+        peer_streams.send.write_all(&buf[..n]).await?;
+    }
+
+    // Greacefully close our connection after all data has been sent.
+    if let Err(e) = peer_streams.send.finish().await {
+        eprintln!(
+            "{} Failed to close the peer stream gracefully: {e}",
+            local_now_fmt()
+        );
+    }
+
+    // Let the user know that the upload is complete.
+    println!("{} Upload complete!", local_now_fmt());
+    Ok(())
+}
+
 /// Allow peers to connect using self-signed certificates.
 /// Necessary for using the QUIC protocol.
 #[derive(Debug)]
@@ -442,7 +583,9 @@ fn configure_peer_verification() -> quinn::ClientConfig {
             .try_into()
             .expect("Failed to convert `Duration` to `IdleTimeout`"),
     ));
-    transport_config.keep_alive_interval(Some(Duration::from_secs(60)));
+
+    // Send keep alive packets at a fraction of the idle timeout.
+    transport_config.keep_alive_interval(Some(Duration::from_secs(10)));
     client_config.transport_config(Arc::new(transport_config));
 
     client_config

@@ -5,20 +5,26 @@ use clap::Parser;
 use file_yeet_shared::{
     local_now_fmt, ClientApiRequest, HashBytes, SocketAddrHelper, MAX_SERVER_COMMUNICATION_SIZE,
 };
-use smallvec::SmallVec;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     sync::{mpsc, RwLock},
 };
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
-/// A client that has connected to the server.
-struct Client {
-    pub address: String,
+/// A client stream that is handling a publish request.
+struct Publisher {
+    // A reference to the client's socket address as a string.
+    pub address: Arc<RwLock<String>>,
+
+    // A channel to send messages to the task handling this client's publish request.
     pub stream: mpsc::Sender<String>,
 }
+type PublisherRef = Arc<RwLock<Publisher>>;
 
-/// The command line arguments for the server.
+/// A nonce for the server to use in its communications with clients.
+type Nonce = [u32; 4];
+
+/// The command line interface for `file_yeet_server`.
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
@@ -27,12 +33,12 @@ struct Cli {
     bind_ip: Option<String>,
 
     /// The port the server will bind to.
-    #[arg(short='p', long, default_value_t = NonZeroU16::new(file_yeet_shared::DEFAULT_PORT).unwrap())]
+    #[arg(short='p', long, default_value_t = file_yeet_shared::DEFAULT_PORT)]
     bind_port: NonZeroU16,
 }
 
 /// A mapping between file hashes and the addresses of connected peers that are publishing the file.
-type PublishersRef = Arc<RwLock<HashMap<HashBytes, SmallVec<[Arc<RwLock<Client>>; 3]>>>>;
+type PublishersRef = Arc<RwLock<HashMap<HashBytes, HashMap<Nonce, PublisherRef>>>>;
 
 #[tokio::main]
 async fn main() {
@@ -41,7 +47,7 @@ async fn main() {
 
     // Determine which address to bind to.
     let SocketAddrHelper {
-        addr: bind_address,
+        address: bind_address,
         hostname: _,
     } = file_yeet_shared::get_server_or_default(args.bind_ip.as_deref(), args.bind_port)
         .expect("Failed to parse server address");
@@ -107,13 +113,18 @@ async fn handle_incoming_loop(
     while let Some(connecting) = local_end.accept().await {
         let cancellation_token = cancellation_token.clone();
         let publishers = publishers.clone();
+        let client_disconnect_token = CancellationToken::new();
+
         task_master.spawn(async move {
             tokio::select! {
                 // Allow the server to cancel client tasks.
-                () = cancellation_token.cancelled() => {}
+                () = cancellation_token.cancelled() => client_disconnect_token.cancel(),
 
                 // Handle this client's connection.
-                r = handle_quic_connection(connecting, publishers) => {
+                r = handle_quic_connection(connecting, publishers, client_disconnect_token.clone()) => {
+                    // Let all tasks created for this client know that they should shut down.
+                    client_disconnect_token.cancel();
+
                     if let Err(e) = r {
                         eprintln!(
                             "{} Failed to handle client connection: {e}",
@@ -146,12 +157,19 @@ enum ClientRequestError {
 async fn handle_quic_connection(
     connecting: quinn::Connecting,
     publishers: PublishersRef,
+    cancellation_token: CancellationToken,
 ) -> Result<(), ClientRequestError> {
     let connection = connecting.await.map_err(ClientRequestError::Connection)?;
     let socket_addr = connection.remote_address();
-    let mut sock_string = socket_addr.to_string();
+    let sock_string = Arc::new(RwLock::new(socket_addr.to_string()));
     let mut port_used = socket_addr.port();
-    let mut client_lock: Option<Arc<RwLock<Client>>> = None;
+    let mut client_pubs: Vec<PublisherRef> = Vec::new();
+    let nonce: Nonce = [
+        rand::random(),
+        rand::random(),
+        rand::random(),
+        rand::random(),
+    ];
     let mut bb = bytes::BytesMut::with_capacity(MAX_SERVER_COMMUNICATION_SIZE);
 
     loop {
@@ -169,15 +187,23 @@ async fn handle_quic_connection(
                 .map_err(ClientRequestError::IoError)?,
         )
         .map_err(|e| ClientRequestError::InvalidApiRequestCode(e.number))?;
-        println!("{} {api} from {sock_string}", local_now_fmt());
+        println!(
+            "{} {api} from {}",
+            local_now_fmt(),
+            sock_string.read().await
+        );
 
         match api {
             ClientApiRequest::SocketPing => {
                 // Format the ping response as a length and UTF-8 string.
-                bb.put_u16(
-                    u16::try_from(sock_string.len()).expect("Message content length is invalid"),
-                );
-                bb.put(sock_string.as_bytes());
+                {
+                    let sock_string = sock_string.read().await;
+                    bb.put_u16(
+                        u16::try_from(sock_string.len())
+                            .expect("Message content length is invalid"),
+                    );
+                    bb.put(sock_string.as_bytes());
+                }
 
                 // Send the ping response to the client.
                 quic_send
@@ -196,7 +222,8 @@ async fn handle_quic_connection(
                     continue;
                 }
 
-                sock_string = {
+                // Update the shared string with the new port.
+                *sock_string.write().await = {
                     let mut a = socket_addr;
                     a.set_port(port);
                     a.to_string()
@@ -204,8 +231,9 @@ async fn handle_quic_connection(
                 println!("{} Overriding port to {port}", local_now_fmt());
                 port_used = port;
 
-                if let Some(lock) = client_lock.as_ref() {
-                    let mut client = lock.write().await;
+                // Update the client address string for each
+                for pub_lock in &mut client_pubs {
+                    let mut client = pub_lock.write().await;
                     client.address = sock_string.clone();
                 }
             }
@@ -219,12 +247,13 @@ async fn handle_quic_connection(
 
                 // Now that we have the peer's socket address and the file hash, we can handle the publish request.
                 handle_publish(
-                    connection.clone(),
                     quic_send,
                     sock_string.clone(),
+                    nonce,
                     hash,
-                    &mut client_lock,
+                    &mut client_pubs,
                     publishers.clone(),
+                    cancellation_token.clone(),
                 )
                 .await;
             }
@@ -255,40 +284,43 @@ async fn handle_quic_connection(
 
 /// Handle QUIC connections for clients that want to publish a new file hash.
 async fn handle_publish(
-    connection: quinn::Connection,
-    mut quic_send: quinn::SendStream,
-    sock_string: String,
+    quic_send: quinn::SendStream,
+    sock_string: Arc<RwLock<String>>,
+    session_nonce: Nonce,
     hash: HashBytes,
-    client_lock: &mut Option<Arc<RwLock<Client>>>,
+    client_pubs: &mut Vec<PublisherRef>,
     publishers: PublishersRef,
+    cancellation_token: CancellationToken,
 ) {
-    // Use a channel to handle buffering and flushing of messages.
-    // Ensures that the stream doesn't need to be cloned or passed between threads.
-    let (tx, mut rx) = mpsc::channel::<String>(4 * MAX_SERVER_COMMUNICATION_SIZE);
+    /// Helper to remove a publisher from the list of peers sharing a file hash.
+    async fn try_remove_publisher(
+        session_nonce: Nonce,
+        hash: HashBytes,
+        publishers: PublishersRef,
+    ) {
+        // Remove the client from the list of peers publishing this hash.
+        // TODO: Consider identifying clients by a unique ID in case of address collisions.
+        let mut publishers = publishers.write().await;
+        if let Some(clients_list) = publishers.get_mut(&hash) {
+            clients_list.remove(&session_nonce);
 
-    let client = client_lock.get_or_insert_with(|| {
-        Arc::new(RwLock::new(Client {
-            address: sock_string.clone(),
-            stream: tx,
-        }))
-    });
-
-    // Add the client to a list of peers publishing this hash.
-    // Wrap the lock in a block to ensure it is released quickly.
-    {
-        let mut publishers_lock = publishers.write().await;
-        if let Some(client_list) = publishers_lock.get_mut(&hash) {
-            client_list.push(client.clone());
-        } else {
-            publishers_lock.insert(hash, smallvec::smallvec![client.clone()]);
+            // Remove the file hash from the map if no clients are publishing it.
+            if clients_list.is_empty() {
+                publishers.remove(&hash);
+            }
         }
     }
-
-    tokio::task::spawn(async move {
+    /// A loop to handle messages to be sent to a client publishing a file hash.
+    async fn handle_publish_inner(
+        mut quic_send: quinn::SendStream,
+        mut rx: mpsc::Receiver<String>,
+        sock_string: Arc<RwLock<String>>,
+    ) {
         #[cfg(debug_assertions)]
         println!(
-            "{} Starting subscribe task for client {sock_string}",
-            local_now_fmt()
+            "{} Starting subscribe task for client {}",
+            local_now_fmt(),
+            sock_string.read().await,
         );
         let mut bb = bytes::BytesMut::with_capacity(MAX_SERVER_COMMUNICATION_SIZE);
 
@@ -306,28 +338,54 @@ async fn handle_publish(
             bb.clear();
 
             #[cfg(debug_assertions)]
-            println!("{} Introduced {message} to {sock_string}", local_now_fmt());
+            println!(
+                "{} Introduced {message} to {}",
+                local_now_fmt(),
+                sock_string.read().await
+            );
+        }
+    }
+
+    // Use a channel to handle buffering and flushing of messages.
+    // Ensures that the stream doesn't need to be cloned or passed between threads.
+    let (tx, rx) = mpsc::channel::<String>(4 * MAX_SERVER_COMMUNICATION_SIZE);
+
+    let client = Arc::new(RwLock::new(Publisher {
+        address: sock_string.clone(),
+        stream: tx,
+    }));
+    client_pubs.push(client.clone());
+
+    // Add the client to a list of peers publishing this hash.
+    // Wrap the lock in a block to ensure it is released quickly.
+    {
+        let mut publishers_lock = publishers.write().await;
+        if let Some(client_list) = publishers_lock.get_mut(&hash) {
+            client_list.insert(session_nonce, client.clone());
+        } else {
+            publishers_lock.insert(hash, HashMap::from([(session_nonce, client.clone())]));
+        }
+    }
+
+    // Create a cacellable task to handle the client's publish request.
+    tokio::task::spawn(async move {
+        tokio::select! {
+            // Allow the server to cancel the task.
+            () = cancellation_token.cancelled() => {}
+
+            // Handle the client's file-publishing task.
+            () = handle_publish_inner(quic_send, rx, sock_string) => {}
         }
 
-        // Wait for the client to close the connection.
-        let closed_reason = connection.closed().await;
-        println!(
-            "{} Client {sock_string} disconnected: {closed_reason:?}",
-            local_now_fmt()
-        );
-
-        // Remove the client from the list of peers publishing this hash.
-        // TODO: Consider identifying clients by a unique ID in case of address collisions.
-        if let Some(clients_list) = publishers.write().await.get_mut(&hash) {
-            clients_list.retain(|c| c.blocking_read().address != sock_string);
-        }
+        // Remove any
+        try_remove_publisher(session_nonce, hash, publishers).await;
     });
 }
 
 /// Handle QUIC connections for clients that want to subscribe to a file hash.
 async fn handle_subscribe(
     quic_send: &mut quinn::SendStream,
-    sock_string: &String,
+    sock_string: &Arc<RwLock<String>>,
     hash: HashBytes,
     clients: &PublishersRef,
     bb: &mut bytes::BytesMut,
@@ -360,21 +418,26 @@ async fn handle_subscribe(
 
     let clients = client_list.iter();
     let mut n: u16 = 0;
-    for pub_client in clients {
+    for (_, pub_client) in clients {
         // Get read access on client lock.
         let pub_client = pub_client.read().await;
+        let client_address = pub_client.address.read().await;
 
         // Ensure that the message doesn't exceed the maximum size.
-        if bb.len() + 2 + pub_client.address.len() > MAX_SERVER_COMMUNICATION_SIZE {
+        if bb.len() + 2 + client_address.len() > MAX_SERVER_COMMUNICATION_SIZE {
             break;
         }
 
         // Feed the publishing client socket address to the task that handles communicating with this client.
         // Only include the peer if the message was successfully passed.
-        if let Ok(()) = pub_client.stream.send(sock_string.clone()).await {
+        if let Ok(()) = pub_client
+            .stream
+            .send(sock_string.read().await.clone())
+            .await
+        {
             // Send the publisher's socket address to the subscribing client.
-            bb.put_u16(u16::try_from(pub_client.address.len()).unwrap());
-            bb.put(pub_client.address.as_bytes());
+            bb.put_u16(u16::try_from(client_address.len()).unwrap());
+            bb.put(client_address.as_bytes());
             n += 1;
         }
     }
@@ -391,9 +454,10 @@ async fn handle_subscribe(
     #[cfg(debug_assertions)]
     if n != 0 {
         println!(
-            "{} Introduced {} peers to {sock_string}",
+            "{} Introduced {} peers to {}",
             local_now_fmt(),
-            n
+            n,
+            sock_string.read().await,
         );
     }
 
