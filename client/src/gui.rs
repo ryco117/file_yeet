@@ -1,28 +1,37 @@
 use std::{
+    num::NonZeroU16,
     ops::Div as _,
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use file_yeet_shared::DEFAULT_PORT;
-use iced::widget;
+use file_yeet_shared::{HashBytes, DEFAULT_PORT};
+use iced::{widget, Element};
 
 use crate::core::{self, MAX_PEER_COMMUNICATION_SIZE};
+
+/// Lazyily initialized regex for parsing server addresses.
+static SERVER_ADDRESS_REGEX: once_cell::sync::Lazy<regex::Regex> =
+    once_cell::sync::Lazy::new(|| {
+        regex::Regex::new(r"^(?P<host>[^:]+)(?::(?P<port>\d+))?$").unwrap()
+    });
 
 /// The state of the connection to a `file_yeet` server.
 #[derive(Default, Debug)]
 enum ConnectionState {
+    /// No server connection is active.
     #[default]
     Disconnected,
-    Connecting {
-        start: Instant,
-        tick: Instant,
-    },
+
+    /// Connecting to the server is in progress.
+    Connecting { start: Instant, tick: Instant },
+
+    /// A connection to the server is active.
     Connected {
         endpoint: quinn::Endpoint,
         server: quinn::Connection,
-        modal: bool,
+        hash_input: String,
     },
 }
 
@@ -31,6 +40,8 @@ enum ConnectionState {
 pub struct AppState {
     connection_state: ConnectionState,
     server_address: String,
+    status_message: Option<String>,
+    modal: bool,
 }
 
 /// The messages that can be sent to the update loop of the application.
@@ -47,6 +58,9 @@ pub enum Message {
 
     /// The result of a server connection attempt.
     ConnectResulted(Result<core::PreparedConnection, Arc<anyhow::Error>>),
+
+    /// The hash input field was changed.
+    HashInputChanged(String),
 
     /// The publish button was clicked.
     PublishClicked,
@@ -89,8 +103,8 @@ impl iced::Application for AppState {
 
             // Handle the publish button being clicked by picking a file to publish.
             Message::ConnectClicked => {
-                let server_address = self.server_address.clone();
-                let mut bb = bytes::BytesMut::with_capacity(MAX_PEER_COMMUNICATION_SIZE);
+                // Clear the status message before starting the connection attempt.
+                self.status_message = None;
 
                 // Set the state to `Connecting` before starting the connection attempt.
                 self.connection_state = ConnectionState::Connecting {
@@ -98,13 +112,38 @@ impl iced::Application for AppState {
                     tick: Instant::now(),
                 };
 
-                // TODO: Use regex to determine if a port number was provided.
+                // Determine if a valid server address was entered.
+                let regex_match = if self.server_address.is_empty() {
+                    // If empty, allow for defaults to be used.
+                    Some((None, DEFAULT_PORT))
+                } else {
+                    // Otherwise, parse the server address and optional port.
+                    SERVER_ADDRESS_REGEX
+                        .captures(&self.server_address)
+                        .and_then(|captures| {
+                            let host = captures.name("host").unwrap().as_str();
+
+                            // If there is no port, use the default port. Otherwise, the input must be valid.
+                            let port = captures.name("port").map_or(Some(DEFAULT_PORT), |p| {
+                                p.as_str().parse::<NonZeroU16>().ok()
+                            })?;
+                            Some((Some(host.to_owned()), port))
+                        })
+                };
+
+                // If the server address is invalid, display an error message and return.
+                let Some((server_address, port)) = regex_match else {
+                    self.status_message = Some("Invalid server address".to_owned());
+                    self.connection_state = ConnectionState::Disconnected;
+                    return iced::Command::none();
+                };
 
                 iced::Command::perform(
                     async move {
+                        let mut bb = bytes::BytesMut::with_capacity(MAX_PEER_COMMUNICATION_SIZE);
                         core::prepare_server_connection(
-                            Some(&server_address),
-                            DEFAULT_PORT,
+                            server_address.as_deref(),
+                            port,
                             None,
                             core::PortMappingConfig::None,
                             &mut bb,
@@ -130,23 +169,36 @@ impl iced::Application for AppState {
                     self.connection_state = ConnectionState::Connected {
                         endpoint: prepared.endpoint,
                         server: prepared.server_connection,
-                        modal: false,
+                        hash_input: String::new(),
                     };
                     iced::Command::none()
                 }
                 Err(e) => {
-                    // TODO: Show an error message based on a real error value.
-                    eprintln!("Error connecting: {e:?}");
+                    self.status_message = Some({
+                        let e = format!("Error connecting: {e:?}");
+                        eprintln!("{e}");
+                        e
+                    });
                     self.connection_state = ConnectionState::Disconnected;
                     iced::Command::none()
                 }
             },
 
+            // Handle the hash input being changed.
+            Message::HashInputChanged(hash) => {
+                if let ConnectionState::Connected { hash_input, .. } = &mut self.connection_state {
+                    *hash_input = hash;
+                }
+                iced::Command::none()
+            }
+
             // Handle the publish button being clicked by picking a file to publish.
             Message::PublishClicked => {
-                if let ConnectionState::Connected { modal, .. } = &mut self.connection_state {
-                    *modal = true;
-                }
+                // Clear the status message before starting the publish attempt.
+                self.status_message = None;
+
+                // Let state know that a modal dialog is open.
+                self.modal = true;
 
                 iced::Command::perform(
                     rfd::AsyncFileDialog::new()
@@ -158,18 +210,17 @@ impl iced::Application for AppState {
 
             // Begin the process of publishing a file to the server.
             Message::PublishPathChosen(_) => {
-                if let ConnectionState::Connected { modal, .. } = &mut self.connection_state {
-                    *modal = false;
-                }
-
+                self.modal = false;
                 iced::Command::none()
             }
 
             // Handle the subscribe button being clicked by choosing a save location.
             Message::SubscribeClicked => {
-                if let ConnectionState::Connected { modal, .. } = &mut self.connection_state {
-                    *modal = true;
-                }
+                // Clear the status message before starting the subscribe attempt.
+                self.status_message = None;
+
+                // Let state know that a modal dialog is open.
+                self.modal = true;
 
                 iced::Command::perform(
                     rfd::AsyncFileDialog::new()
@@ -180,12 +231,34 @@ impl iced::Application for AppState {
             }
 
             // Begin the process of subscribing to a file from the server.
-            Message::SubscribePathChosen(_) => {
-                if let ConnectionState::Connected { modal, .. } = &mut self.connection_state {
-                    *modal = false;
+            Message::SubscribePathChosen(p) => {
+                self.modal = false;
+
+                // Ensure a path was chosen.
+                let Some(path) = p else {
+                    return iced::Command::none();
+                };
+
+                // Ensure the client is connected to a server.
+                let ConnectionState::Connected { hash_input, .. } = &self.connection_state else {
+                    return iced::Command::none();
+                };
+
+                // Ensure the hash is valid.
+                let mut hash = HashBytes::default();
+                if let Err(e) = faster_hex::hex_decode(hash_input.as_bytes(), &mut hash) {
+                    self.status_message = Some(format!("Invalid hash: {e}"));
+                    return iced::Command::none();
                 }
 
                 iced::Command::none()
+                // iced::Command::perform(
+                //     async move {
+                //         let mut bb = bytes::BytesMut::with_capacity(MAX_PEER_COMMUNICATION_SIZE);
+                //         core::(hash, ).await
+                //     },
+                //     Message::ConnectClicked,
+                // )
             }
         }
     }
@@ -194,7 +267,7 @@ impl iced::Application for AppState {
     fn subscription(&self) -> iced::Subscription<Message> {
         match self.connection_state {
             ConnectionState::Connecting { .. } => {
-                iced::time::every(Duration::from_millis(10)).map(|_| Message::SpinTick)
+                iced::time::every(Duration::from_millis(33)).map(|_| Message::SpinTick)
             }
             _ => iced::Subscription::none(),
         }
@@ -202,7 +275,8 @@ impl iced::Application for AppState {
 
     /// Draw the application GUI.
     fn view(&self) -> iced::Element<Message> {
-        match self.connection_state {
+        // Create a different top-level page based on the connection state.
+        let page: Element<Message> = match &self.connection_state {
             // Display a prompt for the server address when disconnected.
             ConnectionState::Disconnected => {
                 let server_address = widget::text_input(
@@ -228,7 +302,7 @@ impl iced::Application for AppState {
             }
 
             // Display a spinner while connecting.
-            ConnectionState::Connecting { start, tick } => {
+            &ConnectionState::Connecting { start, tick } => {
                 let spinner = widget::container::Container::new(widget::progress_bar(
                     0.0..=1.,
                     (tick - start)
@@ -246,25 +320,56 @@ impl iced::Application for AppState {
             }
 
             // Display the main application controls when connected.
-            ConnectionState::Connected { modal, .. } => {
+            ConnectionState::Connected { hash_input, .. } => {
                 let mut publish_button = widget::button("Publish");
                 let mut download_button = widget::button("Download");
+                let mut hash_text_input = widget::text_input("Hash", hash_input);
 
-                // Disable the buttons while a modal is open.
-                if !modal {
+                // Disable the inputs while a modal is open.
+                if !self.modal {
                     publish_button = publish_button.on_press(Message::PublishClicked);
-                    download_button = download_button.on_press(Message::SubscribeClicked);
+                    hash_text_input = hash_text_input.on_input(Message::HashInputChanged);
+
+                    // Enable the download button if the hash is valid.
+                    if hash_input.len() == file_yeet_shared::HASH_BYTE_COUNT << 1
+                        && faster_hex::hex_check(hash_input.as_bytes())
+                    {
+                        download_button = download_button.on_press(Message::SubscribeClicked);
+                    }
                 }
 
-                widget::container(widget::row!(publish_button, download_button).spacing(6))
-                    .width(iced::Length::Fill)
-                    .height(iced::Length::Fill)
-                    .padding(12)
-                    .center_x()
-                    .center_y()
-                    .into()
+                widget::container(
+                    widget::row!(
+                        publish_button,
+                        widget::horizontal_space(),
+                        hash_text_input,
+                        download_button
+                    )
+                    .spacing(6),
+                )
+                .width(iced::Length::Fill)
+                .height(iced::Length::Fill)
+                .padding(12)
+                .center_x()
+                .center_y()
+                .into()
             }
-        }
+        };
+
+        // Always display the status bar at the bottom.
+        let status_bar = widget::container(if let Some(status_message) = &self.status_message {
+            Element::from(
+                widget::text(status_message)
+                    .style(iced::theme::Text::Color(iced::Color::from_rgb8(
+                        0xF0, 0x60, 0x80,
+                    )))
+                    .width(iced::Length::Fill)
+                    .height(iced::Length::Shrink),
+            )
+        } else {
+            widget::horizontal_space().into()
+        });
+        widget::column!(page, status_bar).padding(6).into()
     }
 
     /// Prefer a dark theme.

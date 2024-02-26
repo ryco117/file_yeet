@@ -164,12 +164,7 @@ async fn handle_quic_connection(
     let sock_string = Arc::new(RwLock::new(socket_addr.to_string()));
     let mut port_used = socket_addr.port();
     let mut client_pubs: Vec<PublisherRef> = Vec::new();
-    let nonce: Nonce = [
-        rand::random(),
-        rand::random(),
-        rand::random(),
-        rand::random(),
-    ];
+    let nonce = random_nonce();
     let mut bb = bytes::BytesMut::with_capacity(MAX_SERVER_COMMUNICATION_SIZE);
 
     loop {
@@ -194,49 +189,25 @@ async fn handle_quic_connection(
         );
 
         match api {
-            ClientApiRequest::SocketPing => {
-                // Format the ping response as a length and UTF-8 string.
-                {
-                    let sock_string = sock_string.read().await;
-                    bb.put_u16(
-                        u16::try_from(sock_string.len())
-                            .expect("Message content length is invalid"),
-                    );
-                    bb.put(sock_string.as_bytes());
-                }
+            // Send a ping response to the client.
+            // Close the connection if we can't send the response.
+            ClientApiRequest::SocketPing => socket_ping(quic_send, &sock_string).await?,
 
-                // Send the ping response to the client.
-                quic_send
-                    .write_all(&bb)
-                    .await
-                    .map_err(|e| ClientRequestError::IoError(e.into()))?;
-            }
+            // Update the client's address string with the new port.
+            // Close the connection if we can't read the new port.
             ClientApiRequest::PortOverride => {
-                let port = quic_recv
-                    .read_u16()
-                    .await
-                    .map_err(ClientRequestError::IoError)?;
-
-                // Avoid unnecessary string allocations.
-                if port == port_used {
-                    continue;
-                }
-
-                // Update the shared string with the new port.
-                *sock_string.write().await = {
-                    let mut a = socket_addr;
-                    a.set_port(port);
-                    a.to_string()
-                };
-                println!("{} Overriding port to {port}", local_now_fmt());
-                port_used = port;
-
-                // Update the client address string for each
-                for pub_lock in &mut client_pubs {
-                    let mut client = pub_lock.write().await;
-                    client.address = sock_string.clone();
-                }
+                port_override(
+                    quic_recv,
+                    &sock_string,
+                    socket_addr,
+                    &mut port_used,
+                    &mut client_pubs,
+                )
+                .await?;
             }
+
+            // Create a new task to handle the client's file-publishing request.
+            // Close the connection if we can't read the file hash.
             ClientApiRequest::Publish => {
                 let mut hash = HashBytes::default();
                 quic_recv.read_exact(&mut hash).await.map_err(|_| {
@@ -257,6 +228,9 @@ async fn handle_quic_connection(
                 )
                 .await;
             }
+
+            // Handle the client's file-subscription request.
+            // Close the connection if we can't complete the request.
             ClientApiRequest::Subscribe => {
                 let mut hash = HashBytes::default();
                 quic_recv.read_exact(&mut hash).await.map_err(|_| {
@@ -266,20 +240,80 @@ async fn handle_quic_connection(
                 })?;
 
                 // Now that we have the peer's socket address and the file hash, we can handle the subscribe request.
-                if let Err(e) =
-                    handle_subscribe(&mut quic_send, &sock_string, hash, &publishers, &mut bb).await
-                {
-                    eprintln!(
-                        "{} Failed to handle subscribe request: {e}",
-                        local_now_fmt()
-                    );
-                }
+                handle_subscribe(&mut quic_send, &sock_string, hash, &publishers, &mut bb).await?;
             }
         }
         // Clear the scratch space before the next iteration.
         // This is a low cost operation because it only changes an internal index value.
         bb.clear();
     }
+}
+
+/// Generate a random nonce to uniquely identify client connections.
+fn random_nonce() -> Nonce {
+    [
+        rand::random(),
+        rand::random(),
+        rand::random(),
+        rand::random(),
+    ]
+}
+
+/// Send a ping response to the client by sending the address we introduce them to peers as.
+async fn socket_ping(
+    mut quic_send: quinn::SendStream,
+    sock_string: &Arc<RwLock<String>>,
+) -> Result<(), ClientRequestError> {
+    let mut bb = bytes::BytesMut::with_capacity(MAX_SERVER_COMMUNICATION_SIZE);
+
+    // Format the ping response as a length and UTF-8 string.
+    {
+        let sock_string = sock_string.read().await;
+        bb.put_u16(u16::try_from(sock_string.len()).expect("Message content length is invalid"));
+        bb.put(sock_string.as_bytes());
+    }
+
+    // Send the ping response to the client.
+    quic_send
+        .write_all(&bb)
+        .await
+        .map_err(|e| ClientRequestError::IoError(e.into()))
+}
+
+/// Update the client's address string with the new port.
+async fn port_override(
+    mut quic_recv: quinn::RecvStream,
+    sock_string: &Arc<RwLock<String>>,
+    socket_addr: std::net::SocketAddr,
+    port_used: &mut u16,
+    client_pubs: &mut Vec<PublisherRef>,
+) -> Result<(), ClientRequestError> {
+    let port = quic_recv
+        .read_u16()
+        .await
+        .map_err(ClientRequestError::IoError)?;
+
+    // Avoid unnecessary string allocations.
+    if port == *port_used {
+        return Ok(());
+    }
+
+    // Update the shared string with the new port.
+    *sock_string.write().await = {
+        let mut a = socket_addr;
+        a.set_port(port);
+        a.to_string()
+    };
+    println!("{} Overriding port to {port}", local_now_fmt());
+    *port_used = port;
+
+    // Update the client address string for each
+    for pub_lock in client_pubs {
+        let mut client = pub_lock.write().await;
+        client.address = sock_string.clone();
+    }
+
+    Ok(())
 }
 
 /// Handle QUIC connections for clients that want to publish a new file hash.
@@ -367,7 +401,7 @@ async fn handle_publish(
         }
     }
 
-    // Create a cacellable task to handle the client's publish request.
+    // Create a cancellable task to handle the client's publish request.
     tokio::task::spawn(async move {
         tokio::select! {
             // Allow the server to cancel the task.
@@ -377,7 +411,7 @@ async fn handle_publish(
             () = handle_publish_inner(quic_send, rx, sock_string) => {}
         }
 
-        // Remove any
+        // Remove any reference there may be to this publish task.
         try_remove_publisher(session_nonce, hash, publishers).await;
     });
 }

@@ -159,7 +159,61 @@ async fn main() {
                 |o| o.clone().into(),
             );
 
-            subscribe(endpoint, &server_connection, bb, hash, &output).await;
+            // Request all available peers from the server.
+            let mut connection_attempts = match subscribe(endpoint, &server_connection, bb, hash)
+                .await
+            {
+                Err(e) => {
+                    return eprintln!("{} Failed to subscribe to the file: {e}", local_now_fmt())
+                }
+                Ok(c) => c,
+            };
+
+            // Iterate through the connection attempts as they resolve and use the first successful connection.
+            let peer_connection = loop {
+                match connection_attempts.next().await {
+                    Some(Some((c, mut b))) => {
+                        println!("{} Getting file size from peer...", local_now_fmt());
+
+                        // Read the file size from the peer.
+                        let Ok(file_size) = b.recv.read_u64().await else {
+                            continue;
+                        };
+                        let Ok(consent) = file_consent_cli(file_size, &output) else {
+                            continue;
+                        };
+                        if consent {
+                            break Some((c, b, file_size));
+                        }
+
+                        println!("{} Download cancelled", local_now_fmt());
+
+                        // Try to let the peer know that we cancelled the download.
+                        // Don't worry about the result since we are done with this peer.
+                        let _ =
+                            tokio::time::timeout(Duration::from_millis(200), b.send.write_u8(0))
+                                .await;
+                    }
+                    Some(None) => continue,
+                    None => break None,
+                }
+            };
+
+            // If no peer connection was successful, return an error.
+            let Some((_peer_connection, peer_streams, file_size)) = peer_connection else {
+                return println!("Failed to connect to any available peers");
+            };
+
+            // Try to download the requested file using the peer connection.
+            // Pin the future to avoid a stack overflow. <https://rust-lang.github.io/rust-clippy/master/index.html#large_futures>
+            Box::pin(core::download_from_peer(
+                hash,
+                peer_streams,
+                file_size,
+                &output,
+            ))
+            .await
+            .expect("Failed to download from peer");
         }
     }
 
@@ -301,13 +355,18 @@ async fn subscribe(
     server_connection: &quinn::Connection,
     mut bb: bytes::BytesMut,
     hash: HashBytes,
-    output: &Path,
-) {
+) -> anyhow::Result<
+    FuturesUnordered<impl std::future::Future<Output = Option<(quinn::Connection, BiStream)>>>,
+> {
     // Create a bi-directional stream to the server.
     let mut server_streams: BiStream = server_connection
         .open_bi()
         .await
-        .expect("Failed to open a bi-directional QUIC stream for a socket ping request")
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to open a bi-directional QUIC stream for a socket ping request: {e}"
+            )
+        })?
         .into();
 
     // Send the server a subscribe request.
@@ -317,7 +376,7 @@ async fn subscribe(
         .send
         .write_all(&bb)
         .await
-        .expect("Failed to send a subscribe request to the server");
+        .map_err(|e| anyhow::anyhow!("Failed to send a subscribe request to the server: {e}"))?;
 
     println!(
         "{} Requesting file with hash from the server...",
@@ -329,17 +388,17 @@ async fn subscribe(
         .recv
         .read_u16()
         .await
-        .expect("Failed to read a u16 response from the server");
-    if response_count == 0 {
-        eprintln!("{} No publishers available for file hash", local_now_fmt());
-        return;
-    }
+        .map_err(|e| anyhow::anyhow!("Failed to read a u16 response from the server: {e}"))?;
 
     let mut scratch_space = [0; MAX_SERVER_COMMUNICATION_SIZE];
-    let mut connection_attempts = FuturesUnordered::new();
+    let connection_attempts = FuturesUnordered::new();
+    if response_count == 0 {
+        eprintln!("{} No publishers available for file hash", local_now_fmt());
+        return Ok(connection_attempts);
+    }
     let local_address = endpoint
         .local_addr()
-        .expect("Could not determine our local IP");
+        .map_err(|e| anyhow::anyhow!("Could not determine our local IP: {e}"))?;
 
     // Parse each peer socket address.
     for _ in 0..response_count {
@@ -347,15 +406,18 @@ async fn subscribe(
             .recv
             .read_u16()
             .await
-            .expect("Failed to read response from server") as usize;
+            .map_err(|e| anyhow::anyhow!("Failed to read response from server: {e}"))?
+            as usize;
         let peer_string_bytes = &mut scratch_space[..address_len];
         server_streams
             .recv
             .read_exact(peer_string_bytes)
             .await
-            .expect("Failed to read a valid UTF-8 response from the server");
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to read a valid UTF-8 response from the server: {e}")
+            })?;
         let peer_address_str = std::str::from_utf8(peer_string_bytes)
-            .expect("Server did not send a valid UTF-8 response");
+            .map_err(|e| anyhow::anyhow!("Server did not send a valid UTF-8 response: {e}"))?;
         let peer_address = match peer_address_str.parse() {
             Ok(p) => p,
             Err(e) => {
@@ -376,49 +438,7 @@ async fn subscribe(
         ));
     }
 
-    // Iterate through the connection attempts as they resolve and use the first successful connection.
-    let peer_connection = loop {
-        match connection_attempts.next().await {
-            Some(Some((c, mut b))) => {
-                println!("{} Getting file size from peer...", local_now_fmt());
-
-                // Read the file size from the peer.
-                let Ok(file_size) = b.recv.read_u64().await else {
-                    continue;
-                };
-                let Ok(consent) = file_consent_cli(file_size, output) else {
-                    continue;
-                };
-                if consent {
-                    break Some((c, b, file_size));
-                }
-
-                println!("{} Download cancelled", local_now_fmt());
-
-                // Try to let the peer know that we cancelled the download.
-                // Don't worry about the result since we are done with this peer.
-                let _ = tokio::time::timeout(Duration::from_millis(200), b.send.write_u8(0)).await;
-            }
-            Some(None) => continue,
-            None => break None,
-        }
-    };
-
-    if let Some((_peer_connection, peer_streams, file_size)) = peer_connection {
-        // Try to download the requested file using the peer connection.
-        if let Err(e) = Box::pin(core::download_from_peer(
-            hash,
-            peer_streams,
-            file_size,
-            output,
-        ))
-        .await
-        {
-            eprintln!("{} Failed to download from peer: {e}", local_now_fmt());
-        }
-    } else {
-        eprintln!("{} Failed to connect to any peers", local_now_fmt());
-    }
+    Ok(connection_attempts)
 }
 
 /// Prompt the user for consent to download a file.
