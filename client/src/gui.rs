@@ -1,4 +1,5 @@
 use std::{
+    net::SocketAddr,
     num::NonZeroU16,
     ops::Div as _,
     path::PathBuf,
@@ -8,6 +9,7 @@ use std::{
 
 use file_yeet_shared::{local_now_fmt, HashBytes, DEFAULT_PORT, GOODBYE_CODE, GOODBYE_MESSAGE};
 use iced::{widget, window, Element};
+use tokio::sync::RwLock;
 
 use crate::core::{
     self, PortMappingConfig, MAX_PEER_COMMUNICATION_SIZE, SERVER_CONNECTION_TIMEOUT,
@@ -35,6 +37,21 @@ enum PortMappingGuiOptions {
     TryPcpNatPmp,
 }
 
+#[derive(Debug)]
+enum TransferProgress {
+    Connecting,
+    Consent(u64),
+    Transfering(Arc<RwLock<u64>>),
+    Done(bool),
+}
+
+#[derive(Debug)]
+struct Transfer {
+    pub hash: String,
+    pub path: PathBuf,
+    pub progress: TransferProgress,
+}
+
 /// The state of the connection to a `file_yeet` server.
 #[derive(Default, Debug)]
 enum ConnectionState {
@@ -47,9 +64,14 @@ enum ConnectionState {
 
     /// A connection to the server is active.
     Connected {
+        // Local QUIC endpoint for server and peer connections.
         endpoint: quinn::Endpoint,
+        // Connection with the server.
         server: quinn::Connection,
+        // The hash input field for creating new subscribe requests.
         hash_input: String,
+        // A list of active file transfers.
+        transfers: Vec<Transfer>,
     },
 }
 
@@ -103,6 +125,9 @@ pub enum Message {
 
     /// The path to save a file to was chosen or cancelled.
     SubscribePathChosen(Option<PathBuf>),
+
+    /// A subscribe request was completed.
+    SubscribePeersResult(Result<(Vec<SocketAddr>, PathBuf), Arc<anyhow::Error>>),
 
     /// An unhandled event occurred.
     UnhandledEvent(iced::Event),
@@ -194,6 +219,7 @@ impl iced::Application for AppState {
                         endpoint: prepared.endpoint,
                         server: prepared.server_connection,
                         hash_input: String::new(),
+                        transfers: Vec::new(),
                     };
                     self.port_mapping = prepared.port_mapping;
                     iced::Command::none()
@@ -265,6 +291,35 @@ impl iced::Application for AppState {
             // Begin the process of subscribing to a file from the server.
             Message::SubscribePathChosen(path) => self.update_subscribe_path_chosen(path),
 
+            // Handle the result of a subscribe request.
+            Message::SubscribePeersResult(r) => {
+                match r {
+                    Ok((peers, path)) => {
+                        if let ConnectionState::Connected {
+                            hash_input,
+                            transfers,
+                            ..
+                        } = &mut self.connection_state
+                        {
+                            transfers.append(
+                                &mut peers
+                                    .into_iter()
+                                    .map(|_addr| Transfer {
+                                        hash: hash_input.clone(),
+                                        path: path.clone(),
+                                        progress: TransferProgress::Connecting,
+                                    })
+                                    .collect(),
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        self.status_message = Some(format!("Error subscribing: {e:?}"));
+                    }
+                }
+                iced::Command::none()
+            }
+
             // Handle an event that iced did not handle itself.
             // This is used to allow for custom exit handling in this instance.
             Message::UnhandledEvent(event) => match event {
@@ -324,7 +379,11 @@ impl iced::Application for AppState {
             }
 
             // Display the main application controls when connected.
-            ConnectionState::Connected { hash_input, .. } => self.view_connected_page(hash_input),
+            ConnectionState::Connected {
+                hash_input,
+                transfers,
+                ..
+            } => self.view_connected_page(hash_input, transfers),
         };
 
         // Always display the status bar at the bottom.
@@ -447,7 +506,11 @@ impl AppState {
     }
 
     /// Draw the main application controls when connected to a server.
-    fn view_connected_page(&self, hash_input: &str) -> iced::Element<Message> {
+    fn view_connected_page(
+        &self,
+        hash_input: &str,
+        transfers: &[Transfer],
+    ) -> iced::Element<Message> {
         let mut publish_button = widget::button("Publish");
         let mut download_button = widget::button("Download");
         let mut hash_text_input = widget::text_input("Hash", hash_input);
@@ -466,12 +529,35 @@ impl AppState {
             }
         }
 
+        // Hash input and download button.
+        let download_input = widget::row!(
+            hash_text_input.width(iced::Length::FillPortion(2)),
+            download_button,
+        )
+        .spacing(6);
+
+        // Create a list of active downloads.
+        let downloads = widget::column(transfers.iter().map(|t| {
+            let progress = match &t.progress {
+                TransferProgress::Connecting => "Connecting...",
+                TransferProgress::Consent(_) => "Waiting for consent...",
+                TransferProgress::Transfering(_) => "Transfering...",
+                TransferProgress::Done(_) => "Done",
+            };
+
+            widget::container(widget::column!(
+                widget::row!(widget::text(&t.hash), widget::text(progress),).spacing(6),
+                widget::text(&t.path.to_string_lossy()),
+            ))
+            .padding(6)
+            .into()
+        }));
+
         widget::container(
             widget::row!(
                 publish_button,
                 widget::horizontal_space(),
-                hash_text_input.width(iced::Length::FillPortion(2)),
-                download_button
+                widget::column!(download_input, downloads).spacing(6),
             )
             .spacing(6),
         )
@@ -555,12 +641,15 @@ impl AppState {
         self.modal = false;
 
         // Ensure a path was chosen.
-        let Some(_path) = path else {
+        let Some(path) = path else {
             return iced::Command::none();
         };
 
         // Ensure the client is connected to a server.
-        let ConnectionState::Connected { hash_input, .. } = &self.connection_state else {
+        let ConnectionState::Connected {
+            server, hash_input, ..
+        } = &self.connection_state
+        else {
             return iced::Command::none();
         };
 
@@ -571,14 +660,14 @@ impl AppState {
             return iced::Command::none();
         }
 
-        iced::Command::none()
-        // iced::Command::perform(
-        //     async move {
-        //         let mut bb = bytes::BytesMut::with_capacity(MAX_PEER_COMMUNICATION_SIZE);
-        //         core::(hash, ).await
-        //     },
-        //     Message::ConnectClicked,
-        // )
+        let server = server.clone();
+        iced::Command::perform(
+            async move {
+                let mut bb = bytes::BytesMut::with_capacity(MAX_PEER_COMMUNICATION_SIZE);
+                core::subscribe(&server, &mut bb, hash).await
+            },
+            |r| Message::SubscribePeersResult(r.map(|peers| (peers, path)).map_err(Arc::new)),
+        )
     }
 
     /// Try to safely close the application.

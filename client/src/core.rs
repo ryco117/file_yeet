@@ -2,14 +2,17 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
     num::NonZeroU16,
     path::Path,
-    sync::{Arc, Mutex, RwLock},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
 use bytes::BufMut as _;
 use file_yeet_shared::{local_now_fmt, HashBytes, SocketAddrHelper, MAX_SERVER_COMMUNICATION_SIZE};
 use sha2::Digest as _;
-use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
+use tokio::{
+    io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _},
+    sync::RwLock,
+};
 
 /// Use a sane default timeout for server connections.
 pub const SERVER_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -257,6 +260,86 @@ pub async fn port_override_request(
     Ok(())
 }
 
+/// Perform a subscribe request to the server. Returns a list of peers that are sharing the file.
+pub async fn subscribe(
+    server_connection: &quinn::Connection,
+    bb: &mut bytes::BytesMut,
+    hash: HashBytes,
+) -> anyhow::Result<Vec<SocketAddr>> {
+    // Create a bi-directional stream to the server.
+    let mut server_streams: BiStream = server_connection
+        .open_bi()
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to open a bi-directional QUIC stream for a socket ping request: {e}"
+            )
+        })?
+        .into();
+
+    // Send the server a subscribe request.
+    bb.put_u16(file_yeet_shared::ClientApiRequest::Subscribe as u16);
+    bb.put(&hash[..]);
+    server_streams
+        .send
+        .write_all(bb)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to send a subscribe request to the server: {e}"))?;
+
+    println!(
+        "{} Requesting file with hash from the server...",
+        local_now_fmt()
+    );
+
+    // Determine if the server is responding with a success or failure.
+    let response_count = server_streams
+        .recv
+        .read_u16()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to read a u16 response from the server: {e}"))?;
+
+    if response_count == 0 {
+        return Ok(Vec::with_capacity(0));
+    }
+
+    let mut scratch_space = [0; MAX_SERVER_COMMUNICATION_SIZE];
+    let mut peers = Vec::new();
+
+    // Parse each peer socket address.
+    for _ in 0..response_count {
+        let address_len = server_streams
+            .recv
+            .read_u16()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to read response from server: {e}"))?
+            as usize;
+        let peer_string_bytes = &mut scratch_space[..address_len];
+        server_streams
+            .recv
+            .read_exact(peer_string_bytes)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to read a valid UTF-8 response from the server: {e}")
+            })?;
+        let peer_address_str = std::str::from_utf8(peer_string_bytes)
+            .map_err(|e| anyhow::anyhow!("Server did not send a valid UTF-8 response: {e}"))?;
+        let peer_address = match peer_address_str.parse() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "{} Failed to parse peer address {peer_address_str}: {e}",
+                    local_now_fmt()
+                );
+                continue;
+            }
+        };
+
+        peers.push(peer_address);
+    }
+
+    Ok(peers)
+}
+
 /// Try to read a valid UTF-8 from the server until the expected length is reached.
 async fn expect_server_text(stream: &mut quinn::RecvStream, len: u16) -> anyhow::Result<String> {
     let mut raw_bytes = [0; MAX_SERVER_COMMUNICATION_SIZE];
@@ -486,7 +569,7 @@ pub async fn download_from_peer(
 
             // Update the caller with the number of bytes written.
             if let Some(progress) = byte_progress.as_ref() {
-                *progress.write().unwrap() = bytes_written;
+                *progress.write().await = bytes_written;
             }
         }
     }
