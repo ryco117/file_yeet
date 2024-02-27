@@ -333,13 +333,13 @@ async fn handle_publish(
         publishers: PublishersRef,
     ) {
         // Remove the client from the list of peers publishing this hash.
-        // TODO: Consider identifying clients by a unique ID in case of address collisions.
         let mut publishers = publishers.write().await;
-        if let Some(clients_list) = publishers.get_mut(&hash) {
-            clients_list.remove(&session_nonce);
+        if let Some(file_publishers) = publishers.get_mut(&hash) {
+            // Remove this client from the file's list of publishers.
+            file_publishers.remove(&session_nonce);
 
             // Remove the file hash from the map if no clients are publishing it.
-            if clients_list.is_empty() {
+            if file_publishers.is_empty() {
                 publishers.remove(&hash);
             }
         }

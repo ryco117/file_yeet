@@ -7,7 +7,7 @@ use std::{
 };
 
 use file_yeet_shared::{local_now_fmt, HashBytes, DEFAULT_PORT, GOODBYE_CODE, GOODBYE_MESSAGE};
-use iced::{widget, Element};
+use iced::{widget, window, Element};
 
 use crate::core::{
     self, PortMappingConfig, MAX_PEER_COMMUNICATION_SIZE, SERVER_CONNECTION_TIMEOUT,
@@ -19,6 +19,9 @@ static SERVER_ADDRESS_REGEX: once_cell::sync::Lazy<regex::Regex> =
     once_cell::sync::Lazy::new(|| {
         regex::Regex::new(r"^(?P<host>[^:]+)(?::(?P<port>\d+))?$").unwrap()
     });
+
+/// The maximum time to wait before forcing the application to exit.
+const MAX_SHUTDOWN_WAIT: Duration = Duration::from_secs(3);
 
 /// The labels for the port mapping radio buttons.
 const PORT_MAPPING_OPTIONS: [&str; 3] = ["None", "Port forward", "NAT-PMP / PCP"];
@@ -39,8 +42,8 @@ enum ConnectionState {
     #[default]
     Disconnected,
 
-    /// Connecting to the server is in progress.
-    Connecting { start: Instant, tick: Instant },
+    /// Connecting to the server or safely closing the application.
+    Stalling { start: Instant, tick: Instant },
 
     /// A connection to the server is active.
     Connected {
@@ -57,6 +60,7 @@ pub struct AppState {
     server_address: String,
     status_message: Option<String>,
     modal: bool,
+    safely_closing: bool,
     port_mapping: Option<crab_nat::PortMapping>,
 
     // TODO: Separate into "state options" struct or similar.
@@ -101,10 +105,7 @@ pub enum Message {
     SubscribePathChosen(Option<PathBuf>),
 
     /// An unhandled event occurred.
-    UnhandleEvent(iced::Event),
-
-    /// Exit the application safely. Odd this isn't the default...
-    SafelyExit,
+    UnhandledEvent(iced::Event),
 
     /// Exit the application immediately. Ensure we aren't waiting for async tasks forever.
     ForceExit,
@@ -180,7 +181,7 @@ impl iced::Application for AppState {
 
             // The spin animation tick doesn't need anything special besides updating the tick state.
             Message::SpinTick => {
-                if let ConnectionState::Connecting { tick, .. } = &mut self.connection_state {
+                if let ConnectionState::Stalling { tick, .. } = &mut self.connection_state {
                     *tick = Instant::now();
                 }
                 iced::Command::none()
@@ -266,55 +267,34 @@ impl iced::Application for AppState {
 
             // Handle an event that iced did not handle itself.
             // This is used to allow for custom exit handling in this instance.
-            Message::UnhandleEvent(event) => match event {
-                iced::Event::Window(id, iced::window::Event::CloseRequested) => {
-                    if id == iced::window::Id::MAIN {
-                        iced::Command::perform(std::future::ready(()), |()| Message::SafelyExit)
+            Message::UnhandledEvent(event) => match event {
+                iced::Event::Window(id, window::Event::CloseRequested) => {
+                    if id == window::Id::MAIN {
+                        if self.safely_closing {
+                            // If we are already closing, force exit immediately.
+                            window::close(window::Id::MAIN)
+                        } else {
+                            self.safely_close()
+                        }
                     } else {
-                        iced::window::close(id)
+                        // Non-main windows (if ever implemented) can be closed immediately.
+                        window::close(id)
                     }
                 }
                 _ => iced::Command::none(),
             },
 
-            // Exit the application.
-            Message::SafelyExit => {
-                // TODO: Ensure current uploads/downloads are gracefully closed.(/paused?)
-                if let ConnectionState::Connected { endpoint, .. } = &mut self.connection_state {
-                    endpoint.close(GOODBYE_CODE, GOODBYE_MESSAGE.as_bytes());
-                };
-
-                if let Some(port_mapping) = self.port_mapping.take() {
-                    iced::Command::perform(
-                        tokio::time::timeout(Duration::from_millis(500), async {
-                            if let Err((e, _)) = port_mapping.try_drop().await {
-                                eprintln!(
-                                    "{} Could not safely remove port mapping: {e}",
-                                    local_now_fmt()
-                                );
-                            } else {
-                                println!("{} Port mapping safely removed", local_now_fmt());
-                            }
-                        }),
-                        |_| Message::ForceExit,
-                    )
-                } else {
-                    // Immediately exit if there is no port mapping to remove.
-                    iced::window::close(iced::window::Id::MAIN)
-                }
-            }
-
             // Exit the application immediately.
-            Message::ForceExit => iced::window::close(iced::window::Id::MAIN),
+            Message::ForceExit => window::close(window::Id::MAIN),
         }
     }
 
     /// Listen for events that should be translated into messages.
     fn subscription(&self) -> iced::Subscription<Message> {
-        let close_event = iced::event::listen().map(Message::UnhandleEvent);
+        let close_event = iced::event::listen().map(Message::UnhandledEvent);
 
         match self.connection_state {
-            ConnectionState::Connecting { .. } => {
+            ConnectionState::Stalling { .. } => {
                 let animation =
                     iced::time::every(Duration::from_millis(33)).map(|_| Message::SpinTick);
                 iced::Subscription::batch([close_event, animation])
@@ -330,8 +310,18 @@ impl iced::Application for AppState {
             // Display a prompt for the server address when disconnected.
             ConnectionState::Disconnected => self.view_disconnected_page(),
 
-            // Display a spinner while connecting.
-            &ConnectionState::Connecting { start, tick } => Self::view_connecting_page(start, tick),
+            // Display a spinner while connecting/stalling.
+            &ConnectionState::Stalling { start, tick } => {
+                if self.safely_closing {
+                    widget::column!(
+                        Self::view_connecting_page(start, tick, MAX_SHUTDOWN_WAIT),
+                        widget::text("Closing... Pressing close a second time will cancel safety operations.").size(24),
+                        widget::vertical_space(),
+                    ).align_items(iced::Alignment::Center).into()
+                } else {
+                    Self::view_connecting_page(start, tick, SERVER_CONNECTION_TIMEOUT)
+                }
+            }
 
             // Display the main application controls when connected.
             ConnectionState::Connected { hash_input, .. } => self.view_connected_page(hash_input),
@@ -435,12 +425,16 @@ impl AppState {
     }
 
     /// Draw the connecting page with a spinner.
-    fn view_connecting_page<'a>(start: Instant, tick: Instant) -> iced::Element<'a, Message> {
+    fn view_connecting_page<'a>(
+        start: Instant,
+        tick: Instant,
+        max_duration: Duration,
+    ) -> iced::Element<'a, Message> {
         let spinner = widget::container::Container::new(widget::progress_bar(
             0.0..=1.,
             (tick - start)
                 .as_secs_f32()
-                .div(SERVER_CONNECTION_TIMEOUT.as_secs_f32())
+                .div(max_duration.as_secs_f32())
                 .fract(),
         ))
         .width(iced::Length::Fill)
@@ -519,8 +513,8 @@ impl AppState {
             return iced::Command::none();
         };
 
-        // Set the state to `Connecting` before starting the connection attempt.
-        self.connection_state = ConnectionState::Connecting {
+        // Set the state to `Stalling` before starting the connection attempt.
+        self.connection_state = ConnectionState::Stalling {
             start: Instant::now(),
             tick: Instant::now(),
         };
@@ -585,6 +579,40 @@ impl AppState {
         //     },
         //     Message::ConnectClicked,
         // )
+    }
+
+    /// Try to safely close the application.
+    fn safely_close(&mut self) -> iced::Command<Message> {
+        // TODO: Ensure current uploads/downloads are gracefully closed.(/paused?)
+        if let ConnectionState::Connected { endpoint, .. } = &mut self.connection_state {
+            endpoint.close(GOODBYE_CODE, GOODBYE_MESSAGE.as_bytes());
+        };
+
+        if let Some(port_mapping) = self.port_mapping.take() {
+            let start = Instant::now();
+            let delta = Duration::from_millis(500);
+
+            // Set the state to `Stalling` before waiting for the safe close to complete.
+            self.connection_state = ConnectionState::Stalling { start, tick: start };
+            self.safely_closing = true;
+            iced::Command::perform(
+                tokio::time::timeout(delta, async move {
+                    if let Err((e, _)) = port_mapping.try_drop().await {
+                        eprintln!(
+                            "{} Could not safely remove port mapping: {e}",
+                            local_now_fmt()
+                        );
+                    } else {
+                        println!("{} Port mapping safely removed", local_now_fmt());
+                    }
+                }),
+                // Force exist after completing the request or after a timeout.
+                |_| Message::ForceExit,
+            )
+        } else {
+            // Immediately exit if there is no port mapping to remove.
+            window::close(window::Id::MAIN)
+        }
     }
 }
 
