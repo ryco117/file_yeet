@@ -2,7 +2,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
     num::NonZeroU16,
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
     time::Duration,
 };
 
@@ -30,7 +30,7 @@ pub const MAX_PEER_COMMUNICATION_SIZE: usize = 16 * 1024;
 pub enum PortMappingConfig {
     None,
     PortForwarding(NonZeroU16),
-    TryNatPmp,
+    PcpNatPmp(Option<crab_nat::PortMapping>),
 }
 
 /// The command relationship between the two peers. Useful for asserting synchronization roles based on the command type.
@@ -98,14 +98,14 @@ pub async fn prepare_server_connection(
         .expect("Failed to get the local address of our QUIC endpoint");
     if local_address.ip().is_unspecified() {
         local_address.set_ip({
-            let interface =
-                default_net::get_default_interface().expect("Failed to get our default interface");
+            let interface = default_net::get_default_interface()
+                .map_err(|e| anyhow::anyhow!("Failed to get a default interface: {e}"))?;
             if using_ipv4 {
                 IpAddr::V4(
                     interface
                         .ipv4
                         .first()
-                        .expect("Failed to get our default IPv4 address")
+                        .ok_or_else(|| anyhow::anyhow!("Failed to get a default IPv4 address:"))?
                         .addr,
                 )
             } else {
@@ -113,7 +113,7 @@ pub async fn prepare_server_connection(
                     interface
                         .ipv6
                         .first()
-                        .expect("Failed to get our default IPv6 address")
+                        .ok_or_else(|| anyhow::anyhow!("Failed to get a default IPv6 address"))?
                         .addr,
                 )
             }
@@ -136,7 +136,7 @@ pub async fn prepare_server_connection(
         PortMappingConfig::PortForwarding(p) => (None, Some(p)),
 
         // Allow the user to skip port mapping.
-        PortMappingConfig::TryNatPmp => match try_port_mapping(gateway, local_address).await {
+        PortMappingConfig::PcpNatPmp(_) => match try_port_mapping(gateway, local_address).await {
             Ok(m) => {
                 let p = m.external_port();
                 println!(
@@ -237,6 +237,7 @@ pub async fn socket_ping_request(
     Ok((sanity_check_addr, sanity_check))
 }
 
+/// Perform a port override request to the server.
 pub async fn port_override_request(
     server_connection: &quinn::Connection,
     port: NonZeroU16,
@@ -248,6 +249,7 @@ pub async fn port_override_request(
     // Format a port override request.
     bb.put_u16(file_yeet_shared::ClientApiRequest::PortOverride as u16);
     bb.put_u16(port.get());
+
     // Send the port override request to the server and clear the buffer.
     server_streams.send.write_all(bb).await?;
     bb.clear();
@@ -267,7 +269,6 @@ async fn expect_server_text(stream: &mut quinn::RecvStream, len: u16) -> anyhow:
 pub async fn udp_holepunch(
     cmd: FileYeetCommandType,
     endpoint: quinn::Endpoint,
-    local_address: SocketAddr,
     peer_address: SocketAddr,
 ) -> Option<(quinn::Connection, BiStream)> {
     // Create a lock for where we will place the QUIC connection used to communicate with our peer.
@@ -278,7 +279,7 @@ pub async fn udp_holepunch(
     let endpoint_listen = endpoint.clone();
     let listen_future = tokio::time::timeout(
         PEER_LISTEN_TIMEOUT,
-        listen_for_peer(endpoint_listen, local_address, &peer_reached_listen),
+        listen_for_peer(endpoint_listen, &peer_reached_listen),
     );
 
     // Attempt to connect to the peer's public address.
@@ -337,12 +338,11 @@ pub async fn udp_holepunch(
 /// Spawn a thread that listens for a peer and will assign the peer `Connection` lock when connected.
 async fn listen_for_peer(
     endpoint: quinn::Endpoint,
-    local_address: SocketAddr,
     peer_reached_lock: &Arc<Mutex<bool>>,
 ) -> Option<quinn::Connection> {
     // Print and create binding from the local address.
     println!(
-        "{} Listening for peer on the QUIC endpoint: {local_address}",
+        "{} Listening for peer on the QUIC endpoint",
         local_now_fmt()
     );
 
@@ -433,6 +433,7 @@ pub async fn download_from_peer(
     mut peer_streams: BiStream,
     file_size: u64,
     output: &Path,
+    byte_progress: Option<Arc<RwLock<u64>>>,
 ) -> Result<(), DownloadError> {
     // Open the file for writing.
     let mut file = tokio::fs::OpenOptions::new()
@@ -471,6 +472,7 @@ pub async fn download_from_peer(
                 std::io::ErrorKind::UnexpectedEof,
                 "Peer closed the upload early",
             )))?;
+
         if size > 0 {
             // Write the bytes to the file and update the hash.
             let bb = &buf[..size];
@@ -481,6 +483,11 @@ pub async fn download_from_peer(
 
             // Update the number of bytes written.
             bytes_written += size as u64;
+
+            // Update the caller with the number of bytes written.
+            if let Some(progress) = byte_progress.as_ref() {
+                *progress.write().unwrap() = bytes_written;
+            }
         }
     }
 
@@ -497,6 +504,35 @@ pub async fn download_from_peer(
         output.display()
     );
     Ok(())
+}
+
+/// Get a file's size and its SHA-256 hash.
+pub async fn file_size_and_hash(file_path: &Path) -> anyhow::Result<(u64, HashBytes)> {
+    let mut hasher = sha2::Sha256::new();
+    let mut reader = tokio::io::BufReader::new(
+        tokio::fs::File::open(file_path)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to open the file: {e}"))?,
+    );
+    let mut hash_byte_buffer = [0; 8192];
+    loop {
+        let n = reader
+            .read(&mut hash_byte_buffer)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to read from the file: {e}"))?;
+        if n == 0 {
+            break;
+        }
+
+        hasher.update(&hash_byte_buffer[..n]);
+    }
+    let file_size = reader
+        .seek(tokio::io::SeekFrom::End(0))
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to seek to the end of the file: {e}"))?;
+    let hash: HashBytes = hasher.finalize().into();
+
+    Ok((file_size, hash))
 }
 
 /// Upload the file to the peer. Ensure they consent to the file size before sending the file.

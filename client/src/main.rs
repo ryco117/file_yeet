@@ -1,12 +1,13 @@
-use core::BiStream;
-use std::{io::Write as _, num::NonZeroU16, path::Path, time::Duration};
+use core::{BiStream, PreparedConnection};
+use std::{io::Write as _, net::SocketAddr, num::NonZeroU16, path::Path, time::Duration};
 
 use bytes::BufMut as _;
-use file_yeet_shared::{local_now_fmt, HashBytes, MAX_SERVER_COMMUNICATION_SIZE};
+use file_yeet_shared::{
+    local_now_fmt, HashBytes, GOODBYE_CODE, GOODBYE_MESSAGE, MAX_SERVER_COMMUNICATION_SIZE,
+};
 use futures_util::{stream::FuturesUnordered, StreamExt};
 use iced::Application;
-use sha2::{Digest as _, Sha256};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 mod core;
 mod gui;
@@ -61,7 +62,14 @@ async fn main() {
 
     // If no subcommand was provided, run the GUI.
     let Some(cmd) = args.cmd else {
-        if let Err(e) = gui::AppState::run(iced::Settings::default()) {
+        // Run the GUI. Specify that the application should override the default exit behavior.
+        if let Err(e) = gui::AppState::run(iced::Settings {
+            window: iced::window::Settings {
+                exit_on_close_request: false,
+                ..iced::window::Settings::default()
+            },
+            ..iced::Settings::default()
+        }) {
             eprintln!("{} GUI failed to run: {e}", local_now_fmt());
         }
 
@@ -72,18 +80,16 @@ async fn main() {
     let mut bb = bytes::BytesMut::with_capacity(MAX_SERVER_COMMUNICATION_SIZE);
 
     // Connect to the public file_yeet_server.
-    let core::PreparedConnection {
-        endpoint,
-        server_connection,
-        port_mapping,
-    } = core::prepare_server_connection(
+    let prepared_connection = core::prepare_server_connection(
         args.server_address.as_deref(),
         args.server_port,
         args.gateway.as_deref(),
         if let Some(g) = args.port_override {
+            // Use the provided port override.
             core::PortMappingConfig::PortForwarding(g)
         } else if args.nat_map {
-            core::PortMappingConfig::TryNatPmp
+            // Try to create a new port mapping using NAT-PMP or PCP.
+            core::PortMappingConfig::PcpNatPmp(None)
         } else {
             core::PortMappingConfig::None
         },
@@ -96,132 +102,26 @@ async fn main() {
     match cmd {
         // Try to hash and publish the file to the rendezvous server.
         FileYeetCommand::Pub { file_path } => {
-            let file_path = std::path::Path::new(&file_path);
-            let mut hasher = Sha256::new();
-            let mut reader = tokio::io::BufReader::new(
-                tokio::fs::File::open(file_path)
-                    .await
-                    .expect("Failed to open the file"),
-            );
-            let mut hash_byte_buffer = [0; 8192];
-            loop {
-                let n = reader
-                    .read(&mut hash_byte_buffer)
-                    .await
-                    .expect("Failed to read from the file");
-                if n == 0 {
-                    break;
-                }
-
-                hasher.update(&hash_byte_buffer[..n]);
-            }
-            let file_size = reader
-                .seek(tokio::io::SeekFrom::End(0))
-                .await
-                .expect("Failed to seek to the end of the file");
-            let hash: HashBytes = hasher.finalize().into();
-            let mut hex_bytes = [0; 2 * file_yeet_shared::HASH_BYTE_COUNT];
-            println!(
-                "{} File {} has SHA-256 hash {} and size {file_size} bytes",
-                local_now_fmt(),
-                file_path.display(),
-                faster_hex::hex_encode(&hash, &mut hex_bytes)
-                    .expect("Failed to use a valid hex buffer"),
-            );
-
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {
-                    println!("{} Ctrl-C detected, cancelling the publish", local_now_fmt());
-                }
-                () = publish_loop(endpoint, server_connection.clone(), bb, hash, file_size, file_path) => {}
+            if let Err(e) = publish_command(&prepared_connection, bb, file_path).await {
+                eprintln!("{} Failed to publish the file: {e}", local_now_fmt());
             }
         }
 
         // Try to get the file hash from the rendezvous server and peers.
         FileYeetCommand::Sub { sha256_hex, output } => {
-            let mut hash = HashBytes::default();
-            if let Err(e) = faster_hex::hex_decode(sha256_hex.as_bytes(), &mut hash) {
-                eprintln!("{} Failed to parse hex hash: {e}", local_now_fmt());
-                return;
-            };
-
-            // Determine the output file path to use.
-            let output = output.as_ref().filter(|s| !s.is_empty()).map_or_else(
-                || {
-                    let mut output = std::env::temp_dir();
-                    let mut hex_bytes = [0; 2 * file_yeet_shared::HASH_BYTE_COUNT];
-                    output.push(
-                        faster_hex::hex_encode(&hash, &mut hex_bytes)
-                            .expect("Failed to use a valid hex buffer"),
-                    );
-                    output
-                },
-                |o| o.clone().into(),
-            );
-
-            // Request all available peers from the server.
-            let mut connection_attempts = match subscribe(endpoint, &server_connection, bb, hash)
-                .await
-            {
-                Err(e) => {
-                    return eprintln!("{} Failed to subscribe to the file: {e}", local_now_fmt())
-                }
-                Ok(c) => c,
-            };
-
-            // Iterate through the connection attempts as they resolve and use the first successful connection.
-            let peer_connection = loop {
-                match connection_attempts.next().await {
-                    Some(Some((c, mut b))) => {
-                        println!("{} Getting file size from peer...", local_now_fmt());
-
-                        // Read the file size from the peer.
-                        let Ok(file_size) = b.recv.read_u64().await else {
-                            continue;
-                        };
-                        let Ok(consent) = file_consent_cli(file_size, &output) else {
-                            continue;
-                        };
-                        if consent {
-                            break Some((c, b, file_size));
-                        }
-
-                        println!("{} Download cancelled", local_now_fmt());
-
-                        // Try to let the peer know that we cancelled the download.
-                        // Don't worry about the result since we are done with this peer.
-                        let _ =
-                            tokio::time::timeout(Duration::from_millis(200), b.send.write_u8(0))
-                                .await;
-                    }
-                    Some(None) => continue,
-                    None => break None,
-                }
-            };
-
-            // If no peer connection was successful, return an error.
-            let Some((_peer_connection, peer_streams, file_size)) = peer_connection else {
-                return println!("Failed to connect to any available peers");
-            };
-
-            // Try to download the requested file using the peer connection.
-            // Pin the future to avoid a stack overflow. <https://rust-lang.github.io/rust-clippy/master/index.html#large_futures>
-            Box::pin(core::download_from_peer(
-                hash,
-                peer_streams,
-                file_size,
-                &output,
-            ))
-            .await
-            .expect("Failed to download from peer");
+            if let Err(e) = subscribe_command(&prepared_connection, bb, sha256_hex, output).await {
+                eprintln!("{} Failed to download the file: {e}", local_now_fmt());
+            }
         }
     }
 
     // Close our connection to the server. Send a goodbye to be polite.
-    server_connection.close(quinn::VarInt::from_u32(0), "Goodbye!".as_bytes());
+    prepared_connection
+        .server_connection
+        .close(GOODBYE_CODE, GOODBYE_MESSAGE.as_bytes());
 
     // Try to clean up the port mapping if one was made.
-    if let Some(mapping) = port_mapping {
+    if let Some(mapping) = prepared_connection.port_mapping {
         if let Err((e, m)) = mapping.try_drop().await {
             eprintln!(
                 "{} Failed to delete the port mapping with expiration {:?} : {e}",
@@ -237,20 +137,166 @@ async fn main() {
     }
 }
 
+/// Handle the CLI command to publish a file.
+async fn publish_command(
+    prepared_connection: &PreparedConnection,
+    bb: bytes::BytesMut,
+    file_path: String,
+) -> anyhow::Result<()> {
+    let file_path = std::path::Path::new(&file_path);
+    let (file_size, hash) = match core::file_size_and_hash(file_path).await {
+        Ok(t) => t,
+        Err(e) => anyhow::bail!("Failed to hash file: {e}"),
+    };
+    let mut hex_bytes = [0; 2 * file_yeet_shared::HASH_BYTE_COUNT];
+    println!(
+        "{} File {} has SHA-256 hash {} and size {file_size} bytes",
+        local_now_fmt(),
+        file_path.display(),
+        faster_hex::hex_encode(&hash, &mut hex_bytes).expect("Failed to use a valid hex buffer"),
+    );
+
+    let core::PreparedConnection {
+        endpoint,
+        server_connection,
+        ..
+    } = prepared_connection;
+
+    // Allow the publish loop to be cancelled by a Ctrl-C signal.
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            println!("{} Ctrl-C detected, cancelling the publish", local_now_fmt());
+        }
+        r = publish_loop(endpoint, server_connection.clone(), bb, hash, file_size, file_path) => return r
+    }
+
+    Ok(())
+}
+
+/// Handle the CLI command to subscribe to a file.
+async fn subscribe_command(
+    prepared_connection: &PreparedConnection,
+    bb: bytes::BytesMut,
+    sha256_hex: String,
+    output_path: Option<String>,
+) -> anyhow::Result<()> {
+    let mut hash = HashBytes::default();
+    if let Err(e) = faster_hex::hex_decode(sha256_hex.as_bytes(), &mut hash) {
+        anyhow::bail!("Failed to parse hex hash: {e}");
+    };
+
+    // Determine the output file path to use.
+    let output = output_path.as_ref().filter(|s| !s.is_empty()).map_or_else(
+        || {
+            let mut output = std::env::temp_dir();
+            let mut hex_bytes = [0; 2 * file_yeet_shared::HASH_BYTE_COUNT];
+            output.push(
+                faster_hex::hex_encode(&hash, &mut hex_bytes)
+                    .expect("Failed to use a valid hex buffer"),
+            );
+            output
+        },
+        |o| o.clone().into(),
+    );
+
+    let core::PreparedConnection {
+        endpoint,
+        server_connection,
+        ..
+    } = prepared_connection;
+
+    // Request all available peers from the server.
+    let mut peers = match subscribe(server_connection, bb, hash).await {
+        Err(e) => anyhow::bail!("Failed to subscribe to the file: {e}"),
+        Ok(c) => c,
+    };
+
+    // If no peers are available, quickly return.
+    if peers.is_empty() {
+        anyhow::bail!("No peers are available for the file");
+    }
+
+    // Try to connect to multiple peers concurrently with a list of connection futures.
+    let mut connection_attempts = FuturesUnordered::new();
+    for peer_address in peers.drain(..) {
+        connection_attempts.push(core::udp_holepunch(
+            core::FileYeetCommandType::Sub,
+            endpoint.clone(),
+            peer_address,
+        ));
+    }
+
+    // Iterate through the connection attempts as they resolve and use the first successful connection.
+    let peer_connection = loop {
+        match connection_attempts.next().await {
+            Some(Some((c, mut b))) => {
+                println!("{} Getting file size from peer...", local_now_fmt());
+
+                // Read the file size from the peer.
+                let Ok(file_size) = b.recv.read_u64().await else {
+                    continue;
+                };
+                let Ok(consent) = file_consent_cli(file_size, &output) else {
+                    continue;
+                };
+                if consent {
+                    break Some((c, b, file_size));
+                }
+
+                println!("{} Download cancelled", local_now_fmt());
+
+                // Try to let the peer know that we cancelled the download.
+                // Don't worry about the result since we are done with this peer.
+                let _ = tokio::time::timeout(Duration::from_millis(200), b.send.write_u8(0)).await;
+                c.close(GOODBYE_CODE, &[]);
+            }
+            Some(None) => continue,
+            None => break None,
+        }
+    };
+
+    // Try to get a successful peer connection.
+    if let Some((peer_connection, peer_streams, file_size)) = peer_connection {
+        // Try to download the requested file using the peer connection.
+        // Pin the future to avoid a stack overflow. <https://rust-lang.github.io/rust-clippy/master/index.html#large_futures>
+        if let Err(e) = Box::pin(core::download_from_peer(
+            hash,
+            peer_streams,
+            file_size,
+            &output,
+            None,
+        ))
+        .await
+        {
+            anyhow::bail!("Failed to download from peer: {e}");
+        }
+
+        peer_connection.close(GOODBYE_CODE, "Thanks for sharing".as_bytes());
+    } else {
+        anyhow::bail!("Failed to connect to any available peers");
+    };
+
+    Ok(())
+}
+
 /// Enter a loop to listen for the server to send peer socket addresses requesting our publish.
 async fn publish_loop(
-    endpoint: quinn::Endpoint,
+    endpoint: &quinn::Endpoint,
     server_connection: quinn::Connection,
     mut bb: bytes::BytesMut,
     hash: HashBytes,
     file_size: u64,
     file_path: &Path,
-) {
+) -> anyhow::Result<()> {
     // Create a bi-directional stream to the server.
     let mut server_streams: BiStream = server_connection
         .open_bi()
         .await
-        .expect("Failed to open a bi-directional QUIC stream for a socket ping request")
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to open a bi-directional QUIC stream for a socket ping request {e}"
+            )
+        })?
         .into();
 
     // Format a publish request.
@@ -261,7 +307,7 @@ async fn publish_loop(
         .send
         .write_all(&bb)
         .await
-        .expect("Failed to send a publish request to the server");
+        .map_err(|e| anyhow::anyhow!("Failed to send a publish request to the server {e}"))?;
     drop(bb);
 
     // Close the stream after completing the publish request.
@@ -323,9 +369,6 @@ async fn publish_loop(
         let Some((_peer_connection, peer_streams)) = core::udp_holepunch(
             core::FileYeetCommandType::Pub,
             endpoint.clone(),
-            endpoint
-                .local_addr()
-                .expect("Could not determine our local IP"),
             peer_address,
         )
         .await
@@ -347,17 +390,14 @@ async fn publish_loop(
         }
     }
 
-    println!("Server connection closed");
+    Ok(println!("Server connection closed"))
 }
 
 async fn subscribe(
-    endpoint: quinn::Endpoint,
     server_connection: &quinn::Connection,
     mut bb: bytes::BytesMut,
     hash: HashBytes,
-) -> anyhow::Result<
-    FuturesUnordered<impl std::future::Future<Output = Option<(quinn::Connection, BiStream)>>>,
-> {
+) -> anyhow::Result<Vec<SocketAddr>> {
     // Create a bi-directional stream to the server.
     let mut server_streams: BiStream = server_connection
         .open_bi()
@@ -390,15 +430,12 @@ async fn subscribe(
         .await
         .map_err(|e| anyhow::anyhow!("Failed to read a u16 response from the server: {e}"))?;
 
-    let mut scratch_space = [0; MAX_SERVER_COMMUNICATION_SIZE];
-    let connection_attempts = FuturesUnordered::new();
     if response_count == 0 {
-        eprintln!("{} No publishers available for file hash", local_now_fmt());
-        return Ok(connection_attempts);
+        return Ok(Vec::with_capacity(0));
     }
-    let local_address = endpoint
-        .local_addr()
-        .map_err(|e| anyhow::anyhow!("Could not determine our local IP: {e}"))?;
+
+    let mut scratch_space = [0; MAX_SERVER_COMMUNICATION_SIZE];
+    let mut peers = Vec::new();
 
     // Parse each peer socket address.
     for _ in 0..response_count {
@@ -429,16 +466,10 @@ async fn subscribe(
             }
         };
 
-        // Try to connect to multiple peers concurrently with a list of connection futures.
-        connection_attempts.push(core::udp_holepunch(
-            core::FileYeetCommandType::Sub,
-            endpoint.clone(),
-            local_address,
-            peer_address,
-        ));
+        peers.push(peer_address);
     }
 
-    Ok(connection_attempts)
+    Ok(peers)
 }
 
 /// Prompt the user for consent to download a file.

@@ -23,6 +23,12 @@ pub type HashBytes = [u8; HASH_BYTE_COUNT];
 /// Same for both the server and the client.
 pub const QUIC_TIMEOUT_SECONDS: u64 = 60;
 
+/// Code sent on a graceful disconnect.
+pub const GOODBYE_CODE: quinn::VarInt = quinn::VarInt::from_u32(0);
+
+/// Optional polite message on a graceful disconnect.
+pub const GOODBYE_MESSAGE: &str = "Goodbye!";
+
 /// A helper to access often used socket address info.
 pub struct SocketAddrHelper {
     pub address: SocketAddr,
