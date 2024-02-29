@@ -22,7 +22,7 @@ struct Publisher {
 type PublisherRef = Arc<RwLock<Publisher>>;
 
 /// A nonce for the server to use in its communications with clients.
-type Nonce = [u32; 4];
+type Nonce = [u64; 2];
 
 /// The command line interface for `file_yeet_server`.
 #[derive(Parser)]
@@ -251,12 +251,7 @@ async fn handle_quic_connection(
 
 /// Generate a random nonce to uniquely identify client connections.
 fn random_nonce() -> Nonce {
-    [
-        rand::random(),
-        rand::random(),
-        rand::random(),
-        rand::random(),
-    ]
+    [rand::random(), rand::random()]
 }
 
 /// Send a ping response to the client by sending the address we introduce them to peers as.

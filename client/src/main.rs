@@ -9,6 +9,8 @@ use futures_util::{stream::FuturesUnordered, StreamExt};
 use iced::Application;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use crate::core::humanize_bytes;
+
 mod core;
 mod gui;
 
@@ -68,6 +70,7 @@ async fn main() {
                 exit_on_close_request: false,
                 ..iced::window::Settings::default()
             },
+            flags: (args.server_address, args.port_override, args.nat_map),
             ..iced::Settings::default()
         }) {
             eprintln!("{} GUI failed to run: {e}", local_now_fmt());
@@ -150,10 +153,11 @@ async fn publish_command(
     };
     let mut hex_bytes = [0; 2 * file_yeet_shared::HASH_BYTE_COUNT];
     println!(
-        "{} File {} has SHA-256 hash {} and size {file_size} bytes",
+        "{} File {} has SHA-256 hash {} and size {} bytes",
         local_now_fmt(),
         file_path.display(),
         faster_hex::hex_encode(&hash, &mut hex_bytes).expect("Failed to use a valid hex buffer"),
+        humanize_bytes(file_size),
     );
 
     let core::PreparedConnection {
@@ -222,6 +226,7 @@ async fn subscribe_command(
     for peer_address in peers.drain(..) {
         connection_attempts.push(core::udp_holepunch(
             core::FileYeetCommandType::Sub,
+            hash,
             endpoint.clone(),
             peer_address,
         ));
@@ -257,12 +262,12 @@ async fn subscribe_command(
     };
 
     // Try to get a successful peer connection.
-    if let Some((peer_connection, peer_streams, file_size)) = peer_connection {
+    if let Some((peer_connection, mut peer_streams, file_size)) = peer_connection {
         // Try to download the requested file using the peer connection.
         // Pin the future to avoid a stack overflow. <https://rust-lang.github.io/rust-clippy/master/index.html#large_futures>
         if let Err(e) = Box::pin(core::download_from_peer(
             hash,
-            peer_streams,
+            &mut peer_streams,
             file_size,
             &output,
             None,
@@ -369,6 +374,7 @@ async fn publish_loop(
         // TODO: Use tasks to handle multiple publish requests concurrently.
         let Some((_peer_connection, peer_streams)) = core::udp_holepunch(
             core::FileYeetCommandType::Pub,
+            hash,
             endpoint.clone(),
             peer_address,
         )
@@ -396,16 +402,18 @@ async fn publish_loop(
 
 /// Prompt the user for consent to download a file.
 fn file_consent_cli(file_size: u64, output: &Path) -> Result<bool, std::io::Error> {
+    let file_size = humanize_bytes(file_size);
+
     // Ensure the user consents to downloading the file.
     if output.exists() {
         print!(
-            "{} Download file of size {file_size} bytes and overwrite {}? <y/N>: ",
+            "{} Download file of size {file_size} and overwrite {}? <y/N>: ",
             local_now_fmt(),
             output.display()
         );
     } else {
         print!(
-            "{} Download file of size {file_size} bytes to {}? <y/N>: ",
+            "{} Download file of size {file_size} to {}? <y/N>: ",
             local_now_fmt(),
             output.display()
         );

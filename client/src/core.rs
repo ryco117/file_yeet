@@ -2,17 +2,14 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
     num::NonZeroU16,
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{Arc, RwLock},
     time::Duration,
 };
 
 use bytes::BufMut as _;
 use file_yeet_shared::{local_now_fmt, HashBytes, SocketAddrHelper, MAX_SERVER_COMMUNICATION_SIZE};
 use sha2::Digest as _;
-use tokio::{
-    io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _},
-    sync::RwLock,
-};
+use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
 
 /// Use a sane default timeout for server connections.
 pub const SERVER_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -351,77 +348,91 @@ async fn expect_server_text(stream: &mut quinn::RecvStream, len: u16) -> anyhow:
 /// Attempt to connect to peer using UDP hole punching.
 pub async fn udp_holepunch(
     cmd: FileYeetCommandType,
+    hash: HashBytes,
     endpoint: quinn::Endpoint,
     peer_address: SocketAddr,
 ) -> Option<(quinn::Connection, BiStream)> {
-    // Create a lock for where we will place the QUIC connection used to communicate with our peer.
-    let peer_reached_lock: Arc<Mutex<bool>> = Arc::default();
-
     // Spawn a thread that listens for a peer and will set the boolean lock when connected.
-    let peer_reached_listen = peer_reached_lock.clone();
     let endpoint_listen = endpoint.clone();
     let listen_future = tokio::time::timeout(
         PEER_LISTEN_TIMEOUT,
-        listen_for_peer(endpoint_listen, &peer_reached_listen),
+        listen_for_peer(endpoint_listen, peer_address),
     );
 
     // Attempt to connect to the peer's public address.
     let connect_future = tokio::time::timeout(
         PEER_CONNECT_TIMEOUT,
-        connect_to_peer(endpoint, peer_address, &peer_reached_lock),
+        connect_to_peer(endpoint, peer_address),
     );
 
     // Return the peer stream if we have one.
     let (listen_stream, connect_stream) = futures_util::join!(listen_future, connect_future);
     let listen_stream = listen_stream.ok().flatten();
     let connect_stream = connect_stream.ok().flatten();
-    let connection = match u32::from(listen_stream.is_some()) + u32::from(connect_stream.is_some())
-    {
-        0 => None,
-        1 => listen_stream.or(connect_stream),
-        2 => {
-            // TODO: It could be interesting and possible to create a more general stream negotiation.
-            //       For example, if each peer sent a random nonce over each stream, and the nonces were XOR'd per stream,
-            //       the result could be used to determine which stream to use (highest/lowest resulting nonce after XOR).
-            match cmd {
-                FileYeetCommandType::Pub => listen_stream,
-                FileYeetCommandType::Sub => connect_stream,
-            }
-        }
-        _ => unreachable!("Not possible to have more than two streams"),
-    }?;
-
-    let peer_streams: BiStream = tokio::time::timeout(Duration::from_millis(400), async {
-        let streams = match cmd {
-            FileYeetCommandType::Pub => {
-                // Open a bi-directional stream.
-                connection.open_bi().await
-            }
-            FileYeetCommandType::Sub => {
-                // Let the uploading peer open a bi-directional stream.
-                connection.accept_bi().await
-            }
+    let connections =
+        // TODO: It could be interesting and possible to create a more general stream negotiation.
+        //       For example, if each peer sent a random nonce over each stream, and the nonces were XOR'd per stream,
+        //       the result could be used to determine which stream to use (highest/lowest resulting nonce after XOR).
+        match cmd {
+            FileYeetCommandType::Pub => listen_stream.into_iter().chain(connect_stream.into_iter()),
+            FileYeetCommandType::Sub => connect_stream.into_iter().chain(listen_stream.into_iter()),
         };
-        if let Ok(streams) = streams {
-            Some(streams.into())
-        } else {
-            None
+
+    for connection in connections {
+        if let Some(peer_streams) = peer_connection_into_stream(&connection, hash, cmd).await {
+            // Let the user know that a connection is established. A bi-directional stream is ready to use.
+            println!("{} Peer connection established", local_now_fmt());
+            return Some((connection, peer_streams));
         }
-    })
-    .await
-    .ok()
-    .flatten()?;
+    }
+    None
+}
 
-    // Let the user know that a connection is established. A bi-directional stream is ready to use.
-    println!("{} Peer connection established", local_now_fmt());
+/// Try to finalize a peer connection attempt by turning it into a bi-directional stream.
+async fn peer_connection_into_stream(
+    connection: &quinn::Connection,
+    hash: HashBytes,
+    cmd: FileYeetCommandType,
+) -> Option<BiStream> {
+    let streams = match cmd {
+        FileYeetCommandType::Pub => {
+            // Let the downloading peer initiate a bi-directional stream.
+            let mut r = connection.accept_bi().await;
+            if let Ok(s) = &mut r {
+                let mut requested_hash = HashBytes::default();
+                s.1.read_exact(&mut requested_hash).await.ok()?;
 
-    Some((connection, peer_streams))
+                // Ensure the requested hash matches the file hash.
+                if requested_hash != hash {
+                    eprintln!(
+                        "{} Peer requested a file with an unexpected hash",
+                        local_now_fmt(),
+                    );
+                    return None;
+                }
+            }
+            r
+        }
+        FileYeetCommandType::Sub => {
+            // Open a bi-directional stream to the publishing peer.
+            let mut r = connection.open_bi().await;
+            if let Ok(s) = &mut r {
+                s.0.write_all(&hash).await.ok()?;
+            }
+            r
+        }
+    };
+    if let Ok(streams) = streams {
+        Some(streams.into())
+    } else {
+        None
+    }
 }
 
 /// Spawn a thread that listens for a peer and will assign the peer `Connection` lock when connected.
 async fn listen_for_peer(
     endpoint: quinn::Endpoint,
-    peer_reached_lock: &Arc<Mutex<bool>>,
+    expected_peer: SocketAddr,
 ) -> Option<quinn::Connection> {
     // Print and create binding from the local address.
     println!(
@@ -431,6 +442,18 @@ async fn listen_for_peer(
 
     // Accept a peer connection.
     let connecting = endpoint.accept().await?;
+
+    // Ensure we are connecting to the expected peer.
+    // TODO: Allow returning an unexpected peer connection to the caller to be routed appropriately.
+    if connecting.remote_address() != expected_peer {
+        eprintln!(
+            "{} Peer connection from unexpected address: {}",
+            local_now_fmt(),
+            connecting.remote_address(),
+        );
+        return None;
+    }
+
     let connection = match connecting.await {
         Ok(connection) => connection,
         Err(e) => {
@@ -441,11 +464,6 @@ async fn listen_for_peer(
             return None;
         }
     };
-
-    // Set the peer stream lock to the listening stream if there isn't already one present.
-    *peer_reached_lock
-        .lock()
-        .expect("Could not obtain the mutex lock") = true;
 
     // Connected to a peer on the listening stream, print their address.
     let peer_addr = connection.remote_address();
@@ -461,17 +479,12 @@ async fn listen_for_peer(
 async fn connect_to_peer(
     endpoint: quinn::Endpoint,
     peer_address: SocketAddr,
-    peer_reached_lock: &Arc<Mutex<bool>>,
 ) -> Option<quinn::Connection> {
     // Set a sane number of connection retries.
     let mut retries = MAX_PEER_CONNECTION_RETRIES;
 
     // Ensure we have retries left and there isn't already a peer `Connection` to use.
-    while retries > 0
-        && !*peer_reached_lock
-            .lock()
-            .expect("Could not obtain the mutex lock")
-    {
+    while retries > 0 {
         println!("{} Connecting to peer at {peer_address}", local_now_fmt());
         match endpoint.connect(peer_address, "peer") {
             Ok(connecting) => {
@@ -483,10 +496,6 @@ async fn connect_to_peer(
                         continue;
                     }
                 };
-                // Set the peer mutex to the connected stream if there isn't already one present.
-                *peer_reached_lock
-                    .lock()
-                    .expect("Could not obtain the mutex lock") = true;
 
                 println!("{} Connected to peer at {peer_address}", local_now_fmt());
                 return Some(connection);
@@ -508,14 +517,16 @@ pub enum DownloadError {
     IoError(std::io::Error),
     #[error("The downloaded file hash does not match the expected hash")]
     HashMismatch,
+    #[error("Download lock was poisoned: {0}")]
+    PoisonedLock(String),
 }
 
 /// Download a file from the peer. Initiates the download by consenting to the peer to receive the file.
 pub async fn download_from_peer(
     hash: HashBytes,
-    mut peer_streams: BiStream,
+    peer_streams: &mut BiStream,
     file_size: u64,
-    output: &Path,
+    output_path: &Path,
     byte_progress: Option<Arc<RwLock<u64>>>,
 ) -> Result<(), DownloadError> {
     // Open the file for writing.
@@ -523,7 +534,7 @@ pub async fn download_from_peer(
         .create(true)
         .truncate(true)
         .write(true)
-        .open(&output)
+        .open(&output_path)
         .await
         .map_err(DownloadError::IoError)?;
 
@@ -569,7 +580,9 @@ pub async fn download_from_peer(
 
             // Update the caller with the number of bytes written.
             if let Some(progress) = byte_progress.as_ref() {
-                *progress.write().await = bytes_written;
+                *progress
+                    .write()
+                    .map_err(|e| DownloadError::PoisonedLock(e.to_string()))? = bytes_written;
             }
         }
     }
@@ -584,7 +597,7 @@ pub async fn download_from_peer(
     println!(
         "{} Download complete: {}",
         local_now_fmt(),
-        output.display()
+        output_path.display()
     );
     Ok(())
 }
@@ -664,6 +677,12 @@ pub async fn upload_to_peer(
     Ok(())
 }
 
+/// Turn a byte count into a human readable string.
+#[allow(clippy::cast_precision_loss)]
+pub fn humanize_bytes(bytes: u64) -> String {
+    human_bytes::human_bytes(bytes as f64)
+}
+
 /// Allow peers to connect using self-signed certificates.
 /// Necessary for using the QUIC protocol.
 #[derive(Debug)]
@@ -711,6 +730,7 @@ fn configure_peer_verification() -> quinn::ClientConfig {
 }
 
 /// Helper type for grouping a bi-directional stream, instead of the default tuple type.
+#[derive(Debug)]
 pub struct BiStream {
     pub send: quinn::SendStream,
     pub recv: quinn::RecvStream,
