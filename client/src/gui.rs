@@ -166,6 +166,9 @@ pub enum Message {
     /// The result of a download attempt.
     TransferResulted(Nonce, Result<(), Arc<anyhow::Error>>),
 
+    /// A completed download is being removed from the list.
+    RemoveFromDownloads(Nonce),
+
     /// An unhandled event occurred.
     UnhandledEvent(iced::Event),
 
@@ -218,20 +221,7 @@ impl iced::Application for AppState {
             Message::PortMappingRadioChanged(label) => self.update_port_radio_changed(label),
 
             // Handle the port forward text field being changed.
-            Message::PortForwardTextChanged(text) => {
-                self.port_forwarding_text = text;
-                if let PortMappingGuiOptions::PortForwarding(port) = &mut self.port_mapping_options
-                {
-                    if let Ok(p) = self.port_forwarding_text.parse::<NonZeroU16>() {
-                        *port = Some(p);
-                        self.status_message = None;
-                    } else {
-                        *port = None;
-                        self.status_message = Some(INVALID_PORT_FORWARD.to_owned());
-                    }
-                }
-                iced::Command::none()
-            }
+            Message::PortForwardTextChanged(text) => self.update_port_forward_text(text),
 
             // Handle the publish button being clicked by picking a file to publish.
             Message::ConnectClicked => self.update_connect_clicked(),
@@ -329,19 +319,25 @@ impl iced::Application for AppState {
                 iced::Command::none()
             }
 
+            // Handle a transfer being removed from the downloads list.
+            Message::RemoveFromDownloads(nonce) => {
+                if let ConnectionState::Connected { transfers, .. } = &mut self.connection_state {
+                    if let Some(i) = transfers.iter().position(|t| t.nonce == nonce) {
+                        transfers.remove(i);
+                    }
+                }
+                iced::Command::none()
+            }
+
             // Handle an event that iced did not handle itself.
             // This is used to allow for custom exit handling in this instance.
             Message::UnhandledEvent(event) => match event {
                 iced::Event::Window(id, window::Event::CloseRequested) => {
-                    if id == window::Id::MAIN {
-                        if self.safely_closing {
-                            // If we are already closing, force exit immediately.
-                            window::close(window::Id::MAIN)
-                        } else {
-                            self.safely_close()
-                        }
+                    if id == window::Id::MAIN && !self.safely_closing {
+                        self.safely_close()
                     } else {
                         // Non-main windows (if ever implemented) can be closed immediately.
+                        // This is also used to cancel the safe-close operation.
                         window::close(id)
                     }
                 }
@@ -554,21 +550,28 @@ impl AppState {
                 TransferProgress::Consent(_, size) => widget::row!(
                     widget::text(format!("Accept download of size {}", humanize_bytes(*size)))
                         .width(iced::Length::Fill),
-                    widget::button("Accept").on_press(Message::AcceptDownload(t.nonce)),
-                    widget::button("Cancel").on_press(Message::CancelTransfer(t.nonce))
+                    widget::button(widget::text("Accept").size(12))
+                        .on_press(Message::AcceptDownload(t.nonce)),
+                    widget::button(widget::text("Cancel").size(12))
+                        .on_press(Message::CancelTransfer(t.nonce))
                 )
                 .spacing(12)
                 .into(),
                 TransferProgress::Transfering(_, _, _, p) => widget::row!(
                     widget::text("Transfering..."),
                     widget::progress_bar(0.0..=1., *p),
-                    widget::button("Cancel")
+                    widget::button(widget::text("Cancel").size(12))
                         .on_press(Message::CancelTransfer(t.nonce))
                         .width(iced::Length::Shrink)
                 )
                 .spacing(6)
                 .into(),
-                TransferProgress::Done(r) => widget::text(r).into(),
+                TransferProgress::Done(r) => widget::row!(
+                    widget::text(r).width(iced::Length::Fill),
+                    widget::button(widget::text("Remove").size(12))
+                        .on_press(Message::RemoveFromDownloads(t.nonce))
+                )
+                .into(),
             };
 
             widget::container(widget::column!(
@@ -620,6 +623,21 @@ impl AppState {
             }
             _ => unreachable!(),
         };
+        iced::Command::none()
+    }
+
+    /// Update the state after the port forward text field was changed.
+    fn update_port_forward_text(&mut self, text: String) -> iced::Command<Message> {
+        self.port_forwarding_text = text;
+        if let PortMappingGuiOptions::PortForwarding(port) = &mut self.port_mapping_options {
+            if let Ok(p) = self.port_forwarding_text.parse::<NonZeroU16>() {
+                *port = Some(p);
+                self.status_message = None;
+            } else {
+                *port = None;
+                self.status_message = Some(INVALID_PORT_FORWARD.to_owned());
+            }
+        }
         iced::Command::none()
     }
 
