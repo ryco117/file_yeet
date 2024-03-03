@@ -20,7 +20,7 @@ use crate::core::{
 /// Produces match groups `host` and `port` for the server address and optional port.
 static SERVER_ADDRESS_REGEX: once_cell::sync::Lazy<regex::Regex> =
     once_cell::sync::Lazy::new(|| {
-        regex::Regex::new(r"^(?P<host>[^:]+)(?::(?P<port>\d+))?$").unwrap()
+        regex::Regex::new(r"^\s*(?P<host>[^:]+)(?::(?P<port>\d+))?\s*$").unwrap()
     });
 
 /// The maximum time to wait before forcing the application to exit.
@@ -30,7 +30,7 @@ const MAX_SHUTDOWN_WAIT: Duration = Duration::from_secs(3);
 const ERROR_RED_COLOR: iced::Color = iced::Color::from_rgb(1., 0.4, 0.5);
 
 /// The labels for the port mapping radio buttons.
-const PORT_MAPPING_OPTIONS: [&str; 3] = ["None", "Port forward", "NAT-PMP / PCP"];
+const PORT_MAPPING_OPTION_LABELS: [&str; 3] = ["None", "Port forward", "NAT-PMP / PCP"];
 
 /// The state of the port mapping options in the GUI.
 #[derive(Debug, Default)]
@@ -41,6 +41,24 @@ enum PortMappingGuiOptions {
     TryPcpNatPmp,
 }
 
+/// A peer connection in QUIC for requesting or serving a file to a peer.
+#[derive(Clone, Debug)]
+pub struct PeerConnection {
+    pub connection: quinn::Connection,
+    pub streams: Arc<tokio::sync::RwLock<BiStream>>,
+}
+impl PeerConnection {
+    /// Make a new `PeerConnection` from a QUIC connection and a bi-directional stream.
+    #[must_use]
+    pub fn new(connection: quinn::Connection, streams: BiStream) -> Self {
+        Self {
+            connection,
+            streams: Arc::new(tokio::sync::RwLock::new(streams)),
+        }
+    }
+}
+
+/// The result of a file transfer with a peer.
 #[derive(Clone, Debug, displaydoc::Display)]
 enum TransferResult {
     /// The transfer succeeded.
@@ -51,13 +69,7 @@ enum TransferResult {
     Cancelled,
 }
 
-/// A peer connection in QUIC for requesting or serving a file to a peer.
-#[derive(Clone, Debug)]
-pub struct PeerConnection {
-    pub connection: quinn::Connection,
-    pub streams: Arc<tokio::sync::RwLock<BiStream>>,
-}
-
+/// The state of a file transfer with a peer.
 #[derive(Debug)]
 enum TransferProgress {
     Connecting,
@@ -66,8 +78,10 @@ enum TransferProgress {
     Done(TransferResult),
 }
 
+/// Nonce used to identifying items locally.
 type Nonce = u64;
 
+/// A file transfer with a peer in any state.
 #[derive(Debug)]
 struct Transfer {
     pub hash: HashBytes,
@@ -155,7 +169,7 @@ pub enum Message {
     SubscribePeersResult(Result<(Vec<SocketAddr>, PathBuf, HashBytes), Arc<anyhow::Error>>),
 
     /// A subscribe connection attempt was completed.
-    SubscribeConnectResulted(Nonce, Option<(PeerConnection, u64)>),
+    SubscribePeerConnectResulted(Nonce, Option<(PeerConnection, u64)>),
 
     // A download was accepted, initiate the download.
     AcceptDownload(Nonce),
@@ -296,7 +310,7 @@ impl iced::Application for AppState {
             Message::SubscribePeersResult(r) => self.update_subscribe_peers_result(r),
 
             // Handle the result of a subscribe connection attempt to a peer.
-            Message::SubscribeConnectResulted(nonce, r) => {
+            Message::SubscribePeerConnectResulted(nonce, r) => {
                 self.update_subscribe_connect_resulted(nonce, r)
             }
 
@@ -351,6 +365,7 @@ impl iced::Application for AppState {
 
     /// Listen for events that should be translated into messages.
     fn subscription(&self) -> iced::Subscription<Message> {
+        // Listen for runtime events that iced did not handle internally. Used for safe exit handling.
         let close_event = iced::event::listen().map(Message::UnhandledEvent);
 
         match self.connection_state {
@@ -439,23 +454,23 @@ impl AppState {
         }
 
         let selected = match self.port_mapping_options {
-            PortMappingGuiOptions::None => PORT_MAPPING_OPTIONS[0],
-            PortMappingGuiOptions::PortForwarding(_) => PORT_MAPPING_OPTIONS[1],
-            PortMappingGuiOptions::TryPcpNatPmp => PORT_MAPPING_OPTIONS[2],
+            PortMappingGuiOptions::None => PORT_MAPPING_OPTION_LABELS[0],
+            PortMappingGuiOptions::PortForwarding(_) => PORT_MAPPING_OPTION_LABELS[1],
+            PortMappingGuiOptions::TryPcpNatPmp => PORT_MAPPING_OPTION_LABELS[2],
         };
 
         // Create a bottom section for choosing port forwaring/mapping options.
         let choose_port_mapping = widget::column!(
             widget::radio(
-                PORT_MAPPING_OPTIONS[0],
-                PORT_MAPPING_OPTIONS[0],
+                PORT_MAPPING_OPTION_LABELS[0],
+                PORT_MAPPING_OPTION_LABELS[0],
                 Some(selected),
                 Message::PortMappingRadioChanged,
             ),
             widget::row!(
                 widget::radio(
-                    PORT_MAPPING_OPTIONS[1],
-                    PORT_MAPPING_OPTIONS[1],
+                    PORT_MAPPING_OPTION_LABELS[1],
+                    PORT_MAPPING_OPTION_LABELS[1],
                     Some(selected),
                     Message::PortMappingRadioChanged,
                 ),
@@ -463,8 +478,8 @@ impl AppState {
             )
             .spacing(32),
             widget::radio(
-                PORT_MAPPING_OPTIONS[2],
-                PORT_MAPPING_OPTIONS[2],
+                PORT_MAPPING_OPTION_LABELS[2],
+                PORT_MAPPING_OPTION_LABELS[2],
                 Some(selected),
                 Message::PortMappingRadioChanged,
             ),
@@ -796,12 +811,24 @@ impl AppState {
         )
     }
 
+    /// Update after server has responded to a subscribe request.
     fn update_subscribe_peers_result(
         &mut self,
         result: Result<(Vec<SocketAddr>, PathBuf, HashBytes), Arc<anyhow::Error>>,
     ) -> iced::Command<Message> {
         match result {
             Ok((peers, path, hash)) => {
+                // Helper to get the file size from the peer after a successful connection.
+                async fn get_size_from_peer(
+                    (c, mut b): (quinn::Connection, BiStream),
+                ) -> Option<(PeerConnection, u64)> {
+                    b.recv
+                        .read_u64()
+                        .await
+                        .ok()
+                        .map(|file_size| (PeerConnection::new(c, b), file_size))
+                }
+
                 if let ConnectionState::Connected {
                     endpoint,
                     hash_input,
@@ -814,29 +841,25 @@ impl AppState {
                         self.status_message = Some("No peers available".to_owned());
                         return iced::Command::none();
                     }
-                    let peers: Vec<(SocketAddr, Nonce)> = peers
-                        .into_iter()
-                        .map(|p| (p, rand::random::<u64>()))
-                        .collect();
 
-                    // Create a new transfer for each peer.
-                    let mut new_transfers: Vec<Transfer> = peers
-                        .clone()
-                        .into_iter()
-                        .map(|(_, nonce)| Transfer {
+                    // Create a new transfer state and connection attempt for each peer.
+                    let transfers_commands_iter = peers.into_iter().map(|peer| {
+                        // Create a nonce to identify the transfer.
+                        let nonce = rand::random();
+
+                        // New transfer state for this request.
+                        let transfer = Transfer {
                             hash,
                             hash_hex: hash_input.clone(),
                             path: path.clone(),
                             nonce,
                             progress: TransferProgress::Connecting,
-                        })
-                        .collect();
+                        };
 
-                    // Create a new connection attempt for each peer.
-                    let future_connections = peers.into_iter().map(|(peer, nonce)| {
-                        let endpoint = endpoint.clone();
-                        iced::Command::perform(
-                            async move {
+                        // New connection attempt for this peer with result command identified by the nonce.
+                        let command = {
+                            let endpoint = endpoint.clone();
+                            let future = async move {
                                 tokio::time::timeout(
                                     PEER_CONNECT_TIMEOUT,
                                     futures_util::future::OptionFuture::from(
@@ -847,37 +870,32 @@ impl AppState {
                                             peer,
                                         )
                                         .await
-                                        .map(
-                                            |(c, mut b)| async {
-                                                // Read the file size from the peer.
-                                                if let Ok(file_size) = b.recv.read_u64().await {
-                                                    Some((
-                                                        PeerConnection {
-                                                            connection: c,
-                                                            streams: Arc::new(
-                                                                tokio::sync::RwLock::new(b),
-                                                            ),
-                                                        },
-                                                        file_size,
-                                                    ))
-                                                } else {
-                                                    None
-                                                }
-                                            },
-                                        ),
+                                        .map(get_size_from_peer),
                                     ),
                                 )
                                 .await
-                            },
-                            move |r| {
-                                Message::SubscribeConnectResulted(nonce, r.ok().flatten().flatten())
-                            },
-                        )
+                                .ok()
+                                .flatten()
+                                .flatten()
+                            };
+                            iced::Command::perform(future, move |r| {
+                                Message::SubscribePeerConnectResulted(nonce, r)
+                            })
+                        };
+
+                        // Return the pair to be separated later.
+                        (transfer, command)
                     });
+
+                    // Create a new transfer for each peer.
+                    let (mut new_transfers, connect_commands): (
+                        Vec<Transfer>,
+                        Vec<iced::Command<Message>>,
+                    ) = transfers_commands_iter.unzip();
 
                     // Add the new transfers to the list of active transfers.
                     transfers.append(&mut new_transfers);
-                    iced::Command::batch(future_connections)
+                    iced::Command::batch(connect_commands)
                 } else {
                     iced::Command::none()
                 }

@@ -257,6 +257,71 @@ pub async fn port_override_request(
     Ok(())
 }
 
+/// Perform a publish request to the server.
+pub async fn publish(
+    server_connection: &quinn::Connection,
+    mut bb: bytes::BytesMut,
+    hash: HashBytes,
+) -> anyhow::Result<BiStream> {
+    // Create a bi-directional stream to the server.
+    let mut server_streams: BiStream = server_connection
+        .open_bi()
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to open a bi-directional QUIC stream for a socket ping request {e}"
+            )
+        })?
+        .into();
+
+    // Format a publish request.
+    bb.put_u16(file_yeet_shared::ClientApiRequest::Publish as u16);
+    bb.put(&hash[..]);
+
+    // Send the server a publish request.
+    server_streams
+        .send
+        .write_all(&bb)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to send a publish request to the server {e}"))?;
+
+    Ok(server_streams)
+}
+
+/// Read a response to a publish request from the server.
+pub async fn read_publish_response(
+    server_recv: &mut quinn::RecvStream,
+) -> anyhow::Result<SocketAddr> {
+    let data_len = server_recv
+        .read_u16()
+        .await
+        .expect("Failed to read a u16 response from the server") as usize;
+    if data_len == 0 {
+        anyhow::bail!("Server encountered and error");
+    }
+    if data_len > MAX_SERVER_COMMUNICATION_SIZE {
+        anyhow::bail!("Server response length is invalid");
+    }
+
+    let mut scratch_space = [0; MAX_SERVER_COMMUNICATION_SIZE];
+    let peer_string_bytes = &mut scratch_space[..data_len];
+    if let Err(e) = server_recv.read_exact(peer_string_bytes).await {
+        anyhow::bail!("Failed to read a response from the server: {e}");
+    }
+
+    // Parse the response as a peer socket address or skip this message.
+    let peer_string = match std::str::from_utf8(peer_string_bytes) {
+        Ok(s) => s,
+        Err(e) => anyhow::bail!("Server did not send a valid UTF-8 response: {e}"),
+    };
+    let peer_address = match peer_string.parse() {
+        Ok(addr) => addr,
+        Err(e) => anyhow::bail!("Failed to parse peer address: {e}"),
+    };
+
+    Ok(peer_address)
+}
+
 /// Perform a subscribe request to the server. Returns a list of peers that are sharing the file.
 pub async fn subscribe(
     server_connection: &quinn::Connection,

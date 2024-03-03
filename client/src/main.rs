@@ -1,7 +1,6 @@
 use core::{BiStream, PreparedConnection};
 use std::{io::Write as _, num::NonZeroU16, path::Path, time::Duration};
 
-use bytes::BufMut as _;
 use file_yeet_shared::{
     local_now_fmt, HashBytes, GOODBYE_CODE, GOODBYE_MESSAGE, MAX_SERVER_COMMUNICATION_SIZE,
 };
@@ -289,32 +288,13 @@ async fn subscribe_command(
 async fn publish_loop(
     endpoint: &quinn::Endpoint,
     server_connection: quinn::Connection,
-    mut bb: bytes::BytesMut,
+    bb: bytes::BytesMut,
     hash: HashBytes,
     file_size: u64,
     file_path: &Path,
 ) -> anyhow::Result<()> {
     // Create a bi-directional stream to the server.
-    let mut server_streams: BiStream = server_connection
-        .open_bi()
-        .await
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to open a bi-directional QUIC stream for a socket ping request {e}"
-            )
-        })?
-        .into();
-
-    // Format a publish request.
-    bb.put_u16(file_yeet_shared::ClientApiRequest::Publish as u16);
-    bb.put(&hash[..]);
-    // Send the server a publish request.
-    server_streams
-        .send
-        .write_all(&bb)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to send a publish request to the server {e}"))?;
-    drop(bb);
+    let mut server_streams: BiStream = crate::core::publish(&server_connection, bb, hash).await?;
 
     // Close the stream after completing the publish request.
     let _ = server_streams.send.finish().await;
@@ -326,48 +306,11 @@ async fn publish_loop(
             local_now_fmt()
         );
 
-        let data_len = server_streams
-            .recv
-            .read_u16()
-            .await
-            .expect("Failed to read a u16 response from the server")
-            as usize;
-        if data_len == 0 {
-            eprintln!("{} Server encountered and error", local_now_fmt());
+        // Await the server to send a peer connection.
+        let Ok(peer_address) = crate::core::read_publish_response(&mut server_streams.recv).await
+        else {
+            eprintln!("{} Failed to read the server's response", local_now_fmt());
             break;
-        }
-        if data_len > MAX_SERVER_COMMUNICATION_SIZE {
-            eprintln!("{} Server response length is invalid", local_now_fmt());
-            break;
-        }
-
-        let mut scratch_space = [0; MAX_SERVER_COMMUNICATION_SIZE];
-        let peer_string_bytes = &mut scratch_space[..data_len];
-        if let Err(e) = server_streams.recv.read_exact(peer_string_bytes).await {
-            eprintln!(
-                "{} Failed to read a response from the server: {e}",
-                local_now_fmt()
-            );
-            break;
-        }
-
-        // Parse the response as a peer socket address or skip this message.
-        let peer_string = match std::str::from_utf8(peer_string_bytes) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!(
-                    "{} Server did not send a valid UTF-8 response: {e}",
-                    local_now_fmt()
-                );
-                continue;
-            }
-        };
-        let peer_address = match peer_string.parse() {
-            Ok(addr) => addr,
-            Err(e) => {
-                eprintln!("{} Failed to parse peer address: {e}", local_now_fmt());
-                continue;
-            }
         };
 
         // Attempt to connect to the peer using UDP hole punching.
