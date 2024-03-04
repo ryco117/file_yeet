@@ -219,6 +219,7 @@ async fn handle_quic_connection(
                 // Now that we have the peer's socket address and the file hash, we can handle the publish request.
                 handle_publish(
                     quic_send,
+                    quic_recv,
                     sock_string.clone(),
                     nonce,
                     hash,
@@ -313,7 +314,8 @@ async fn port_override(
 
 /// Handle QUIC connections for clients that want to publish a new file hash.
 async fn handle_publish(
-    quic_send: quinn::SendStream,
+    client_send: quinn::SendStream,
+    mut client_recv: quinn::RecvStream,
     sock_string: Arc<RwLock<String>>,
     session_nonce: Nonce,
     hash: HashBytes,
@@ -397,13 +399,17 @@ async fn handle_publish(
     }
 
     // Create a cancellable task to handle the client's publish request.
+    let mut scratch = [0u8; 1];
     tokio::task::spawn(async move {
         tokio::select! {
             // Allow the server to cancel the task.
             () = cancellation_token.cancelled() => {}
 
+            // Allow the client to cancel their publish request.
+            _ = client_recv.read_exact(&mut scratch) => {}
+
             // Handle the client's file-publishing task.
-            () = handle_publish_inner(quic_send, rx, sock_string) => {}
+            () = handle_publish_inner(client_send, rx, sock_string) => {}
         }
 
         // Remove any reference there may be to this publish task.

@@ -107,6 +107,18 @@ pub fn local_now_fmt() -> chrono::format::DelayedFormat<chrono::format::Strftime
     chrono::Local::now().format("%F %T%.3f")
 }
 
+/// Helper type for grouping a bi-directional stream, instead of the default tuple type.
+#[derive(Debug)]
+pub struct BiStream {
+    pub send: quinn::SendStream,
+    pub recv: quinn::RecvStream,
+}
+impl From<(quinn::SendStream, quinn::RecvStream)> for BiStream {
+    fn from((send, recv): (quinn::SendStream, quinn::RecvStream)) -> Self {
+        Self { send, recv }
+    }
+}
+
 /// Set reasonable transport config defaults for the server as well as peers when receiving connections.
 /// # Panics
 /// If the conversion from `Duration` to `IdleTimeout` of the max idle timeout fails.

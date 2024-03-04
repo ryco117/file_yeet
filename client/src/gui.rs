@@ -7,12 +7,17 @@ use std::{
     time::{Duration, Instant},
 };
 
-use file_yeet_shared::{local_now_fmt, HashBytes, DEFAULT_PORT, GOODBYE_CODE, GOODBYE_MESSAGE};
+use file_yeet_shared::{
+    local_now_fmt, BiStream, HashBytes, DEFAULT_PORT, GOODBYE_CODE, GOODBYE_MESSAGE,
+    MAX_SERVER_COMMUNICATION_SIZE,
+};
+use futures_util::SinkExt;
 use iced::{widget, window, Element};
 use tokio::io::AsyncReadExt;
+use tokio_util::sync::CancellationToken;
 
 use crate::core::{
-    humanize_bytes, BiStream, FileYeetCommandType, PortMappingConfig, PreparedConnection,
+    humanize_bytes, FileYeetCommandType, PortMappingConfig, PreparedConnection,
     MAX_PEER_COMMUNICATION_SIZE, PEER_CONNECT_TIMEOUT, SERVER_CONNECTION_TIMEOUT,
 };
 
@@ -45,7 +50,7 @@ enum PortMappingGuiOptions {
 #[derive(Clone, Debug)]
 pub struct PeerConnection {
     pub connection: quinn::Connection,
-    pub streams: Arc<tokio::sync::RwLock<BiStream>>,
+    pub streams: Arc<tokio::sync::Mutex<BiStream>>,
 }
 impl PeerConnection {
     /// Make a new `PeerConnection` from a QUIC connection and a bi-directional stream.
@@ -53,8 +58,13 @@ impl PeerConnection {
     pub fn new(connection: quinn::Connection, streams: BiStream) -> Self {
         Self {
             connection,
-            streams: Arc::new(tokio::sync::RwLock::new(streams)),
+            streams: Arc::new(tokio::sync::Mutex::new(streams)),
         }
+    }
+}
+impl From<(quinn::Connection, BiStream)> for PeerConnection {
+    fn from((connection, streams): (quinn::Connection, BiStream)) -> Self {
+        Self::new(connection, streams)
     }
 }
 
@@ -63,8 +73,10 @@ impl PeerConnection {
 enum TransferResult {
     /// The transfer succeeded.
     Success,
+
     /// The transfer failed: {0}.
     Failure(Arc<anyhow::Error>),
+
     /// The transfer was cancelled.
     Cancelled,
 }
@@ -89,10 +101,55 @@ struct Transfer {
     pub path: PathBuf,
     pub nonce: Nonce,
     pub progress: TransferProgress,
+    pub cancellation_token: CancellationToken,
+}
+
+/// A file actively being published to the server.
+#[derive(Clone, Debug)]
+struct Publish {
+    pub path: PathBuf,
+    pub server: Arc<tokio::sync::Mutex<BiStream>>,
+    pub nonce: Nonce,
+    pub hash: HashBytes,
+    pub file_size: u64,
+}
+
+/// The state of the connection to a `file_yeet` server and peers.
+#[derive(Debug)]
+struct ConnectedState {
+    /// Local QUIC endpoint for server and peer connections.
+    endpoint: quinn::Endpoint,
+
+    /// Connection with the server.
+    server: quinn::Connection,
+
+    /// The hash input field for creating new subscribe requests.
+    hash_input: String,
+
+    /// List of download requests to peers.
+    downloads: Vec<Transfer>,
+
+    /// List of file publish requests to the server.
+    publishes: Vec<Publish>,
+
+    /// List of file uploads to peers.
+    uploads: Vec<Transfer>,
+}
+impl ConnectedState {
+    fn new(endpoint: quinn::Endpoint, server: quinn::Connection) -> Self {
+        Self {
+            endpoint,
+            server,
+            hash_input: String::new(),
+            downloads: Vec::new(),
+            publishes: Vec::new(),
+            uploads: Vec::new(),
+        }
+    }
 }
 
 /// The state of the connection to a `file_yeet` server.
-#[derive(Default, Debug)]
+#[derive(Debug, Default)]
 enum ConnectionState {
     /// No server connection is active.
     #[default]
@@ -102,16 +159,7 @@ enum ConnectionState {
     Stalling { start: Instant, tick: Instant },
 
     /// A connection to the server is active.
-    Connected {
-        // Local QUIC endpoint for server and peer connections.
-        endpoint: quinn::Endpoint,
-        // Connection with the server.
-        server: quinn::Connection,
-        // The hash input field for creating new subscribe requests.
-        hash_input: String,
-        // A list of active file transfers.
-        transfers: Vec<Transfer>,
-    },
+    Connected(ConnectedState),
 }
 
 /// The state of the application for interacting with the GUI.
@@ -159,6 +207,18 @@ pub enum Message {
     /// The path to a file to publish was chosen or cancelled.
     PublishPathChosen(Option<PathBuf>),
 
+    /// The result of a publish request.
+    PublishRequestResulted(
+        Result<(Arc<tokio::sync::Mutex<BiStream>>, HashBytes, u64), Arc<anyhow::Error>>,
+        PathBuf,
+    ),
+
+    /// The result of trying to recieve a peer to publish to from the server.
+    PublishPeerReceived(Nonce, Result<SocketAddr, Arc<anyhow::Error>>),
+
+    /// The result of trying to connect to a peer to publish to.
+    PublishPeerConnectResulted(Nonce, Option<PeerConnection>),
+
     /// The subscribe button was clicked or the hash field was submitted.
     SubscribeStarted,
 
@@ -174,14 +234,17 @@ pub enum Message {
     // A download was accepted, initiate the download.
     AcceptDownload(Nonce),
 
-    /// A transfer was cancelled.
-    CancelTransfer(Nonce),
+    /// Cancel publishing a file.
+    CancelPublish(Nonce),
+
+    /// Cancel a transfer that is in-progress.
+    CancelTransfer(Nonce, FileYeetCommandType),
 
     /// The result of a download attempt.
-    TransferResulted(Nonce, Result<(), Arc<anyhow::Error>>),
+    TransferResulted(Nonce, Result<(), Arc<anyhow::Error>>, FileYeetCommandType),
 
     /// A completed download is being removed from the list.
-    RemoveFromDownloads(Nonce),
+    RemoveFromTransfers(Nonce, FileYeetCommandType),
 
     /// An unhandled event occurred.
     UnhandledEvent(iced::Event),
@@ -248,7 +311,9 @@ impl iced::Application for AppState {
 
             // Handle the hash input being changed.
             Message::HashInputChanged(hash) => {
-                if let ConnectionState::Connected { hash_input, .. } = &mut self.connection_state {
+                if let ConnectionState::Connected(ConnectedState { hash_input, .. }) =
+                    &mut self.connection_state
+                {
                     *hash_input = hash;
                 }
                 iced::Command::none()
@@ -271,20 +336,19 @@ impl iced::Application for AppState {
             }
 
             // Begin the process of publishing a file to the server.
-            Message::PublishPathChosen(path) => {
-                self.modal = false;
+            Message::PublishPathChosen(path) => self.update_publish_path_chosen(path),
 
-                // Ensure a path was chosen.
-                let Some(_path) = path else {
-                    return iced::Command::none();
-                };
+            // Handle the result of a publish request.
+            Message::PublishRequestResulted(r, path) => {
+                self.update_publish_request_resulted(r, path)
+            }
 
-                // Ensure the client is connected to a server.
-                let ConnectionState::Connected { .. } = &self.connection_state else {
-                    return iced::Command::none();
-                };
+            // Handle a peer connection being received for a publish request.
+            Message::PublishPeerReceived(nonce, r) => self.update_publish_peer_received(nonce, r),
 
-                iced::Command::none()
+            // Handle the result of a peer connection attempt for a publish request.
+            Message::PublishPeerConnectResulted(pub_nonce, peer) => {
+                self.update_publish_peer_connect_resulted(pub_nonce, peer)
             }
 
             // Handle the subscribe button being clicked by choosing a save location.
@@ -317,25 +381,50 @@ impl iced::Application for AppState {
             // Handle the download being accepted, initiate the download.
             Message::AcceptDownload(nonce) => self.update_accept_download(nonce),
 
+            Message::CancelPublish(nonce) => {
+                // TODO: Allow cancelling a publish request without disconnecting from the server.
+                iced::Command::none()
+            }
+
             // Handle a transfer being cancelled.
-            Message::CancelTransfer(nonce) => self.update_cancel_transfer(nonce),
+            Message::CancelTransfer(nonce, transfer_type) => {
+                self.update_cancel_transfer(nonce, transfer_type)
+            }
 
             // Handle the conclusive result of a transfer.
-            Message::TransferResulted(nonce, r) => {
-                if let ConnectionState::Connected { transfers, .. } = &mut self.connection_state {
-                    if let Some(t) = transfers.iter_mut().find(|t| t.nonce == nonce) {
-                        t.progress =
-                            TransferProgress::Done(r.map_or_else(TransferResult::Failure, |()| {
-                                TransferResult::Success
-                            }));
+            Message::TransferResulted(nonce, r, transfer_type) => {
+                if let ConnectionState::Connected(ConnectedState {
+                    downloads, uploads, ..
+                }) = &mut self.connection_state
+                {
+                    let update_transfers = |transfers: &mut Vec<Transfer>| {
+                        if let Some(t) = transfers.iter_mut().find(|t| t.nonce == nonce) {
+                            t.progress = TransferProgress::Done(
+                                r.map_or_else(TransferResult::Failure, |()| {
+                                    TransferResult::Success
+                                }),
+                            );
+                        }
+                    };
+
+                    match transfer_type {
+                        FileYeetCommandType::Sub => update_transfers(downloads),
+                        FileYeetCommandType::Pub => update_transfers(uploads),
                     }
                 }
                 iced::Command::none()
             }
 
             // Handle a transfer being removed from the downloads list.
-            Message::RemoveFromDownloads(nonce) => {
-                if let ConnectionState::Connected { transfers, .. } = &mut self.connection_state {
+            Message::RemoveFromTransfers(nonce, transfer_type) => {
+                if let ConnectionState::Connected(ConnectedState {
+                    downloads, uploads, ..
+                }) = &mut self.connection_state
+                {
+                    let transfers = match transfer_type {
+                        FileYeetCommandType::Sub => downloads,
+                        FileYeetCommandType::Pub => uploads,
+                    };
                     if let Some(i) = transfers.iter().position(|t| t.nonce == nonce) {
                         transfers.remove(i);
                     }
@@ -366,19 +455,48 @@ impl iced::Application for AppState {
     /// Listen for events that should be translated into messages.
     fn subscription(&self) -> iced::Subscription<Message> {
         // Listen for runtime events that iced did not handle internally. Used for safe exit handling.
-        let close_event = iced::event::listen().map(Message::UnhandledEvent);
+        let close_event = || iced::event::listen().map(Message::UnhandledEvent);
 
-        match self.connection_state {
-            ConnectionState::Stalling { .. } | ConnectionState::Connected { .. } => {
-                let animation =
-                    iced::time::every(Duration::from_millis(33)).map(|_| Message::AnimationTick);
+        // Listen for timing intervals to update animations.
+        let animation =
+            || iced::time::every(Duration::from_millis(33)).map(|_| Message::AnimationTick);
 
-                // Listen for close events and animation ticks.
-                iced::Subscription::batch([close_event, animation])
+        match &self.connection_state {
+            // Listen for close events and animation ticks when connecting/stalling.
+            ConnectionState::Stalling { .. } => {
+                iced::Subscription::batch([close_event(), animation()])
+            }
+
+            ConnectionState::Connected(ConnectedState { publishes, .. }) => {
+                let pubs = publishes.iter().map(|publish| {
+                    let publish = publish.clone();
+
+                    // Subscribe to the server for new peers to upload to.
+                    iced::subscription::channel(publish.nonce, 10, move |mut output| async move {
+                        loop {
+                            let mut server = publish.server.lock().await;
+
+                            // Await the server to send a peer connection.
+                            if let Err(e) = output
+                                .send(Message::PublishPeerReceived(
+                                    publish.nonce,
+                                    crate::core::read_publish_response(&mut server.recv)
+                                        .await
+                                        .map_err(Arc::new),
+                                ))
+                                .await
+                            {
+                                eprintln!("{} Failed to send publish peer: {e}", local_now_fmt());
+                            }
+                        }
+                    })
+                });
+
+                iced::Subscription::batch([close_event(), animation()].into_iter().chain(pubs))
             }
 
             // Listen for close events alone when disconnected.
-            ConnectionState::Disconnected => close_event,
+            ConnectionState::Disconnected => close_event(),
         }
     }
 
@@ -403,11 +521,13 @@ impl iced::Application for AppState {
             }
 
             // Display the main application controls when connected.
-            ConnectionState::Connected {
+            ConnectionState::Connected(ConnectedState {
                 hash_input,
-                transfers,
+                downloads,
+                publishes,
+                uploads,
                 ..
-            } => self.view_connected_page(hash_input, transfers),
+            }) => self.view_connected_page(hash_input, downloads, publishes, uploads),
         };
 
         // Always display the status bar at the bottom.
@@ -527,11 +647,68 @@ impl AppState {
         Element::<'a>::from(spinner)
     }
 
+    fn draw_transfers<'a, 'b, I>(
+        transfers: I,
+        transfer_type: FileYeetCommandType,
+    ) -> iced::Element<'b, Message>
+    where
+        I: Iterator<Item = &'a Transfer>,
+    {
+        widget::column(transfers.map(|t| {
+            let progress = match &t.progress {
+                TransferProgress::Connecting => Element::from(widget::text("Connecting...")),
+                TransferProgress::Consent(_, size) => widget::row!(
+                    widget::text(format!("Accept download of size {}", humanize_bytes(*size)))
+                        .width(iced::Length::Fill),
+                    widget::button(widget::text("Accept").size(12))
+                        .on_press(Message::AcceptDownload(t.nonce)),
+                    widget::button(widget::text("Cancel").size(12))
+                        .on_press(Message::CancelTransfer(t.nonce, transfer_type))
+                )
+                .spacing(12)
+                .into(),
+                TransferProgress::Transfering(_, _, _, p) => widget::row!(
+                    widget::text("Transfering..."),
+                    widget::progress_bar(0.0..=1., *p),
+                    widget::button(widget::text("Cancel").size(12))
+                        .on_press(Message::CancelTransfer(t.nonce, transfer_type))
+                        .width(iced::Length::Shrink)
+                )
+                .spacing(6)
+                .into(),
+                TransferProgress::Done(r) => widget::row!(
+                    widget::text(r).width(iced::Length::Fill),
+                    widget::button(widget::text("Remove").size(12))
+                        .on_press(Message::RemoveFromTransfers(t.nonce, transfer_type))
+                )
+                .into(),
+            };
+
+            widget::container(widget::column!(
+                progress,
+                widget::row!(
+                    widget::text(&t.hash_hex).size(12),
+                    widget::horizontal_space(),
+                    widget::text(&t.path.to_string_lossy()).size(12)
+                )
+                .spacing(6),
+            ))
+            .style(iced::theme::Container::Box)
+            .width(iced::Length::Fill)
+            .padding(6)
+            .into()
+        }))
+        .spacing(6)
+        .into()
+    }
+
     /// Draw the main application controls when connected to a server.
     fn view_connected_page(
         &self,
         hash_input: &str,
-        transfers: &[Transfer],
+        downloads: &[Transfer],
+        pubs: &[Publish],
+        uploads: &[Transfer],
     ) -> iced::Element<Message> {
         let mut publish_button = widget::button("Publish");
         let mut download_button = widget::button("Download");
@@ -552,63 +729,34 @@ impl AppState {
         }
 
         // Hash input and download button.
-        let download_input = widget::row!(
-            hash_text_input.width(iced::Length::FillPortion(2)),
-            download_button,
-        )
-        .spacing(6);
+        let download_input = widget::row!(hash_text_input, download_button).spacing(6);
 
-        // Create a list of active downloads.
-        let downloads = widget::column(transfers.iter().map(|t| {
-            let progress = match &t.progress {
-                TransferProgress::Connecting => Element::from(widget::text("Connecting...")),
-                TransferProgress::Consent(_, size) => widget::row!(
-                    widget::text(format!("Accept download of size {}", humanize_bytes(*size)))
-                        .width(iced::Length::Fill),
-                    widget::button(widget::text("Accept").size(12))
-                        .on_press(Message::AcceptDownload(t.nonce)),
-                    widget::button(widget::text("Cancel").size(12))
-                        .on_press(Message::CancelTransfer(t.nonce))
-                )
-                .spacing(12)
-                .into(),
-                TransferProgress::Transfering(_, _, _, p) => widget::row!(
-                    widget::text("Transfering..."),
-                    widget::progress_bar(0.0..=1., *p),
-                    widget::button(widget::text("Cancel").size(12))
-                        .on_press(Message::CancelTransfer(t.nonce))
-                        .width(iced::Length::Shrink)
-                )
-                .spacing(6)
-                .into(),
-                TransferProgress::Done(r) => widget::row!(
-                    widget::text(r).width(iced::Length::Fill),
-                    widget::button(widget::text("Remove").size(12))
-                        .on_press(Message::RemoveFromDownloads(t.nonce))
-                )
-                .into(),
-            };
+        // Create a list of downloads.
+        let downloads: Element<Message> =
+            Self::draw_transfers(downloads.iter(), FileYeetCommandType::Sub);
 
-            widget::container(widget::column!(
-                progress,
+        // Create a list of uploads.
+        let uploads = Self::draw_transfers(uploads.iter(), FileYeetCommandType::Pub);
+
+        // Create a list of files being published.
+        let pubs = widget::column(pubs.iter().map(|p: &Publish| {
+            widget::container(
                 widget::row!(
-                    widget::text(&t.hash_hex).size(12),
-                    widget::horizontal_space(),
-                    widget::text(&t.path.to_string_lossy()).size(12)
+                    widget::text(&p.path.to_string_lossy()).size(12),
+                    widget::button("Cancel").on_press(Message::CancelPublish(p.nonce))
                 )
                 .spacing(6),
-            ))
+            )
             .style(iced::theme::Container::Box)
             .width(iced::Length::Fill)
             .padding(6)
             .into()
-        }))
-        .spacing(6);
+        }));
 
         widget::container(
-            widget::row!(
-                publish_button,
-                widget::column!(download_input, downloads).spacing(6),
+            widget::column!(
+                widget::row!(publish_button, download_input).spacing(6),
+                widget::row!(widget::column!(pubs, uploads).spacing(6), downloads).spacing(6),
             )
             .spacing(18),
         )
@@ -727,8 +875,10 @@ impl AppState {
     fn update_animation_tick(&mut self) -> iced::Command<Message> {
         match &mut self.connection_state {
             ConnectionState::Stalling { tick, .. } => *tick = Instant::now(),
-            ConnectionState::Connected { transfers, .. } => {
-                for t in transfers {
+            ConnectionState::Connected(ConnectedState {
+                downloads, uploads, ..
+            }) => {
+                for t in downloads.iter_mut().chain(uploads.iter_mut()) {
                     if let TransferProgress::Transfering(_, lock, total, progress) = &mut t.progress
                     {
                         let Ok(p) = lock.read() else {
@@ -757,21 +907,197 @@ impl AppState {
     ) -> iced::Command<Message> {
         match result {
             Ok(prepared) => {
-                self.connection_state = ConnectionState::Connected {
-                    endpoint: prepared.endpoint,
-                    server: prepared.server_connection,
-                    hash_input: String::new(),
-                    transfers: Vec::new(),
-                };
+                self.connection_state = ConnectionState::Connected(ConnectedState::new(
+                    prepared.endpoint,
+                    prepared.server_connection,
+                ));
                 self.port_mapping = prepared.port_mapping;
                 iced::Command::none()
             }
             Err(e) => {
-                self.status_message = Some(format!("Error connecting: {e:?}"));
+                self.status_message = Some(format!("Error connecting: {e}"));
                 self.connection_state = ConnectionState::Disconnected;
                 iced::Command::none()
             }
         }
+    }
+
+    /// Update the state after the publish button was clicked. Begins a publish request if a file was chosen.
+    fn update_publish_path_chosen(&mut self, path: Option<PathBuf>) -> iced::Command<Message> {
+        self.modal = false;
+
+        // Ensure a path was chosen.
+        let Some(path) = path else {
+            return iced::Command::none();
+        };
+
+        // Ensure the client is connected to a server.
+        let ConnectionState::Connected(ConnectedState { server, .. }) = &self.connection_state
+        else {
+            return iced::Command::none();
+        };
+
+        let server = server.clone();
+        iced::Command::perform(
+            async move {
+                // Get the file size and hash of the chosen file to publish.
+                let (file_size, hash) = match crate::core::file_size_and_hash(&path).await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        return (
+                            Err(Arc::new(anyhow::anyhow!(
+                                "Error getting file size and hash: {e}"
+                            ))),
+                            path,
+                        );
+                    }
+                };
+
+                // Create a memory buffer with sufficient capacity for the publish request.
+                let bb = bytes::BytesMut::with_capacity(MAX_SERVER_COMMUNICATION_SIZE);
+
+                // Create a bi-directional stream to the server for this publish request.
+                (
+                    crate::core::publish(&server, bb, hash)
+                        .await
+                        .map(|b| (Arc::new(tokio::sync::Mutex::new(b)), hash, file_size))
+                        .map_err(Arc::new),
+                    path,
+                )
+            },
+            |(r, p)| Message::PublishRequestResulted(r, p),
+        )
+    }
+
+    /// Update after the server has accepted a publish request, or there was an error.
+    fn update_publish_request_resulted(
+        &mut self,
+        result: Result<(Arc<tokio::sync::Mutex<BiStream>>, HashBytes, u64), Arc<anyhow::Error>>,
+        path: PathBuf,
+    ) -> iced::Command<Message> {
+        if let ConnectionState::Connected(ConnectedState { publishes, .. }) =
+            &mut self.connection_state
+        {
+            match result {
+                Ok((stream, hash, file_size)) => {
+                    publishes.push(Publish {
+                        path,
+                        server: stream,
+                        nonce: rand::random(),
+                        hash,
+                        file_size,
+                    });
+                }
+                Err(e) => {
+                    self.status_message = Some(format!("Error publishing {}: {e}", path.display()));
+                }
+            }
+        }
+        iced::Command::none()
+    }
+
+    /// Update after the server has sent a peer to publish to, or there was an error.
+    fn update_publish_peer_received(
+        &mut self,
+        nonce: Nonce,
+        result: Result<SocketAddr, Arc<anyhow::Error>>,
+    ) -> iced::Command<Message> {
+        let ConnectionState::Connected(ConnectedState {
+            endpoint,
+            publishes,
+            ..
+        }) = &mut self.connection_state
+        else {
+            return iced::Command::none();
+        };
+
+        let publish = publishes.iter_mut().find(|p| p.nonce == nonce).cloned();
+        match (result, publish) {
+            (Ok(peer), Some(publish)) => iced::Command::perform(
+                crate::core::udp_holepunch(
+                    FileYeetCommandType::Pub,
+                    publish.hash,
+                    endpoint.clone(),
+                    peer,
+                ),
+                move |r| {
+                    Message::PublishPeerConnectResulted(nonce, r.map(Into::<PeerConnection>::into))
+                },
+            ),
+            (Err(e), _) => {
+                self.status_message = Some(format!("Error receiving peer: {e}"));
+                iced::Command::none()
+            }
+            (_, None) => iced::Command::none(),
+        }
+    }
+
+    /// Update after a connection attempt to a peer for publishing has completed.
+    fn update_publish_peer_connect_resulted(
+        &mut self,
+        pub_nonce: Nonce,
+        peer: Option<PeerConnection>,
+    ) -> iced::Command<Message> {
+        let ConnectionState::Connected(ConnectedState {
+            publishes, uploads, ..
+        }) = &mut self.connection_state
+        else {
+            return iced::Command::none();
+        };
+        let Some(peer) = peer else {
+            return iced::Command::none();
+        };
+        let Some(publish) = publishes.iter().find(|p| p.nonce == pub_nonce) else {
+            return iced::Command::none();
+        };
+
+        let upload_nonce = rand::random();
+        let progress_lock = Arc::new(RwLock::new(0));
+        let cancellation_token = CancellationToken::new();
+        uploads.push(Transfer {
+            hash: publish.hash,
+            hash_hex: faster_hex::hex_string(&publish.hash),
+            path: publish.path.clone(),
+            nonce: upload_nonce,
+            progress: TransferProgress::Transfering(
+                peer.clone(),
+                progress_lock.clone(),
+                publish.file_size,
+                0.,
+            ),
+            cancellation_token: cancellation_token.clone(),
+        });
+
+        let file_path = publish.path.clone();
+        let file_size = publish.file_size;
+        iced::Command::perform(
+            async move {
+                let file = match tokio::fs::File::open(file_path).await {
+                    Ok(f) => f,
+                    Err(e) => anyhow::bail!("Failed to open the file: {e}"),
+                };
+
+                // Prepare a reader for the file to upload.
+                let reader = tokio::io::BufReader::new(file);
+
+                // Try to upload the file to the peer connection.
+                let mut streams = peer.streams.lock().await;
+                Box::pin(crate::core::upload_to_peer(
+                    &mut streams,
+                    file_size,
+                    reader,
+                    Some(progress_lock),
+                ))
+                .await
+            },
+            move |r| {
+                Message::TransferResulted(
+                    upload_nonce,
+                    r.map_err(Arc::new),
+                    FileYeetCommandType::Pub,
+                )
+            },
+        )
     }
 
     /// Update the state after the publish button was clicked. Begins a subscribe request.
@@ -784,9 +1110,9 @@ impl AppState {
         };
 
         // Ensure the client is connected to a server.
-        let ConnectionState::Connected {
+        let ConnectionState::Connected(ConnectedState {
             server, hash_input, ..
-        } = &self.connection_state
+        }) = &self.connection_state
         else {
             return iced::Command::none();
         };
@@ -829,12 +1155,12 @@ impl AppState {
                         .map(|file_size| (PeerConnection::new(c, b), file_size))
                 }
 
-                if let ConnectionState::Connected {
+                if let ConnectionState::Connected(ConnectedState {
                     endpoint,
                     hash_input,
-                    transfers,
+                    downloads: transfers,
                     ..
-                } = &mut self.connection_state
+                }) = &mut self.connection_state
                 {
                     // Let the user know why nothing else is happening.
                     if peers.is_empty() {
@@ -854,6 +1180,7 @@ impl AppState {
                             path: path.clone(),
                             nonce,
                             progress: TransferProgress::Connecting,
+                            cancellation_token: CancellationToken::new(),
                         };
 
                         // New connection attempt for this peer with result command identified by the nonce.
@@ -901,7 +1228,7 @@ impl AppState {
                 }
             }
             Err(e) => {
-                self.status_message = Some(format!("Error subscribing to the server: {e:?}"));
+                self.status_message = Some(format!("Error subscribing to the server: {e}"));
                 iced::Command::none()
             }
         }
@@ -913,7 +1240,11 @@ impl AppState {
         nonce: Nonce,
         result: Option<(PeerConnection, u64)>,
     ) -> iced::Command<Message> {
-        let ConnectionState::Connected { transfers, .. } = &mut self.connection_state else {
+        let ConnectionState::Connected(ConnectedState {
+            downloads: transfers,
+            ..
+        }) = &mut self.connection_state
+        else {
             return iced::Command::none();
         };
 
@@ -935,7 +1266,11 @@ impl AppState {
 
     /// Tell the peer to send the file and begin recieving and writing the file.
     fn update_accept_download(&mut self, nonce: Nonce) -> iced::Command<Message> {
-        let ConnectionState::Connected { transfers, .. } = &mut self.connection_state else {
+        let ConnectionState::Connected(ConnectedState {
+            downloads: transfers,
+            ..
+        }) = &mut self.connection_state
+        else {
             return iced::Command::none();
         };
 
@@ -963,7 +1298,7 @@ impl AppState {
 
         iced::Command::perform(
             async move {
-                let mut peer_streams_lock = peer_streams.streams.write().await;
+                let mut peer_streams_lock = peer_streams.streams.lock().await;
                 Box::pin(crate::core::download_from_peer(
                     hash,
                     &mut peer_streams_lock,
@@ -974,16 +1309,40 @@ impl AppState {
                 .await
                 .map_err(|e| Arc::new(anyhow::anyhow!("Download failed: {e}")))
             },
-            move |r| Message::TransferResulted(nonce, r),
+            move |r| Message::TransferResulted(nonce, r, FileYeetCommandType::Sub),
         )
     }
 
     /// Update the state after a transfer was cancelled.
-    fn update_cancel_transfer(&mut self, nonce: Nonce) -> iced::Command<Message> {
-        if let ConnectionState::Connected { transfers, .. } = &mut self.connection_state {
+    fn update_cancel_publish(&mut self, nonce: Nonce) -> iced::Command<Message> {
+        if let ConnectionState::Connected(ConnectedState { publishes, .. }) =
+            &mut self.connection_state
+        {
+            if let Some(p) = publishes.iter_mut().find(|p| p.nonce == nonce) {
+                // TODO:
+            }
+        }
+        iced::Command::none()
+    }
+
+    /// Update the state after a transfer was cancelled.
+    fn update_cancel_transfer(
+        &mut self,
+        nonce: Nonce,
+        transfer_type: FileYeetCommandType,
+    ) -> iced::Command<Message> {
+        if let ConnectionState::Connected(ConnectedState {
+            downloads, uploads, ..
+        }) = &mut self.connection_state
+        {
+            let transfers = match transfer_type {
+                FileYeetCommandType::Sub => downloads,
+                FileYeetCommandType::Pub => uploads,
+            };
             if let Some(t) = transfers.iter_mut().find(|t| t.nonce == nonce) {
                 // Politely close the connection.
                 if let TransferProgress::Consent(c, _) = &t.progress {
+                    // TODO: Use a cancellation token to safely close the worker task.
                     c.connection
                         .close(GOODBYE_CODE, "Cancelling transfer".as_bytes());
                 }
@@ -997,8 +1356,10 @@ impl AppState {
 
     /// Try to safely close the application.
     fn safely_close(&mut self) -> iced::Command<Message> {
-        // TODO: Ensure current uploads/downloads are gracefully closed.(/paused?)
-        if let ConnectionState::Connected { endpoint, .. } = &mut self.connection_state {
+        // TODO: Allow current downloads to be recontinued after a restart.
+        if let ConnectionState::Connected(ConnectedState { endpoint, .. }) =
+            &mut self.connection_state
+        {
             endpoint.close(GOODBYE_CODE, GOODBYE_MESSAGE.as_bytes());
         };
 

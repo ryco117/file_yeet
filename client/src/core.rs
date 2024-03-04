@@ -7,7 +7,9 @@ use std::{
 };
 
 use bytes::BufMut as _;
-use file_yeet_shared::{local_now_fmt, HashBytes, SocketAddrHelper, MAX_SERVER_COMMUNICATION_SIZE};
+use file_yeet_shared::{
+    local_now_fmt, BiStream, HashBytes, SocketAddrHelper, MAX_SERVER_COMMUNICATION_SIZE,
+};
 use sha2::Digest as _;
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
 
@@ -34,7 +36,7 @@ pub enum PortMappingConfig {
 }
 
 /// The command relationship between the two peers. Useful for asserting synchronization roles based on the command type.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum FileYeetCommandType {
     Pub,
     Sub,
@@ -60,7 +62,7 @@ pub async fn prepare_server_connection(
     let (server_cert, server_key) = file_yeet_shared::generate_self_signed_cert()
         .expect("Failed to generate self-signed certificate");
     let mut server_config = quinn::ServerConfig::with_single_cert(vec![server_cert], server_key)
-        .expect("Quinn failed to accept the server certificates");
+        .expect("Quinn failed to accept our generated certificates");
 
     // Set custom keep alive policies.
     server_config.transport_config(file_yeet_shared::server_transport_config());
@@ -295,7 +297,8 @@ pub async fn read_publish_response(
     let data_len = server_recv
         .read_u16()
         .await
-        .expect("Failed to read a u16 response from the server") as usize;
+        .map_err(|e| anyhow::anyhow!("Failed to read response from the server: {e}"))?
+        as usize;
     if data_len == 0 {
         anyhow::bail!("Server encountered and error");
     }
@@ -698,9 +701,10 @@ pub async fn file_size_and_hash(file_path: &Path) -> anyhow::Result<(u64, HashBy
 
 /// Upload the file to the peer. Ensure they consent to the file size before sending the file.
 pub async fn upload_to_peer(
-    mut peer_streams: BiStream,
+    peer_streams: &mut BiStream,
     file_size: u64,
     mut reader: tokio::io::BufReader<tokio::fs::File>,
+    byte_progress: Option<Arc<RwLock<u64>>>,
 ) -> anyhow::Result<()> {
     // Ensure that the file reader is at the start before the upload.
     reader.rewind().await?;
@@ -717,6 +721,8 @@ pub async fn upload_to_peer(
 
     // Create a scratch space for reading data from the stream.
     let mut buf = [0; MAX_PEER_COMMUNICATION_SIZE];
+    let mut bytes_read = 0;
+
     // Read from the file and write to the peer.
     loop {
         // Read a natural amount of bytes from the file.
@@ -727,6 +733,17 @@ pub async fn upload_to_peer(
 
         // Write the bytes to the peer.
         peer_streams.send.write_all(&buf[..n]).await?;
+
+        // Update the number of bytes read.
+        bytes_read += n as u64;
+
+        // Update the caller with the number of bytes sent to the peer.
+        if let Some(progress) = byte_progress.as_ref() {
+            *progress
+                .write()
+                .map_err(|e| anyhow::anyhow!("Upload progress lock was poisoned: {e}"))? =
+                bytes_read;
+        }
     }
 
     // Greacefully close our connection after all data has been sent.
@@ -792,16 +809,4 @@ fn configure_peer_verification() -> quinn::ClientConfig {
     client_config.transport_config(Arc::new(transport_config));
 
     client_config
-}
-
-/// Helper type for grouping a bi-directional stream, instead of the default tuple type.
-#[derive(Debug)]
-pub struct BiStream {
-    pub send: quinn::SendStream,
-    pub recv: quinn::RecvStream,
-}
-impl From<(quinn::SendStream, quinn::RecvStream)> for BiStream {
-    fn from((send, recv): (quinn::SendStream, quinn::RecvStream)) -> Self {
-        Self { send, recv }
-    }
 }

@@ -1,14 +1,15 @@
-use core::{BiStream, PreparedConnection};
 use std::{io::Write as _, num::NonZeroU16, path::Path, time::Duration};
 
 use file_yeet_shared::{
-    local_now_fmt, HashBytes, GOODBYE_CODE, GOODBYE_MESSAGE, MAX_SERVER_COMMUNICATION_SIZE,
+    local_now_fmt, BiStream, HashBytes, GOODBYE_CODE, GOODBYE_MESSAGE,
+    MAX_SERVER_COMMUNICATION_SIZE,
 };
 use futures_util::{stream::FuturesUnordered, StreamExt};
 use iced::Application;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio_util::sync::CancellationToken;
 
-use crate::core::humanize_bytes;
+use crate::core::{humanize_bytes, FileYeetCommandType, PreparedConnection};
 
 mod core;
 mod gui;
@@ -48,6 +49,7 @@ struct Cli {
 enum FileYeetCommand {
     /// Publish a file to the server.
     Pub { file_path: String },
+
     /// Subscribe to a file from the server.
     Sub {
         sha256_hex: String,
@@ -166,11 +168,13 @@ async fn publish_command(
     } = prepared_connection;
 
     // Allow the publish loop to be cancelled by a Ctrl-C signal.
+    let cancellation_token = CancellationToken::new();
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             println!("{} Ctrl-C detected, cancelling the publish", local_now_fmt());
+            cancellation_token.cancel();
         }
-        r = publish_loop(endpoint, server_connection.clone(), bb, hash, file_size, file_path) => return r
+        r = publish_loop(endpoint, server_connection, bb, hash, file_size, file_path, cancellation_token.clone()) => return r
     }
 
     Ok(())
@@ -224,7 +228,7 @@ async fn subscribe_command(
     let mut connection_attempts = FuturesUnordered::new();
     for peer_address in peers.drain(..) {
         connection_attempts.push(core::udp_holepunch(
-            core::FileYeetCommandType::Sub,
+            FileYeetCommandType::Sub,
             hash,
             endpoint.clone(),
             peer_address,
@@ -287,17 +291,15 @@ async fn subscribe_command(
 /// Enter a loop to listen for the server to send peer socket addresses requesting our publish.
 async fn publish_loop(
     endpoint: &quinn::Endpoint,
-    server_connection: quinn::Connection,
+    server_connection: &quinn::Connection,
     bb: bytes::BytesMut,
     hash: HashBytes,
     file_size: u64,
     file_path: &Path,
+    cancellation_token: CancellationToken,
 ) -> anyhow::Result<()> {
     // Create a bi-directional stream to the server.
-    let mut server_streams: BiStream = crate::core::publish(&server_connection, bb, hash).await?;
-
-    // Close the stream after completing the publish request.
-    let _ = server_streams.send.finish().await;
+    let mut server_streams: BiStream = crate::core::publish(server_connection, bb, hash).await?;
 
     // Enter a loop to listen for the server to send peer connections.
     loop {
@@ -313,31 +315,47 @@ async fn publish_loop(
             break;
         };
 
-        // Attempt to connect to the peer using UDP hole punching.
-        // TODO: Use tasks to handle multiple publish requests concurrently.
-        let Some((_peer_connection, peer_streams)) = core::udp_holepunch(
-            core::FileYeetCommandType::Pub,
-            hash,
-            endpoint.clone(),
-            peer_address,
-        )
-        .await
-        else {
-            eprintln!("{} Failed to connect to peer", local_now_fmt());
-            continue;
-        };
+        let cancellation_token = cancellation_token.clone();
+        let endpoint = endpoint.clone();
+        let file_path = file_path.to_path_buf();
+        tokio::task::spawn(async move {
+            tokio::select! {
+                // Ensure the publish tasks are cancellable.
+                () = cancellation_token.cancelled() => {}
 
-        // Prepare a reader for the file to upload.
-        let reader = tokio::io::BufReader::new(
-            tokio::fs::File::open(file_path)
-                .await
-                .expect("Failed to open the file"),
-        );
+                // Try to connect to the peer and upload the file.
+                () = async move {
+                    // Attempt to connect to the peer using UDP hole punching.
+                    let Some((_peer_connection, mut peer_streams)) = core::udp_holepunch(
+                        FileYeetCommandType::Pub,
+                        hash,
+                        endpoint,
+                        peer_address,
+                    )
+                    .await
+                    else {
+                        eprintln!("{} Failed to connect to peer", local_now_fmt());
+                        return;
+                    };
 
-        // Try to upload the file to the peer connection.
-        if let Err(e) = Box::pin(core::upload_to_peer(peer_streams, file_size, reader)).await {
-            eprintln!("{} Failed to upload to peer: {e}", local_now_fmt());
-        }
+                    let file = match tokio::fs::File::open(file_path).await {
+                        Ok(f) => f,
+                        Err(e) => {
+                            eprintln!("{} Failed to open the file: {e}", local_now_fmt());
+                            return;
+                        }
+                    };
+
+                    // Prepare a reader for the file to upload.
+                    let reader = tokio::io::BufReader::new(file);
+
+                    // Try to upload the file to the peer connection.
+                    if let Err(e) = Box::pin(core::upload_to_peer(&mut peer_streams, file_size, reader, None)).await {
+                        eprintln!("{} Failed to upload to peer: {e}", local_now_fmt());
+                    }
+                } => {}
+            }
+        });
     }
 
     Ok(println!("{} Server connection closed", local_now_fmt()))
