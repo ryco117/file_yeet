@@ -13,7 +13,7 @@ use file_yeet_shared::{
 };
 use futures_util::SinkExt;
 use iced::{widget, window, Element};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt as _};
 use tokio_util::sync::CancellationToken;
 
 use crate::core::{
@@ -70,7 +70,7 @@ impl From<(quinn::Connection, BiStream)> for PeerConnection {
 
 /// The result of a file transfer with a peer.
 #[derive(Clone, Debug, displaydoc::Display)]
-enum TransferResult {
+pub enum TransferResult {
     /// The transfer succeeded.
     Success,
 
@@ -111,7 +111,9 @@ struct Publish {
     pub server: Arc<tokio::sync::Mutex<BiStream>>,
     pub nonce: Nonce,
     pub hash: HashBytes,
+    pub hash_hex: String,
     pub file_size: u64,
+    pub cancellation_token: CancellationToken,
 }
 
 /// The state of the connection to a `file_yeet` server and peers.
@@ -234,6 +236,9 @@ pub enum Message {
     // A download was accepted, initiate the download.
     AcceptDownload(Nonce),
 
+    /// Copy a hash to the clipboard.
+    CopyHash(String),
+
     /// Cancel publishing a file.
     CancelPublish(Nonce),
 
@@ -241,7 +246,7 @@ pub enum Message {
     CancelTransfer(Nonce, FileYeetCommandType),
 
     /// The result of a download attempt.
-    TransferResulted(Nonce, Result<(), Arc<anyhow::Error>>, FileYeetCommandType),
+    TransferResulted(Nonce, TransferResult, FileYeetCommandType),
 
     /// A completed download is being removed from the list.
     RemoveFromTransfers(Nonce, FileYeetCommandType),
@@ -381,10 +386,11 @@ impl iced::Application for AppState {
             // Handle the download being accepted, initiate the download.
             Message::AcceptDownload(nonce) => self.update_accept_download(nonce),
 
-            Message::CancelPublish(nonce) => {
-                // TODO: Allow cancelling a publish request without disconnecting from the server.
-                iced::Command::none()
-            }
+            // Copy a hash to the clipboard.
+            Message::CopyHash(hash) => iced::clipboard::write(hash),
+
+            // Set the cancellation token to notify the publishing thread to cancel.
+            Message::CancelPublish(nonce) => self.update_cancel_publish(nonce),
 
             // Handle a transfer being cancelled.
             Message::CancelTransfer(nonce, transfer_type) => {
@@ -393,26 +399,7 @@ impl iced::Application for AppState {
 
             // Handle the conclusive result of a transfer.
             Message::TransferResulted(nonce, r, transfer_type) => {
-                if let ConnectionState::Connected(ConnectedState {
-                    downloads, uploads, ..
-                }) = &mut self.connection_state
-                {
-                    let update_transfers = |transfers: &mut Vec<Transfer>| {
-                        if let Some(t) = transfers.iter_mut().find(|t| t.nonce == nonce) {
-                            t.progress = TransferProgress::Done(
-                                r.map_or_else(TransferResult::Failure, |()| {
-                                    TransferResult::Success
-                                }),
-                            );
-                        }
-                    };
-
-                    match transfer_type {
-                        FileYeetCommandType::Sub => update_transfers(downloads),
-                        FileYeetCommandType::Pub => update_transfers(uploads),
-                    }
-                }
-                iced::Command::none()
+                self.update_transfer_resulted(nonce, r, transfer_type)
             }
 
             // Handle a transfer being removed from the downloads list.
@@ -476,17 +463,30 @@ impl iced::Application for AppState {
                         loop {
                             let mut server = publish.server.lock().await;
 
-                            // Await the server to send a peer connection.
-                            if let Err(e) = output
-                                .send(Message::PublishPeerReceived(
-                                    publish.nonce,
-                                    crate::core::read_publish_response(&mut server.recv)
+                            tokio::select! {
+                                // Let the task be cancelled.
+                                () = publish.cancellation_token.cancelled() => {
+                                    if let Err(e) = server.send.write_u8(0).await {
+                                        eprintln!("{} Failed to cancel publish: {e}", local_now_fmt());
+                                    }
+
+                                    // Provide a brief wait for the task to be cancelled.
+                                    tokio::time::sleep(Duration::from_millis(200)).await;
+                                    println!("{} Dead publish task is still running...", local_now_fmt());
+                                }
+
+                                // Await the server to send a peer connection.
+                                result = crate::core::read_publish_response(&mut server.recv) => {
+                                    if let Err(e) = output
+                                        .send(Message::PublishPeerReceived(
+                                            publish.nonce,
+                                            result.map_err(Arc::new),
+                                        ))
                                         .await
-                                        .map_err(Arc::new),
-                                ))
-                                .await
-                            {
-                                eprintln!("{} Failed to send publish peer: {e}", local_now_fmt());
+                                    {
+                                        eprintln!("{} Failed to perform internal message passing: {e}", local_now_fmt());
+                                    }
+                                }
                             }
                         }
                     })
@@ -742,13 +742,16 @@ impl AppState {
         let pubs = widget::column(pubs.iter().map(|p: &Publish| {
             widget::container(
                 widget::row!(
-                    widget::text(&p.path.to_string_lossy()).size(12),
+                    widget::column!(
+                        widget::text(&p.hash_hex).size(12),
+                        widget::text(&p.path.to_string_lossy()).size(12)
+                    ),
+                    widget::button("Copy Hash").on_press(Message::CopyHash(p.hash_hex.clone())),
                     widget::button("Cancel").on_press(Message::CancelPublish(p.nonce))
                 )
                 .spacing(6),
             )
             .style(iced::theme::Container::Box)
-            .width(iced::Length::Fill)
             .padding(6)
             .into()
         }));
@@ -980,12 +983,15 @@ impl AppState {
         {
             match result {
                 Ok((stream, hash, file_size)) => {
+                    let cancellation_token = CancellationToken::new();
                     publishes.push(Publish {
                         path,
                         server: stream,
                         nonce: rand::random(),
                         hash,
+                        hash_hex: faster_hex::hex_string(&hash),
                         file_size,
+                        cancellation_token,
                     });
                 }
                 Err(e) => {
@@ -1074,7 +1080,11 @@ impl AppState {
             async move {
                 let file = match tokio::fs::File::open(file_path).await {
                     Ok(f) => f,
-                    Err(e) => anyhow::bail!("Failed to open the file: {e}"),
+                    Err(e) => {
+                        return TransferResult::Failure(Arc::new(anyhow::anyhow!(
+                            "Failed to open the file: {e}"
+                        )))
+                    }
                 };
 
                 // Prepare a reader for the file to upload.
@@ -1082,21 +1092,21 @@ impl AppState {
 
                 // Try to upload the file to the peer connection.
                 let mut streams = peer.streams.lock().await;
-                Box::pin(crate::core::upload_to_peer(
-                    &mut streams,
-                    file_size,
-                    reader,
-                    Some(progress_lock),
-                ))
-                .await
+
+                tokio::select! {
+                    () = cancellation_token.cancelled() => TransferResult::Cancelled,
+                    result = Box::pin(crate::core::upload_to_peer(
+                        &mut streams,
+                        file_size,
+                        reader,
+                        Some(progress_lock),
+                    )) => match result {
+                        Ok(()) => TransferResult::Success,
+                        Err(e) => TransferResult::Failure(Arc::new(e)),
+                    }
+                }
             },
-            move |r| {
-                Message::TransferResulted(
-                    upload_nonce,
-                    r.map_err(Arc::new),
-                    FileYeetCommandType::Pub,
-                )
-            },
+            move |r| Message::TransferResulted(upload_nonce, r, FileYeetCommandType::Pub),
         )
     }
 
@@ -1295,19 +1305,29 @@ impl AppState {
             0.,
         );
         let output_path = transfer.path.clone();
+        let cancellation_token = transfer.cancellation_token.clone();
 
         iced::Command::perform(
             async move {
                 let mut peer_streams_lock = peer_streams.streams.lock().await;
-                Box::pin(crate::core::download_from_peer(
-                    hash,
-                    &mut peer_streams_lock,
-                    file_size,
-                    &output_path,
-                    Some(byte_progress),
-                ))
-                .await
-                .map_err(|e| Arc::new(anyhow::anyhow!("Download failed: {e}")))
+                tokio::select! {
+                    // Let the transfer be cancelled. This is not an error if cancelled.
+                    () = cancellation_token.cancelled() => TransferResult::Cancelled,
+
+                    // Await the file to be downloaded.
+                    result = Box::pin(crate::core::download_from_peer(
+                        hash,
+                        &mut peer_streams_lock,
+                        file_size,
+                        &output_path,
+                        Some(byte_progress),
+                    )) => {
+                        match result {
+                            Ok(()) => TransferResult::Success,
+                            Err(e) => TransferResult::Failure(Arc::new(anyhow::anyhow!("Download failed: {e}"))),
+                        }
+                    }
+                }
             },
             move |r| Message::TransferResulted(nonce, r, FileYeetCommandType::Sub),
         )
@@ -1318,8 +1338,12 @@ impl AppState {
         if let ConnectionState::Connected(ConnectedState { publishes, .. }) =
             &mut self.connection_state
         {
-            if let Some(p) = publishes.iter_mut().find(|p| p.nonce == nonce) {
-                // TODO:
+            if let Some(i) = publishes.iter().position(|p| p.nonce == nonce) {
+                // Cancel the publish task.
+                publishes[i].cancellation_token.cancel();
+
+                // Remove the publish from the list of publishes.
+                publishes.remove(i);
             }
         }
         iced::Command::none()
@@ -1340,15 +1364,36 @@ impl AppState {
                 FileYeetCommandType::Pub => uploads,
             };
             if let Some(t) = transfers.iter_mut().find(|t| t.nonce == nonce) {
-                // Politely close the connection.
-                if let TransferProgress::Consent(c, _) = &t.progress {
-                    // TODO: Use a cancellation token to safely close the worker task.
-                    c.connection
-                        .close(GOODBYE_CODE, "Cancelling transfer".as_bytes());
-                }
+                // Cancel the download task.
+                t.cancellation_token.cancel();
 
-                // Set the transfer to a cancelled state.
-                t.progress = TransferProgress::Done(TransferResult::Cancelled);
+                // If waiting for user interaction, mark the transfer as cancelled.
+                if let TransferProgress::Consent(_, _) = &t.progress {
+                    t.progress = TransferProgress::Done(TransferResult::Cancelled);
+                }
+            }
+        }
+        iced::Command::none()
+    }
+
+    /// Update the state after a transfer was completed.
+    fn update_transfer_resulted(
+        &mut self,
+        nonce: Nonce,
+        result: TransferResult,
+        transfer_type: FileYeetCommandType,
+    ) -> iced::Command<Message> {
+        if let ConnectionState::Connected(ConnectedState {
+            downloads, uploads, ..
+        }) = &mut self.connection_state
+        {
+            let mut transfers = match transfer_type {
+                FileYeetCommandType::Sub => downloads.iter_mut(),
+                FileYeetCommandType::Pub => uploads.iter_mut(),
+            };
+
+            if let Some(t) = transfers.find(|t| t.nonce == nonce) {
+                t.progress = TransferProgress::Done(result);
             }
         }
         iced::Command::none()

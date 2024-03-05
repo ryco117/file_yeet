@@ -3,7 +3,8 @@ use std::{collections::HashMap, num::NonZeroU16, sync::Arc};
 use bytes::BufMut as _;
 use clap::Parser;
 use file_yeet_shared::{
-    local_now_fmt, ClientApiRequest, HashBytes, SocketAddrHelper, MAX_SERVER_COMMUNICATION_SIZE,
+    local_now_fmt, BiStream, ClientApiRequest, HashBytes, SocketAddrHelper,
+    MAX_SERVER_COMMUNICATION_SIZE,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -170,13 +171,15 @@ async fn handle_quic_connection(
     loop {
         // Accept a new stream for each client request.
         // QUIC streams are very cheap and multiple streams lends itself to concurrent requests.
-        let (mut quic_send, mut quic_recv) = connection
+        let mut client_streams: BiStream = connection
             .accept_bi()
             .await
-            .map_err(ClientRequestError::Connection)?;
+            .map_err(ClientRequestError::Connection)?
+            .into();
 
         let api = ClientApiRequest::try_from(
-            quic_recv
+            client_streams
+                .recv
                 .read_u16()
                 .await
                 .map_err(ClientRequestError::IoError)?,
@@ -191,13 +194,13 @@ async fn handle_quic_connection(
         match api {
             // Send a ping response to the client.
             // Close the connection if we can't send the response.
-            ClientApiRequest::SocketPing => socket_ping(quic_send, &sock_string).await?,
+            ClientApiRequest::SocketPing => socket_ping(client_streams.send, &sock_string).await?,
 
             // Update the client's address string with the new port.
             // Close the connection if we can't read the new port.
             ClientApiRequest::PortOverride => {
                 port_override(
-                    quic_recv,
+                    client_streams.recv,
                     &sock_string,
                     socket_addr,
                     &mut port_used,
@@ -210,16 +213,19 @@ async fn handle_quic_connection(
             // Close the connection if we can't read the file hash.
             ClientApiRequest::Publish => {
                 let mut hash = HashBytes::default();
-                quic_recv.read_exact(&mut hash).await.map_err(|_| {
-                    ClientRequestError::IoError(std::io::Error::from(
-                        std::io::ErrorKind::UnexpectedEof,
-                    ))
-                })?;
+                client_streams
+                    .recv
+                    .read_exact(&mut hash)
+                    .await
+                    .map_err(|_| {
+                        ClientRequestError::IoError(std::io::Error::from(
+                            std::io::ErrorKind::UnexpectedEof,
+                        ))
+                    })?;
 
                 // Now that we have the peer's socket address and the file hash, we can handle the publish request.
                 handle_publish(
-                    quic_send,
-                    quic_recv,
+                    client_streams,
                     sock_string.clone(),
                     nonce,
                     hash,
@@ -234,14 +240,25 @@ async fn handle_quic_connection(
             // Close the connection if we can't complete the request.
             ClientApiRequest::Subscribe => {
                 let mut hash = HashBytes::default();
-                quic_recv.read_exact(&mut hash).await.map_err(|_| {
-                    ClientRequestError::IoError(std::io::Error::from(
-                        std::io::ErrorKind::UnexpectedEof,
-                    ))
-                })?;
+                client_streams
+                    .recv
+                    .read_exact(&mut hash)
+                    .await
+                    .map_err(|_| {
+                        ClientRequestError::IoError(std::io::Error::from(
+                            std::io::ErrorKind::UnexpectedEof,
+                        ))
+                    })?;
 
                 // Now that we have the peer's socket address and the file hash, we can handle the subscribe request.
-                handle_subscribe(&mut quic_send, &sock_string, hash, &publishers, &mut bb).await?;
+                handle_subscribe(
+                    &mut client_streams.send,
+                    &sock_string,
+                    hash,
+                    &publishers,
+                    &mut bb,
+                )
+                .await?;
             }
         }
         // Clear the scratch space before the next iteration.
@@ -314,8 +331,7 @@ async fn port_override(
 
 /// Handle QUIC connections for clients that want to publish a new file hash.
 async fn handle_publish(
-    client_send: quinn::SendStream,
-    mut client_recv: quinn::RecvStream,
+    mut client_streams: BiStream,
     sock_string: Arc<RwLock<String>>,
     session_nonce: Nonce,
     hash: HashBytes,
@@ -345,11 +361,12 @@ async fn handle_publish(
     async fn handle_publish_inner(
         mut quic_send: quinn::SendStream,
         mut rx: mpsc::Receiver<String>,
-        sock_string: Arc<RwLock<String>>,
+        sock_string: &Arc<RwLock<String>>,
+        hash_hex: &str,
     ) {
         #[cfg(debug_assertions)]
         println!(
-            "{} Starting subscribe task for client {}",
+            "{} Starting publish task for client {} {hash_hex}",
             local_now_fmt(),
             sock_string.read().await,
         );
@@ -401,19 +418,27 @@ async fn handle_publish(
     // Create a cancellable task to handle the client's publish request.
     let mut scratch = [0u8; 1];
     tokio::task::spawn(async move {
+        let hash_hex = faster_hex::hex_string(&hash);
+
         tokio::select! {
             // Allow the server to cancel the task.
             () = cancellation_token.cancelled() => {}
 
             // Allow the client to cancel their publish request.
-            _ = client_recv.read_exact(&mut scratch) => {}
+            _ = client_streams.recv.read_exact(&mut scratch) => {}
 
             // Handle the client's file-publishing task.
-            () = handle_publish_inner(client_send, rx, sock_string) => {}
+            () = handle_publish_inner(client_streams.send, rx, &sock_string, &hash_hex) => {}
         }
 
         // Remove any reference there may be to this publish task.
         try_remove_publisher(session_nonce, hash, publishers).await;
+
+        println!(
+            "{} Finishing publish task for client {} {hash_hex}",
+            local_now_fmt(),
+            sock_string.read().await,
+        );
     });
 }
 
