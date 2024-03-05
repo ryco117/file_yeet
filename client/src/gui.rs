@@ -108,12 +108,30 @@ struct Transfer {
 #[derive(Clone, Debug)]
 struct Publish {
     pub path: PathBuf,
-    pub server: Arc<tokio::sync::Mutex<BiStream>>,
+    pub server_streams: Arc<tokio::sync::Mutex<BiStream>>,
     pub nonce: Nonce,
     pub hash: HashBytes,
     pub hash_hex: String,
     pub file_size: u64,
     pub cancellation_token: CancellationToken,
+}
+
+/// The result of a publish request. The bi-directional stream maintains the publish session.
+#[derive(Clone, Debug)]
+pub struct IncomingPublishSession {
+    pub server_streams: Arc<tokio::sync::Mutex<BiStream>>,
+    pub hash: HashBytes,
+    pub file_size: u64,
+}
+impl IncomingPublishSession {
+    #[must_use]
+    pub fn new(server_streams: BiStream, hash: HashBytes, file_size: u64) -> Self {
+        Self {
+            server_streams: Arc::new(tokio::sync::Mutex::new(server_streams)),
+            hash,
+            file_size,
+        }
+    }
 }
 
 /// The state of the connection to a `file_yeet` server and peers.
@@ -210,10 +228,7 @@ pub enum Message {
     PublishPathChosen(Option<PathBuf>),
 
     /// The result of a publish request.
-    PublishRequestResulted(
-        Result<(Arc<tokio::sync::Mutex<BiStream>>, HashBytes, u64), Arc<anyhow::Error>>,
-        PathBuf,
-    ),
+    PublishRequestResulted(Result<IncomingPublishSession, Arc<anyhow::Error>>, PathBuf),
 
     /// The result of trying to recieve a peer to publish to from the server.
     PublishPeerReceived(Nonce, Result<SocketAddr, Arc<anyhow::Error>>),
@@ -248,7 +263,10 @@ pub enum Message {
     /// The result of a download attempt.
     TransferResulted(Nonce, TransferResult, FileYeetCommandType),
 
-    /// A completed download is being removed from the list.
+    /// Open the file containing using system defaults.
+    OpenFile(PathBuf),
+
+    /// A completed transfer is being removed from its list.
     RemoveFromTransfers(Nonce, FileYeetCommandType),
 
     /// An unhandled event occurred.
@@ -402,6 +420,14 @@ impl iced::Application for AppState {
                 self.update_transfer_resulted(nonce, r, transfer_type)
             }
 
+            // Handle a file being opened.
+            Message::OpenFile(path) => {
+                open::that(path).unwrap_or_else(|e| {
+                    eprintln!("{} Failed to open file: {e}", local_now_fmt());
+                });
+                iced::Command::none()
+            }
+
             // Handle a transfer being removed from the downloads list.
             Message::RemoveFromTransfers(nonce, transfer_type) => {
                 if let ConnectionState::Connected(ConnectedState {
@@ -461,7 +487,7 @@ impl iced::Application for AppState {
                     // Subscribe to the server for new peers to upload to.
                     iced::subscription::channel(publish.nonce, 10, move |mut output| async move {
                         loop {
-                            let mut server = publish.server.lock().await;
+                            let mut server = publish.server_streams.lock().await;
 
                             tokio::select! {
                                 // Let the task be cancelled.
@@ -676,12 +702,28 @@ impl AppState {
                 )
                 .spacing(6)
                 .into(),
-                TransferProgress::Done(r) => widget::row!(
-                    widget::text(r).width(iced::Length::Fill),
-                    widget::button(widget::text("Remove").size(12))
-                        .on_press(Message::RemoveFromTransfers(t.nonce, transfer_type))
-                )
-                .into(),
+                TransferProgress::Done(r) => {
+                    let remove = widget::button(widget::text("Remove").size(12))
+                        .on_press(Message::RemoveFromTransfers(t.nonce, transfer_type));
+                    widget::row!(
+                        widget::text(r).width(iced::Length::Fill),
+                        if matches!(transfer_type, FileYeetCommandType::Sub)
+                            && matches!(r, TransferResult::Success)
+                        {
+                            Element::<Message>::from(
+                                widget::row!(
+                                    widget::button(widget::text("Open").size(12))
+                                        .on_press(Message::OpenFile(t.path.clone())),
+                                    remove
+                                )
+                                .spacing(12),
+                            )
+                        } else {
+                            remove.into()
+                        },
+                    )
+                    .into()
+                }
             };
 
             widget::container(widget::column!(
@@ -746,10 +788,11 @@ impl AppState {
                         widget::text(&p.hash_hex).size(12),
                         widget::text(&p.path.to_string_lossy()).size(12)
                     ),
+                    widget::horizontal_space(),
                     widget::button("Copy Hash").on_press(Message::CopyHash(p.hash_hex.clone())),
                     widget::button("Cancel").on_press(Message::CancelPublish(p.nonce))
                 )
-                .spacing(6),
+                .spacing(12),
             )
             .style(iced::theme::Container::Box)
             .padding(6)
@@ -963,7 +1006,7 @@ impl AppState {
                 (
                     crate::core::publish(&server, bb, hash)
                         .await
-                        .map(|b| (Arc::new(tokio::sync::Mutex::new(b)), hash, file_size))
+                        .map(|b| IncomingPublishSession::new(b, hash, file_size))
                         .map_err(Arc::new),
                     path,
                 )
@@ -975,18 +1018,22 @@ impl AppState {
     /// Update after the server has accepted a publish request, or there was an error.
     fn update_publish_request_resulted(
         &mut self,
-        result: Result<(Arc<tokio::sync::Mutex<BiStream>>, HashBytes, u64), Arc<anyhow::Error>>,
+        result: Result<IncomingPublishSession, Arc<anyhow::Error>>,
         path: PathBuf,
     ) -> iced::Command<Message> {
         if let ConnectionState::Connected(ConnectedState { publishes, .. }) =
             &mut self.connection_state
         {
             match result {
-                Ok((stream, hash, file_size)) => {
+                Ok(IncomingPublishSession {
+                    server_streams,
+                    hash,
+                    file_size,
+                }) => {
                     let cancellation_token = CancellationToken::new();
                     publishes.push(Publish {
                         path,
-                        server: stream,
+                        server_streams,
                         nonce: rand::random(),
                         hash,
                         hash_hex: faster_hex::hex_string(&hash),
@@ -1368,7 +1415,7 @@ impl AppState {
                 t.cancellation_token.cancel();
 
                 // If waiting for user interaction, mark the transfer as cancelled.
-                if let TransferProgress::Consent(_, _) = &t.progress {
+                if matches!(t.progress, TransferProgress::Consent(_, _)) {
                     t.progress = TransferProgress::Done(TransferResult::Cancelled);
                 }
             }
