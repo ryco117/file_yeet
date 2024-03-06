@@ -671,14 +671,33 @@ pub async fn download_from_peer(
 }
 
 /// Get a file's size and its SHA-256 hash.
-pub async fn file_size_and_hash(file_path: &Path) -> anyhow::Result<(u64, HashBytes)> {
+#[allow(clippy::cast_precision_loss)]
+pub async fn file_size_and_hash(
+    file_path: &Path,
+    progress: Option<Arc<RwLock<f32>>>,
+) -> anyhow::Result<(u64, HashBytes)> {
     let mut hasher = sha2::Sha256::new();
     let mut reader = tokio::io::BufReader::new(
         tokio::fs::File::open(file_path)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to open the file: {e}"))?,
     );
+
+    // Get the file size so we can report progress.
+    let file_size = reader
+        .seek(std::io::SeekFrom::End(0))
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to seek in file: {e}"))?;
+
+    // Reset the reader to the start of the file.
+    reader
+        .seek(std::io::SeekFrom::Start(0))
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to seek in file: {e}"))?;
+
+    let size_float = file_size as f32;
     let mut hash_byte_buffer = [0; 8192];
+    let mut bytes_hashed = 0;
     loop {
         let n = reader
             .read(&mut hash_byte_buffer)
@@ -689,11 +708,16 @@ pub async fn file_size_and_hash(file_path: &Path) -> anyhow::Result<(u64, HashBy
         }
 
         hasher.update(&hash_byte_buffer[..n]);
+        bytes_hashed += n;
+
+        // Update the caller with the number of bytes read.
+        if let Some(progress) = progress.as_ref() {
+            *progress
+                .write()
+                .map_err(|e| anyhow::anyhow!("Progress lock was poisoned: {e}"))? =
+                bytes_hashed as f32 / size_float;
+        }
     }
-    let file_size = reader
-        .seek(tokio::io::SeekFrom::End(0))
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to seek to the end of the file: {e}"))?;
     let hash: HashBytes = hasher.finalize().into();
 
     Ok((file_size, hash))

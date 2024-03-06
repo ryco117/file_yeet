@@ -148,7 +148,7 @@ async fn publish_command(
     file_path: String,
 ) -> anyhow::Result<()> {
     let file_path = std::path::Path::new(&file_path);
-    let (file_size, hash) = match core::file_size_and_hash(file_path).await {
+    let (file_size, hash) = match core::file_size_and_hash(file_path, None).await {
         Ok(t) => t,
         Err(e) => anyhow::bail!("Failed to hash file: {e}"),
     };

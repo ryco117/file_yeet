@@ -21,6 +21,7 @@ open = "5.1"
 quinn = "0.10"
 rand = "0.8"
 regex = "1.10"
+replace_with = "0.1"
 rfd = "0.14"
 rustls = { version = "0.21", features = ["dangerous_configuration", "quic"] }
 sha2 = "0.10"
