@@ -3,7 +3,7 @@ use std::{collections::HashMap, num::NonZeroU16, sync::Arc};
 use bytes::BufMut as _;
 use clap::Parser;
 use file_yeet_shared::{
-    local_now_fmt, BiStream, ClientApiRequest, HashBytes, SocketAddrHelper,
+    local_now_fmt, BiStream, ClientApiRequest, HashBytes, SocketAddrHelper, GOODBYE_CODE,
     MAX_SERVER_COMMUNICATION_SIZE,
 };
 use tokio::{
@@ -127,10 +127,19 @@ async fn handle_incoming_loop(
                     client_disconnect_token.cancel();
 
                     if let Err(e) = r {
-                        eprintln!(
-                            "{} Failed to handle client connection: {e}",
-                            local_now_fmt()
-                        );
+                        match e {
+                            // Check for a graceful disconnect.
+                            ClientRequestError::Connection(quinn::ConnectionError::ApplicationClosed(r)) if r.error_code == GOODBYE_CODE => {
+                                #[cfg(debug_assertions)]
+                                println!("{} Client gracefully disconnected: {r}", local_now_fmt());
+                            }
+
+                            // If the client didn't gracefully disconnected, print the error.
+                            e => eprintln!(
+                                "{} Failed to handle client connection: {e}",
+                                local_now_fmt()
+                            ),
+                        }
                     }
                 }
             }

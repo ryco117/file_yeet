@@ -42,12 +42,13 @@ pub enum FileYeetCommandType {
     Sub,
 }
 
-/// A prepared server connection, local QUIC endpoint, and optional port mapping.
+/// A prepared server connection with relevant server connection info.
 #[derive(Clone, Debug)]
 pub struct PreparedConnection {
     pub endpoint: quinn::Endpoint,
     pub server_connection: quinn::Connection,
     pub port_mapping: Option<crab_nat::PortMapping>,
+    pub external_address: String,
 }
 
 /// Create a QUIC endpoint connected to the server and perform basic setup.
@@ -157,13 +158,14 @@ pub async fn prepare_server_connection(
     };
 
     // Read the server's response to the sanity check.
-    let (sanity_check_addr, sanity_check) = socket_ping_request(&connection).await?;
+    let (mut sanity_check_addr, sanity_check) = socket_ping_request(&connection).await?;
     println!("{} Server sees us as {sanity_check}", local_now_fmt());
 
     if let Some(port) = port_override {
         // Only send a port override request if the server sees us through a different port.
         if sanity_check_addr.port() != port.get() {
             port_override_request(&connection, port, bb).await?;
+            sanity_check_addr.set_port(port.get());
         }
     }
 
@@ -171,6 +173,7 @@ pub async fn prepare_server_connection(
         endpoint,
         server_connection: connection,
         port_mapping,
+        external_address: sanity_check_addr.to_string(),
     })
 }
 

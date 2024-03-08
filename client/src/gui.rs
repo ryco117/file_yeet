@@ -25,7 +25,7 @@ use crate::core::{
 /// Produces match groups `host` and `port` for the server address and optional port.
 static SERVER_ADDRESS_REGEX: once_cell::sync::Lazy<regex::Regex> =
     once_cell::sync::Lazy::new(|| {
-        regex::Regex::new(r"^\s*(?P<host>[^:]+)(?::(?P<port>\d+))?\s*$").unwrap()
+        regex::Regex::new(r"^\s*(?P<host>([^:]|::)+)(?::(?P<port>\d+))?\s*$").unwrap()
     });
 
 /// The maximum time to wait before forcing the application to exit.
@@ -38,7 +38,7 @@ const ERROR_RED_COLOR: iced::Color = iced::Color::from_rgb(1., 0.4, 0.5);
 const PORT_MAPPING_OPTION_LABELS: [&str; 3] = ["None", "Port forward", "NAT-PMP / PCP"];
 
 /// The state of the port mapping options in the GUI.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Deserialize, serde::Serialize)]
 enum PortMappingGuiOptions {
     #[default]
     None,
@@ -96,10 +96,11 @@ type Nonce = u64;
 /// A file transfer with a peer in any state.
 #[derive(Debug)]
 struct Transfer {
+    pub nonce: Nonce,
     pub hash: HashBytes,
     pub hash_hex: String,
+    pub peer_string: String,
     pub path: PathBuf,
-    pub nonce: Nonce,
     pub progress: TransferProgress,
     pub cancellation_token: CancellationToken,
 }
@@ -117,6 +118,7 @@ struct Publish {
 }
 
 /// The state of a file publish request. Either hashing or successfully publishing.
+// TODO: Use a struct for  the main PublishItem and have a enum for the result to allow cancelling, etc. See `Transfer`.
 #[derive(Clone, Debug)]
 enum PublishItem {
     Hashing(Nonce, Arc<RwLock<f32>>, CancellationToken),
@@ -196,6 +198,9 @@ struct ConnectedState {
     /// Connection with the server.
     server: quinn::Connection,
 
+    /// The external address of the client, as seen from the server.
+    external_address: String,
+
     /// The hash input field for creating new subscribe requests.
     hash_input: String,
 
@@ -209,10 +214,11 @@ struct ConnectedState {
     uploads: Vec<Transfer>,
 }
 impl ConnectedState {
-    fn new(endpoint: quinn::Endpoint, server: quinn::Connection) -> Self {
+    fn new(endpoint: quinn::Endpoint, server: quinn::Connection, external_address: String) -> Self {
         Self {
             endpoint,
             server,
+            external_address,
             hash_input: String::new(),
             downloads: Vec::new(),
             publishes: Vec::new(),
@@ -235,19 +241,23 @@ enum ConnectionState {
     Connected(ConnectedState),
 }
 
+/// The current settings for the app.
+#[derive(Default, serde::Deserialize, serde::Serialize)]
+struct AppSettings {
+    pub server_address: String,
+    pub port_forwarding_text: String,
+    pub port_mapping: PortMappingGuiOptions,
+}
+
 /// The state of the application for interacting with the GUI.
 #[derive(Default)]
 pub struct AppState {
     connection_state: ConnectionState,
-    server_address: String,
+    options: AppSettings,
     status_message: Option<String>,
     modal: bool,
     safely_closing: bool,
     port_mapping: Option<crab_nat::PortMapping>,
-
-    // TODO: Separate into "state options" struct or similar.
-    port_forwarding_text: String,
-    port_mapping_options: PortMappingGuiOptions,
 }
 
 /// The messages that can be sent to the update loop of the application.
@@ -270,6 +280,9 @@ pub enum Message {
 
     /// The result of a server connection attempt.
     ConnectResulted(Result<crate::core::PreparedConnection, Arc<anyhow::Error>>),
+
+    /// Copy the server address to the clipboard.
+    CopyServer,
 
     /// The hash input field was changed.
     HashInputChanged(String),
@@ -333,6 +346,14 @@ pub enum Message {
     ForceExit,
 }
 
+/// Try to get the path to the app settings file.
+fn settings_path() -> Option<std::path::PathBuf> {
+    dirs::data_local_dir().map(|mut p| {
+        p.push("file_yeet_client/settings.json");
+        p
+    })
+}
+
 /// The application state and logic.
 impl iced::Application for AppState {
     type Message = Message;
@@ -342,18 +363,37 @@ impl iced::Application for AppState {
 
     /// Create a new application state.
     fn new((server_address, port, nat_map): Self::Flags) -> (AppState, iced::Command<Message>) {
-        let port_forwarding_text = port.map_or_else(String::new, |p| p.to_string());
+        // Get base settings from the settings file, or default.
+        let mut settings = settings_path()
+            .and_then(|p| {
+                // Ensure the settings file and directory exist.
+                if p.exists() {
+                    // Try to read the settings for the app.
+                    let settings = std::fs::read_to_string(p).ok()?;
+                    serde_json::from_str::<AppSettings>(&settings).ok()
+                } else {
+                    // Create the settings file and directory.
+                    std::fs::create_dir_all(p.parent()?).ok()?;
+                    std::fs::write(p, "").ok()?;
+                    None
+                }
+            })
+            .unwrap_or_default();
+
+        // The CLI arguments take final precedence on start.
+        if let Some(server_address) = &server_address {
+            settings.server_address = server_address.clone();
+        }
+        if let Some(port) = port {
+            settings.port_forwarding_text = port.to_string();
+            settings.port_mapping = PortMappingGuiOptions::PortForwarding(Some(port));
+        } else if nat_map {
+            settings.port_mapping = PortMappingGuiOptions::TryPcpNatPmp;
+        }
+
         (
             Self {
-                server_address: server_address.unwrap_or_default(),
-                port_forwarding_text,
-                port_mapping_options: if let Some(p) = port {
-                    PortMappingGuiOptions::PortForwarding(Some(p))
-                } else if nat_map {
-                    PortMappingGuiOptions::TryPcpNatPmp
-                } else {
-                    PortMappingGuiOptions::None
-                },
+                options: settings,
                 ..Self::default()
             },
             iced::Command::none(),
@@ -370,7 +410,7 @@ impl iced::Application for AppState {
         match message {
             // Handle the server address being changed.
             Message::ServerAddressChanged(address) => {
-                self.server_address = address;
+                self.options.server_address = address;
                 iced::Command::none()
             }
 
@@ -388,6 +428,9 @@ impl iced::Application for AppState {
 
             // Handle the result of a connection attempt.
             Message::ConnectResulted(r) => self.update_connect_resulted(r),
+
+            // Copy the connected server address to the clipboard.
+            Message::CopyServer => iced::clipboard::write(self.options.server_address.clone()),
 
             // Handle the hash input being changed.
             Message::HashInputChanged(hash) => {
@@ -605,13 +648,9 @@ impl iced::Application for AppState {
             }
 
             // Display the main application controls when connected.
-            ConnectionState::Connected(ConnectedState {
-                hash_input,
-                downloads,
-                publishes,
-                uploads,
-                ..
-            }) => self.view_connected_page(hash_input, downloads, publishes, uploads),
+            ConnectionState::Connected(connected_state) => {
+                self.view_connected_page(connected_state)
+            }
         };
 
         // Always display the status bar at the bottom.
@@ -637,13 +676,15 @@ impl iced::Application for AppState {
 impl AppState {
     /// Draw the disconnected page with a server address input and connect button.
     fn view_disconnected_page(&self) -> iced::Element<Message> {
-        let mut server_address =
-            widget::text_input("Server address. E.g., localhost:7828", &self.server_address);
+        let mut server_address = widget::text_input(
+            "Server address. E.g., localhost:7828",
+            &self.options.server_address,
+        );
 
         let mut connect_button = widget::button("Connect");
         let mut port_forward_text = widget::text_input(
             "External port forward. E.g., 8888",
-            &self.port_forwarding_text,
+            &self.options.port_forwarding_text,
         );
 
         if !self.modal {
@@ -652,12 +693,12 @@ impl AppState {
                 .on_submit(Message::ConnectClicked);
             connect_button = connect_button.on_press(Message::ConnectClicked);
 
-            if let PortMappingGuiOptions::PortForwarding(_) = &self.port_mapping_options {
+            if let PortMappingGuiOptions::PortForwarding(_) = &self.options.port_mapping {
                 port_forward_text = port_forward_text.on_input(Message::PortForwardTextChanged);
             }
         }
 
-        let selected = match self.port_mapping_options {
+        let selected = match self.options.port_mapping {
             PortMappingGuiOptions::None => PORT_MAPPING_OPTION_LABELS[0],
             PortMappingGuiOptions::PortForwarding(_) => PORT_MAPPING_OPTION_LABELS[1],
             PortMappingGuiOptions::TryPcpNatPmp => PORT_MAPPING_OPTION_LABELS[2],
@@ -786,10 +827,11 @@ impl AppState {
 
             widget::container(widget::column!(
                 progress,
+                widget::text(&t.hash_hex).size(12),
                 widget::row!(
-                    widget::text(&t.hash_hex).size(12),
+                    widget::text(&t.peer_string).size(12),
                     widget::horizontal_space(),
-                    widget::text(&t.path.to_string_lossy()).size(12)
+                    widget::text(&t.path.to_string_lossy()).size(12),
                 )
                 .spacing(6),
             ))
@@ -803,16 +845,10 @@ impl AppState {
     }
 
     /// Draw the main application controls when connected to a server.
-    fn view_connected_page(
-        &self,
-        hash_input: &str,
-        downloads: &[Transfer],
-        pubs: &[PublishItem],
-        uploads: &[Transfer],
-    ) -> iced::Element<Message> {
+    fn view_connected_page(&self, connected_state: &ConnectedState) -> iced::Element<Message> {
         let mut publish_button = widget::button("Publish");
         let mut download_button = widget::button("Download");
-        let mut hash_text_input = widget::text_input("Hash", hash_input);
+        let mut hash_text_input = widget::text_input("Hash", &connected_state.hash_input);
 
         // Disable the inputs while a modal is open.
         if !self.modal {
@@ -820,8 +856,8 @@ impl AppState {
             hash_text_input = hash_text_input.on_input(Message::HashInputChanged);
 
             // Enable the download button if the hash is valid.
-            if hash_input.len() == file_yeet_shared::HASH_BYTE_COUNT << 1
-                && faster_hex::hex_check(hash_input.as_bytes())
+            if connected_state.hash_input.len() == file_yeet_shared::HASH_BYTE_COUNT << 1
+                && faster_hex::hex_check(connected_state.hash_input.as_bytes())
             {
                 download_button = download_button.on_press(Message::SubscribeStarted);
                 hash_text_input = hash_text_input.on_submit(Message::SubscribeStarted);
@@ -833,13 +869,14 @@ impl AppState {
 
         // Create a list of downloads.
         let downloads: Element<Message> =
-            Self::draw_transfers(downloads.iter(), FileYeetCommandType::Sub);
+            Self::draw_transfers(connected_state.downloads.iter(), FileYeetCommandType::Sub);
 
         // Create a list of uploads.
-        let uploads = Self::draw_transfers(uploads.iter(), FileYeetCommandType::Pub);
+        let uploads =
+            Self::draw_transfers(connected_state.uploads.iter(), FileYeetCommandType::Pub);
 
         // Create a list of files being published.
-        let pubs = widget::column(pubs.iter().map(|p| {
+        let pubs = widget::column(connected_state.publishes.iter().map(|p| {
             widget::container(
                 match p {
                     PublishItem::Hashing(nonce, progress, _) => {
@@ -850,32 +887,44 @@ impl AppState {
                             widget::button("Cancel").on_press(Message::CancelPublish(*nonce))
                         )
                     }
-                    PublishItem::Publishing(p) => {
-                        widget::row!(
-                            widget::column!(
-                                widget::text(&p.hash_hex).size(12),
-                                widget::text(&p.path.to_string_lossy()).size(12)
-                            ),
-                            widget::horizontal_space(),
-                            widget::button("Copy Hash")
-                                .on_press(Message::CopyHash(p.hash_hex.clone())),
-                            widget::button("Cancel").on_press(Message::CancelPublish(p.nonce))
-                        )
-                    }
+                    PublishItem::Publishing(p) => widget::row!(
+                        widget::column!(
+                            widget::text(&p.hash_hex).size(12),
+                            widget::text(&p.path.to_string_lossy()).size(12)
+                        ),
+                        widget::horizontal_space(),
+                        widget::button(widget::text("Copy Hash").size(12))
+                            .on_press(Message::CopyHash(p.hash_hex.clone())),
+                        widget::button(widget::text("Cancel").size(12))
+                            .on_press(Message::CancelPublish(p.nonce))
+                    )
+                    .align_items(iced::Alignment::Center),
                 }
                 .spacing(12),
             )
             .style(iced::theme::Container::Box)
             .padding(6)
             .into()
-        })).spacing(6);
+        }))
+        .spacing(6);
 
         widget::container(
             widget::column!(
+                widget::row!(
+                    widget::text("Server address:"),
+                    widget::text(&self.options.server_address),
+                    widget::button(widget::text("Copy").size(12)).on_press(Message::CopyServer),
+                    // TODO: Impl widget::button(widget::text("Leave").size(12)).on_press(Message::LeaveServer),
+                    widget::horizontal_space(),
+                    widget::text("Our External Address:"),
+                    widget::text(&connected_state.external_address),
+                )
+                .align_items(iced::alignment::Alignment::Center)
+                .spacing(6),
                 widget::row!(publish_button, download_input).spacing(6),
                 widget::row!(widget::column!(pubs, uploads).spacing(6), downloads).spacing(6),
             )
-            .spacing(18),
+            .spacing(12),
         )
         .width(iced::Length::Fill)
         .height(iced::Length::Fill)
@@ -885,13 +934,13 @@ impl AppState {
 
     /// Handle the port mapping radio button being changed.
     fn update_port_radio_changed(&mut self, label: &'static str) -> iced::Command<Message> {
-        self.port_mapping_options = match label {
+        self.options.port_mapping = match label {
             "None" => {
                 self.status_message = None;
                 PortMappingGuiOptions::None
             }
             "Port forward" => PortMappingGuiOptions::PortForwarding({
-                let o = self.port_forwarding_text.parse::<NonZeroU16>().ok();
+                let o = self.options.port_forwarding_text.parse::<NonZeroU16>().ok();
                 if o.is_none() {
                     self.status_message = Some(INVALID_PORT_FORWARD.to_owned());
                 }
@@ -908,9 +957,14 @@ impl AppState {
 
     /// Update the state after the port forward text field was changed.
     fn update_port_forward_text(&mut self, text: String) -> iced::Command<Message> {
-        self.port_forwarding_text = text;
-        if let PortMappingGuiOptions::PortForwarding(port) = &mut self.port_mapping_options {
-            if let Ok(p) = self.port_forwarding_text.parse::<NonZeroU16>() {
+        self.options.port_forwarding_text = text;
+        if let PortMappingGuiOptions::PortForwarding(port) = &mut self.options.port_mapping {
+            if let Ok(p) = self
+                .options
+                .port_forwarding_text
+                .trim()
+                .parse::<NonZeroU16>()
+            {
                 *port = Some(p);
                 self.status_message = None;
             } else {
@@ -927,13 +981,14 @@ impl AppState {
         self.status_message = None;
 
         // Determine if a valid server address was entered.
-        let regex_match = if self.server_address.is_empty() {
-            // If empty, allow for defaults to be used.
-            Some((None, DEFAULT_PORT))
+        let regex_match = if self.options.server_address.trim().is_empty() {
+            // If empty, use sane defaults.
+            self.options.server_address = "localhost".to_owned();
+            Some((Some(self.options.server_address.clone()), DEFAULT_PORT))
         } else {
             // Otherwise, parse the server address and optional port.
             SERVER_ADDRESS_REGEX
-                .captures(&self.server_address)
+                .captures(&self.options.server_address)
                 .and_then(|captures| {
                     let host = captures.name("host").unwrap().as_str();
 
@@ -958,7 +1013,7 @@ impl AppState {
         };
 
         // Try to get the user's intent from the GUI options.
-        let port_mapping = match self.port_mapping_options {
+        let port_mapping = match self.options.port_mapping {
             PortMappingGuiOptions::None | PortMappingGuiOptions::PortForwarding(None) => {
                 PortMappingConfig::None
             }
@@ -1024,11 +1079,18 @@ impl AppState {
     ) -> iced::Command<Message> {
         match result {
             Ok(prepared) => {
+                let PreparedConnection {
+                    endpoint,
+                    server_connection,
+                    external_address,
+                    port_mapping,
+                } = prepared;
                 self.connection_state = ConnectionState::Connected(ConnectedState::new(
-                    prepared.endpoint,
-                    prepared.server_connection,
+                    endpoint,
+                    server_connection,
+                    external_address,
                 ));
-                self.port_mapping = prepared.port_mapping;
+                self.port_mapping = port_mapping;
                 iced::Command::none()
             }
             Err(e) => {
@@ -1228,10 +1290,11 @@ impl AppState {
         let progress_lock = Arc::new(RwLock::new(0));
         let cancellation_token = CancellationToken::new();
         uploads.push(Transfer {
+            nonce: upload_nonce,
             hash: publish.hash,
             hash_hex: faster_hex::hex_string(&publish.hash),
+            peer_string: peer.connection.remote_address().to_string(),
             path: publish.path.clone(),
-            nonce: upload_nonce,
             progress: TransferProgress::Transfering(
                 peer.clone(),
                 progress_lock.clone(),
@@ -1352,10 +1415,11 @@ impl AppState {
 
                         // New transfer state for this request.
                         let transfer = Transfer {
+                            nonce,
                             hash,
                             hash_hex: hash_input.clone(),
+                            peer_string: peer.to_string(),
                             path: path.clone(),
-                            nonce,
                             progress: TransferProgress::Connecting,
                             cancellation_token: CancellationToken::new(),
                         };
@@ -1574,6 +1638,17 @@ impl AppState {
         {
             endpoint.close(GOODBYE_CODE, GOODBYE_MESSAGE.as_bytes());
         };
+
+        // Save the settings before closing the application.
+        if let Err(e) = settings_path()
+            .ok_or_else(|| {
+                anyhow::anyhow!("Could not determine a settings path for this environment.")
+            })
+            .and_then(|p| Ok(std::fs::File::create(p)?))
+            .and_then(|f| Ok(serde_json::to_writer_pretty(f, &self.options)?))
+        {
+            eprintln!("{} Could not save settings: {e}", local_now_fmt());
+        }
 
         if let Some(port_mapping) = self.port_mapping.take() {
             let start = Instant::now();
