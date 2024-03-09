@@ -108,7 +108,7 @@ pub async fn prepare_server_connection(
                     interface
                         .ipv4
                         .first()
-                        .ok_or_else(|| anyhow::anyhow!("Failed to get a default IPv4 address:"))?
+                        .ok_or_else(|| anyhow::anyhow!("Failed to get a default IPv4 address"))?
                         .addr,
                 )
             } else {
@@ -123,7 +123,7 @@ pub async fn prepare_server_connection(
         });
     }
     println!(
-        "{} QUIC endpoint created with address: {local_address}",
+        "{} QUIC endpoint created with local address: {local_address}",
         local_now_fmt()
     );
 

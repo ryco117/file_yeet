@@ -2,7 +2,7 @@ use std::{
     net::SocketAddr,
     num::NonZeroU16,
     ops::Div as _,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
@@ -105,68 +105,67 @@ struct Transfer {
     pub cancellation_token: CancellationToken,
 }
 
+#[derive(Clone, Debug)]
+pub enum PublishRequestResult {
+    Success(IncomingPublishSession),
+    Failure(Arc<anyhow::Error>),
+    Cancelled,
+}
+
 /// A file actively being published to the server.
 #[derive(Clone, Debug)]
 struct Publish {
-    pub path: PathBuf,
     pub server_streams: Arc<tokio::sync::Mutex<BiStream>>,
-    pub nonce: Nonce,
     pub hash: HashBytes,
     pub hash_hex: String,
     pub file_size: u64,
-    pub cancellation_token: CancellationToken,
 }
 
-/// The state of a file publish request. Either hashing or successfully publishing.
-// TODO: Use a struct for  the main PublishItem and have a enum for the result to allow cancelling, etc. See `Transfer`.
+/// The state of a file publish request.
 #[derive(Clone, Debug)]
-enum PublishItem {
-    Hashing(Nonce, Arc<RwLock<f32>>, CancellationToken),
+enum PublishState {
+    Hashing(Arc<RwLock<f32>>),
     Publishing(Publish),
+    Failure(Arc<anyhow::Error>),
+    Cancelled,
+}
+
+/// An item in the list of publishing requests.
+#[derive(Clone, Debug)]
+struct PublishItem {
+    pub nonce: Nonce,
+    pub path: PathBuf,
+    pub cancellation_token: CancellationToken,
+    pub state: PublishState,
 }
 impl PublishItem {
-    #[must_use]
-    pub fn nonce(&self) -> Nonce {
-        match self {
-            Self::Hashing(nonce, ..) | Self::Publishing(Publish { nonce, .. }) => *nonce,
+    /// Make a new publish item in the hashing state.
+    pub fn new(
+        nonce: Nonce,
+        path: PathBuf,
+        cancellation_token: CancellationToken,
+        hash_progress: Arc<RwLock<f32>>,
+    ) -> Self {
+        Self {
+            nonce,
+            path,
+            cancellation_token,
+            state: PublishState::Hashing(hash_progress),
         }
     }
 
-    #[must_use]
-    pub fn cancellation_token(&self) -> &CancellationToken {
-        match self {
-            Self::Hashing(_, _, token)
-            | Self::Publishing(Publish {
-                cancellation_token: token,
-                ..
-            }) => token,
-        }
-    }
-
-    /// Upgrade a hashing state to publishing efficiently.
-    /// # Panics
-    /// Panics if the state is not `PublishItem::Hashing(..)`.
+    /// Upgrade a hashing state to publishing.
     pub fn upgrade_hashing(
         &mut self,
-        path: PathBuf,
         server_streams: Arc<tokio::sync::Mutex<BiStream>>,
         hash: HashBytes,
         file_size: u64,
     ) {
-        replace_with::replace_with_or_abort(self, |self_| {
-            let PublishItem::Hashing(nonce, _, cancellation_token) = self_ else {
-                panic!("Cannot upgrade a non-hashing state to publishing")
-            };
-
-            Self::Publishing(Publish {
-                path,
-                server_streams,
-                nonce,
-                hash,
-                hash_hex: faster_hex::hex_string(&hash),
-                file_size,
-                cancellation_token,
-            })
+        self.state = PublishState::Publishing(Publish {
+            server_streams,
+            hash,
+            hash_hex: faster_hex::hex_string(&hash),
+            file_size,
         });
     }
 }
@@ -284,6 +283,12 @@ pub enum Message {
     /// Copy the server address to the clipboard.
     CopyServer,
 
+    /// Leave the server and disconnect.
+    SafelyLeaveServer,
+
+    /// All async actions to leave a server have completed.
+    LeftServer,
+
     /// The hash input field was changed.
     HashInputChanged(String),
 
@@ -294,11 +299,7 @@ pub enum Message {
     PublishPathChosen(Option<PathBuf>),
 
     /// The result of a publish request.
-    PublishRequestResulted(
-        Nonce,
-        PathBuf,
-        Result<IncomingPublishSession, Arc<anyhow::Error>>,
-    ),
+    PublishRequestResulted(Nonce, PathBuf, PublishRequestResult),
 
     /// The result of trying to recieve a peer to publish to from the server.
     PublishPeerReceived(Nonce, Result<SocketAddr, Arc<anyhow::Error>>),
@@ -432,6 +433,16 @@ impl iced::Application for AppState {
             // Copy the connected server address to the clipboard.
             Message::CopyServer => iced::clipboard::write(self.options.server_address.clone()),
 
+            // Leave the server and disconnect.
+            Message::SafelyLeaveServer => self.safely_close(CloseType::Connections),
+
+            // All async actions to leave a server have completed.
+            Message::LeftServer => {
+                self.safely_closing = false;
+                self.connection_state = ConnectionState::Disconnected;
+                iced::Command::none()
+            }
+
             // Handle the hash input being changed.
             Message::HashInputChanged(hash) => {
                 if let ConnectionState::Connected(ConnectedState { hash_input, .. }) =
@@ -463,7 +474,7 @@ impl iced::Application for AppState {
 
             // Handle the result of a publish request.
             Message::PublishRequestResulted(nonce, path, r) => {
-                self.update_publish_request_resulted(nonce, path, r)
+                self.update_publish_request_resulted(nonce, &path, r)
             }
 
             // Handle a peer connection being received for a publish request.
@@ -550,7 +561,7 @@ impl iced::Application for AppState {
             Message::UnhandledEvent(event) => match event {
                 iced::Event::Window(id, window::Event::CloseRequested) => {
                     if id == window::Id::MAIN && !self.safely_closing {
-                        self.safely_close()
+                        self.safely_close(CloseType::Application)
                     } else {
                         // Non-main windows (if ever implemented) can be closed immediately.
                         // This is also used to cancel the safe-close operation.
@@ -583,16 +594,19 @@ impl iced::Application for AppState {
             ConnectionState::Connected(ConnectedState { publishes, .. }) => {
                 let pubs = publishes.iter().filter_map(|publish| {
                     // If the publish is still hashing, nothing to loop yet.
-                    let publish = if let PublishItem::Publishing(publish) = publish { publish.clone() } else { return None; };
+                    let PublishItem { nonce, cancellation_token, state: PublishState::Publishing(publish), .. } = &publish else { return None; };
+                    let nonce = *nonce;
+                    let cancellation_token = cancellation_token.clone();
+                    let publish = publish.clone();
 
                     // Subscribe to the server for new peers to upload to.
-                    Some(iced::subscription::channel(publish.nonce, 10, move |mut output| async move {
+                    Some(iced::subscription::channel(nonce, 10, move |mut output| async move {
                         loop {
                             let mut server = publish.server_streams.lock().await;
 
                             tokio::select! {
                                 // Let the task be cancelled.
-                                () = publish.cancellation_token.cancelled() => {
+                                () = cancellation_token.cancelled() => {
                                     if let Err(e) = server.send.write_u8(0).await {
                                         eprintln!("{} Failed to cancel publish: {e}", local_now_fmt());
                                     }
@@ -606,7 +620,7 @@ impl iced::Application for AppState {
                                 result = crate::core::read_publish_response(&mut server.recv) => {
                                     if let Err(e) = output
                                         .send(Message::PublishPeerReceived(
-                                            publish.nonce,
+                                            nonce,
                                             result.map_err(Arc::new),
                                         ))
                                         .await
@@ -876,30 +890,46 @@ impl AppState {
             Self::draw_transfers(connected_state.uploads.iter(), FileYeetCommandType::Pub);
 
         // Create a list of files being published.
-        let pubs = widget::column(connected_state.publishes.iter().map(|p| {
+        let pubs = widget::column(connected_state.publishes.iter().map(|pi| {
             widget::container(
-                match p {
-                    PublishItem::Hashing(nonce, progress, _) => {
-                        widget::row!(
-                            widget::text("Hashing..."),
-                            widget::progress_bar(0.0..=1., *progress.read().unwrap())
-                                .width(iced::Length::Fill),
-                            widget::button("Cancel").on_press(Message::CancelPublish(*nonce))
+                match &pi.state {
+                    PublishState::Hashing(progress) => widget::row!(
+                        widget::column!(
+                            widget::row!(
+                                widget::text("Hashing..."),
+                                widget::progress_bar(0.0..=1., *progress.read().unwrap())
+                                    .width(iced::Length::Fill),
+                            )
+                            .spacing(6),
+                            widget::text(&pi.path.to_string_lossy()).size(12),
                         )
-                    }
-                    PublishItem::Publishing(p) => widget::row!(
+                        .spacing(6),
+                        widget::button("Cancel").on_press(Message::CancelPublish(pi.nonce))
+                    ),
+                    PublishState::Publishing(p) => widget::row!(
                         widget::column!(
                             widget::text(&p.hash_hex).size(12),
-                            widget::text(&p.path.to_string_lossy()).size(12)
+                            widget::text(&pi.path.to_string_lossy()).size(12)
                         ),
                         widget::horizontal_space(),
                         widget::button(widget::text("Copy Hash").size(12))
                             .on_press(Message::CopyHash(p.hash_hex.clone())),
                         widget::button(widget::text("Cancel").size(12))
-                            .on_press(Message::CancelPublish(p.nonce))
-                    )
-                    .align_items(iced::Alignment::Center),
+                            .on_press(Message::CancelPublish(pi.nonce))
+                    ),
+                    PublishState::Failure(e) => widget::row!(
+                        widget::text(format!("Failed to publish: {e}"))
+                            .style(iced::theme::Text::Color(ERROR_RED_COLOR)),
+                        widget::button(widget::text("Remove").size(12))
+                            .on_press(Message::CancelPublish(pi.nonce))
+                    ),
+                    PublishState::Cancelled => widget::row!(
+                        widget::text("Cancelled"),
+                        widget::button(widget::text("Remove").size(12))
+                            .on_press(Message::CancelPublish(pi.nonce))
+                    ),
                 }
+                .align_items(iced::Alignment::Center)
                 .spacing(12),
             )
             .style(iced::theme::Container::Box)
@@ -914,7 +944,8 @@ impl AppState {
                     widget::text("Server address:"),
                     widget::text(&self.options.server_address),
                     widget::button(widget::text("Copy").size(12)).on_press(Message::CopyServer),
-                    // TODO: Impl widget::button(widget::text("Leave").size(12)).on_press(Message::LeaveServer),
+                    widget::button(widget::text("Leave").size(12))
+                        .on_press(Message::SafelyLeaveServer),
                     widget::horizontal_space(),
                     widget::text("Our External Address:"),
                     widget::text(&connected_state.external_address),
@@ -1124,17 +1155,18 @@ impl AppState {
         let cancellation_token = CancellationToken::new();
         let cancellation_path = path.clone();
 
-        publishes.push(PublishItem::Hashing(
+        publishes.push(PublishItem::new(
             nonce,
-            progress.clone(),
+            path.clone(),
             cancellation_token.clone(),
+            progress.clone(),
         ));
         iced::Command::perform(
             async move {
                 tokio::select! {
-                    () = cancellation_token.cancelled() => {
-                        (Err(Arc::new(anyhow::anyhow!("Cancelled"))), cancellation_path)
-                    }
+                    // Allow cancelling the publish request thread.
+                    () = cancellation_token.cancelled() => (PublishRequestResult::Cancelled, cancellation_path),
+
                     r = async move {
                         // Get the file size and hash of the chosen file to publish.
                         let (file_size, hash) =
@@ -1142,7 +1174,7 @@ impl AppState {
                                 Ok(p) => p,
                                 Err(e) => {
                                     return (
-                                        Err(Arc::new(anyhow::anyhow!(
+                                        PublishRequestResult::Failure(Arc::new(anyhow::anyhow!(
                                             "Error getting file size and hash: {e}"
                                         ))),
                                         path,
@@ -1155,10 +1187,10 @@ impl AppState {
 
                         // Create a bi-directional stream to the server for this publish request.
                         (
-                            crate::core::publish(&server, bb, hash)
-                                .await
-                                .map(|b| IncomingPublishSession::new(b, hash, file_size))
-                                .map_err(Arc::new),
+                            match crate::core::publish(&server, bb, hash).await {
+                                Ok(b) => PublishRequestResult::Success(IncomingPublishSession::new(b, hash, file_size)),
+                                Err(e) => PublishRequestResult::Failure(Arc::new(e)),
+                            },
                             path,
                         )
                     } => r
@@ -1172,36 +1204,33 @@ impl AppState {
     fn update_publish_request_resulted(
         &mut self,
         nonce: Nonce,
-        path: PathBuf,
-        result: Result<IncomingPublishSession, Arc<anyhow::Error>>,
+        path: &Path,
+        result: PublishRequestResult,
     ) -> iced::Command<Message> {
         if let ConnectionState::Connected(ConnectedState { publishes, .. }) =
             &mut self.connection_state
         {
-            match (
-                result,
-                publishes
-                    .iter()
-                    .position(|p| matches!(p, PublishItem::Hashing(n, _, _) if *n == nonce)),
-            ) {
+            match (result, publishes.iter().position(|p| p.nonce == nonce)) {
                 (
-                    Ok(IncomingPublishSession {
+                    PublishRequestResult::Success(IncomingPublishSession {
                         server_streams,
                         hash,
                         file_size,
                     }),
                     Some(i),
                 ) => {
-                    publishes[i].upgrade_hashing(path, server_streams, hash, file_size);
+                    publishes[i].upgrade_hashing(server_streams, hash, file_size);
                 }
-                (Err(e), Some(i)) => {
-                    publishes.remove(i);
-                    self.status_message = Some(format!("Error publishing {}: {e}", path.display()));
+                (PublishRequestResult::Failure(e), Some(i)) => {
+                    publishes[i].state = PublishState::Failure(e);
                 }
-                (Err(e), None) => {
-                    self.status_message = Some(format!("Error publishing {}: {e}", path.display()));
+                (PublishRequestResult::Cancelled, Some(i)) => {
+                    publishes[i].state = PublishState::Cancelled;
                 }
-                _ => {}
+                (e, None) => {
+                    self.status_message =
+                        Some(format!("Error publishing {}: {e:?}", path.display()));
+                }
             }
         }
         iced::Command::none()
@@ -1223,11 +1252,11 @@ impl AppState {
         };
 
         let publish = publishes
-            .iter_mut()
+            .iter()
             .find_map(|p| {
-                if let PublishItem::Publishing(p) = p {
+                if let PublishState::Publishing(publishing) = &p.state {
                     if p.nonce == nonce {
-                        Some(p)
+                        Some(publishing)
                     } else {
                         None
                     }
@@ -1272,10 +1301,10 @@ impl AppState {
             // Silently fail if the peer connection was not successful.
             return iced::Command::none();
         };
-        let Some(publish) = publishes.iter().find_map(|p| {
-            if let PublishItem::Publishing(p) = p {
-                if p.nonce == pub_nonce {
-                    Some(p)
+        let Some((publishing, path)) = publishes.iter().find_map(|pi| {
+            if let PublishState::Publishing(p) = &pi.state {
+                if pi.nonce == pub_nonce {
+                    Some((p, pi.path.clone()))
                 } else {
                     None
                 }
@@ -1291,24 +1320,23 @@ impl AppState {
         let cancellation_token = CancellationToken::new();
         uploads.push(Transfer {
             nonce: upload_nonce,
-            hash: publish.hash,
-            hash_hex: faster_hex::hex_string(&publish.hash),
+            hash: publishing.hash,
+            hash_hex: faster_hex::hex_string(&publishing.hash),
             peer_string: peer.connection.remote_address().to_string(),
-            path: publish.path.clone(),
+            path: path.clone(),
             progress: TransferProgress::Transfering(
                 peer.clone(),
                 progress_lock.clone(),
-                publish.file_size,
+                publishing.file_size,
                 0.,
             ),
             cancellation_token: cancellation_token.clone(),
         });
 
-        let file_path = publish.path.clone();
-        let file_size = publish.file_size;
+        let file_size = publishing.file_size;
         iced::Command::perform(
             async move {
-                let file = match tokio::fs::File::open(file_path).await {
+                let file = match tokio::fs::File::open(path).await {
                     Ok(f) => f,
                     Err(e) => {
                         return TransferResult::Failure(Arc::new(anyhow::anyhow!(
@@ -1569,12 +1597,14 @@ impl AppState {
         if let ConnectionState::Connected(ConnectedState { publishes, .. }) =
             &mut self.connection_state
         {
-            if let Some(i) = publishes.iter().position(|p| p.nonce() == nonce) {
+            if let Some(i) = publishes.iter().position(|p| p.nonce == nonce) {
                 // Cancel the publish task.
-                publishes[i].cancellation_token().cancel();
+                publishes[i].cancellation_token.cancel();
 
-                // Remove the publish from the list of publishes.
-                publishes.remove(i);
+                // If we have finished hashing, remove the publish from the list.
+                if !matches!(&publishes[i].state, PublishState::Hashing(_)) {
+                    publishes.remove(i);
+                }
             }
         }
         iced::Command::none()
@@ -1630,25 +1660,33 @@ impl AppState {
         iced::Command::none()
     }
 
-    /// Try to safely close the application.
-    fn safely_close(&mut self) -> iced::Command<Message> {
-        // TODO: Allow current downloads to be recontinued after a restart.
-        if let ConnectionState::Connected(ConnectedState { endpoint, .. }) =
-            &mut self.connection_state
+    /// Try to safely close.
+    fn safely_close(&mut self, close_type: CloseType) -> iced::Command<Message> {
+        if let ConnectionState::Connected(ConnectedState {
+            endpoint,
+            publishes,
+            ..
+        }) = &mut self.connection_state
         {
+            // Save the settings before closing the application.
+            if let Err(e) = settings_path()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Could not determine a settings path for this environment.")
+                })
+                .and_then(|p| Ok(std::fs::File::create(p)?))
+                .and_then(|f| Ok(serde_json::to_writer_pretty(f, &self.options)?))
+            {
+                eprintln!("{} Could not save settings: {e}", local_now_fmt());
+            }
+
+            // Cancel all publish tasks.
+            for p in publishes.iter() {
+                p.cancellation_token.cancel();
+            }
+
+            // TODO: Allow current downloads to be recontinued after a restart.
             endpoint.close(GOODBYE_CODE, GOODBYE_MESSAGE.as_bytes());
         };
-
-        // Save the settings before closing the application.
-        if let Err(e) = settings_path()
-            .ok_or_else(|| {
-                anyhow::anyhow!("Could not determine a settings path for this environment.")
-            })
-            .and_then(|p| Ok(std::fs::File::create(p)?))
-            .and_then(|f| Ok(serde_json::to_writer_pretty(f, &self.options)?))
-        {
-            eprintln!("{} Could not save settings: {e}", local_now_fmt());
-        }
 
         if let Some(port_mapping) = self.port_mapping.take() {
             let start = Instant::now();
@@ -1669,13 +1707,30 @@ impl AppState {
                     }
                 }),
                 // Force exist after completing the request or after a timeout.
-                |_| Message::ForceExit,
+                move |_| match close_type {
+                    CloseType::Application => Message::ForceExit,
+                    CloseType::Connections => Message::LeftServer,
+                },
             )
         } else {
-            // Immediately exit if there is no port mapping to remove.
-            window::close(window::Id::MAIN)
+            match close_type {
+                // Immediately exit if there is no port mapping to remove.
+                CloseType::Application => window::close(window::Id::MAIN),
+
+                CloseType::Connections => {
+                    self.connection_state = ConnectionState::Disconnected;
+                    iced::Command::none()
+                }
+            }
         }
     }
+}
+
+/// Either close all connections or the entire application.
+#[derive(Clone, Copy, Debug)]
+enum CloseType {
+    Connections,
+    Application,
 }
 
 const INVALID_PORT_FORWARD: &str = "Invalid port forward. Defaults to no port mappings.";
