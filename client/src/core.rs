@@ -460,7 +460,7 @@ pub async fn udp_holepunch(
 }
 
 /// Try to finalize a peer connection attempt by turning it into a bi-directional stream.
-async fn peer_connection_into_stream(
+pub async fn peer_connection_into_stream(
     connection: &quinn::Connection,
     hash: HashBytes,
     cmd: FileYeetCommandType,
@@ -481,6 +481,8 @@ async fn peer_connection_into_stream(
                     );
                     return None;
                 }
+
+                println!("{} New peer stream accepted", local_now_fmt());
             }
             r
         }
@@ -489,6 +491,8 @@ async fn peer_connection_into_stream(
             let mut r = connection.open_bi().await;
             if let Ok(s) = &mut r {
                 s.0.write_all(&hash).await.ok()?;
+
+                println!("{} New peer stream opened", local_now_fmt());
             }
             r
         }

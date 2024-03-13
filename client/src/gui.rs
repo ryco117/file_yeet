@@ -1,4 +1,5 @@
 use std::{
+    collections::{HashMap, HashSet},
     net::SocketAddr,
     num::NonZeroU16,
     ops::Div as _,
@@ -203,6 +204,9 @@ struct ConnectedState {
     /// The hash input field for creating new subscribe requests.
     hash_input: String,
 
+    /// Map of peer socket addresses to QUIC connections.
+    peers: HashMap<SocketAddr, (quinn::Connection, HashSet<Nonce>)>,
+
     /// List of download requests to peers.
     downloads: Vec<Transfer>,
 
@@ -219,6 +223,7 @@ impl ConnectedState {
             server,
             external_address,
             hash_input: String::new(),
+            peers: HashMap::new(),
             downloads: Vec::new(),
             publishes: Vec::new(),
             uploads: Vec::new(),
@@ -1244,6 +1249,7 @@ impl AppState {
     ) -> iced::Command<Message> {
         let ConnectionState::Connected(ConnectedState {
             endpoint,
+            peers,
             publishes,
             ..
         }) = &mut self.connection_state
@@ -1266,17 +1272,38 @@ impl AppState {
             })
             .cloned();
         match (result, publish) {
-            (Ok(peer), Some(publish)) => iced::Command::perform(
-                crate::core::udp_holepunch(
-                    FileYeetCommandType::Pub,
-                    publish.hash,
-                    endpoint.clone(),
-                    peer,
-                ),
-                move |r| {
-                    Message::PublishPeerConnectResulted(nonce, r.map(Into::<PeerConnection>::into))
-                },
-            ),
+            (Ok(peer), Some(publish)) => {
+                // TODO: A task will listen for connected peers. At that point we should only attempt something if not already connected.
+                let data = if let Some((c, _)) = peers.get(&peer) {
+                    Ok(c.clone())
+                } else {
+                    Err(endpoint.clone())
+                };
+                let hash = publish.hash;
+                iced::Command::perform(
+                    async move {
+                        match data {
+                            Ok(c) => crate::core::peer_connection_into_stream(
+                                &c,
+                                hash,
+                                FileYeetCommandType::Pub,
+                            )
+                            .await
+                            .map(|b| (c, b)),
+                            Err(e) => {
+                                crate::core::udp_holepunch(FileYeetCommandType::Pub, hash, e, peer)
+                                    .await
+                            }
+                        }
+                    },
+                    move |r| {
+                        Message::PublishPeerConnectResulted(
+                            nonce,
+                            r.map(Into::<PeerConnection>::into),
+                        )
+                    },
+                )
+            }
             (Err(e), _) => {
                 self.status_message = Some(format!("Error receiving peer: {e}"));
                 iced::Command::none()
@@ -1292,7 +1319,10 @@ impl AppState {
         peer: Option<PeerConnection>,
     ) -> iced::Command<Message> {
         let ConnectionState::Connected(ConnectedState {
-            publishes, uploads, ..
+            peers,
+            publishes,
+            uploads,
+            ..
         }) = &mut self.connection_state
         else {
             return iced::Command::none();
@@ -1332,6 +1362,18 @@ impl AppState {
             ),
             cancellation_token: cancellation_token.clone(),
         });
+
+        let peer_address = peer.connection.remote_address();
+        match peers.entry(peer_address) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                // Add the peer into our map of known peer addresses.
+                e.insert((peer.connection.clone(), HashSet::from([upload_nonce])));
+            }
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                // Add the transfer nonce to the peer's set of known transfer nonces.
+                e.get_mut().1.insert(upload_nonce);
+            }
+        }
 
         let file_size = publishing.file_size;
         iced::Command::perform(
@@ -1411,7 +1453,7 @@ impl AppState {
         result: Result<(Vec<SocketAddr>, PathBuf, HashBytes), Arc<anyhow::Error>>,
     ) -> iced::Command<Message> {
         match result {
-            Ok((peers, path, hash)) => {
+            Ok((peer_addrs, path, hash)) => {
                 // Helper to get the file size from the peer after a successful connection.
                 async fn get_size_from_peer(
                     (c, mut b): (quinn::Connection, BiStream),
@@ -1426,18 +1468,19 @@ impl AppState {
                 if let ConnectionState::Connected(ConnectedState {
                     endpoint,
                     hash_input,
-                    downloads: transfers,
+                    peers,
+                    downloads,
                     ..
                 }) = &mut self.connection_state
                 {
                     // Let the user know why nothing else is happening.
-                    if peers.is_empty() {
+                    if peer_addrs.is_empty() {
                         self.status_message = Some("No peers available".to_owned());
                         return iced::Command::none();
                     }
 
                     // Create a new transfer state and connection attempt for each peer.
-                    let transfers_commands_iter = peers.into_iter().map(|peer| {
+                    let transfers_commands_iter = peer_addrs.into_iter().map(|peer| {
                         // Create a nonce to identify the transfer.
                         let nonce = rand::random();
 
@@ -1454,21 +1497,41 @@ impl AppState {
 
                         // New connection attempt for this peer with result command identified by the nonce.
                         let command = {
-                            let endpoint = endpoint.clone();
+                            // Allow creating a new connection or opening a stream on an existing one.
+                            // TODO: Create an enum for this instead of using a `Result`.
+                            let data = {
+                                if let Some((c, _)) = peers.get(&peer) {
+                                    Ok(c.clone())
+                                } else {
+                                    Err(endpoint.clone())
+                                }
+                            };
+                            // The future to use to create the connection.
                             let future = async move {
-                                tokio::time::timeout(
-                                    PEER_CONNECT_TIMEOUT,
+                                tokio::time::timeout(PEER_CONNECT_TIMEOUT, async move {
                                     futures_util::future::OptionFuture::from(
-                                        crate::core::udp_holepunch(
-                                            FileYeetCommandType::Sub,
-                                            hash,
-                                            endpoint,
-                                            peer,
-                                        )
-                                        .await
+                                        match data {
+                                            Ok(c) => crate::core::peer_connection_into_stream(
+                                                &c,
+                                                hash,
+                                                FileYeetCommandType::Sub,
+                                            )
+                                            .await
+                                            .map(|s| (c, s)),
+                                            Err(e) => {
+                                                crate::core::udp_holepunch(
+                                                    FileYeetCommandType::Sub,
+                                                    hash,
+                                                    e,
+                                                    peer,
+                                                )
+                                                .await
+                                            }
+                                        }
                                         .map(get_size_from_peer),
-                                    ),
-                                )
+                                    )
+                                    .await
+                                })
                                 .await
                                 .ok()
                                 .flatten()
@@ -1490,7 +1553,7 @@ impl AppState {
                     ) = transfers_commands_iter.unzip();
 
                     // Add the new transfers to the list of active transfers.
-                    transfers.append(&mut new_transfers);
+                    downloads.append(&mut new_transfers);
                     iced::Command::batch(connect_commands)
                 } else {
                     iced::Command::none()
@@ -1510,6 +1573,7 @@ impl AppState {
         result: Option<(PeerConnection, u64)>,
     ) -> iced::Command<Message> {
         let ConnectionState::Connected(ConnectedState {
+            peers,
             downloads: transfers,
             ..
         }) = &mut self.connection_state
@@ -1522,8 +1586,21 @@ impl AppState {
             return iced::Command::none();
         };
 
-        // Handle the result of the connection attempt.
+        // Update the state of the transfer with the result.
         if let Some((connection, file_size)) = result {
+            let peer_address = connection.connection.remote_address();
+            // TODO: Refactor into a function.
+            match peers.entry(peer_address) {
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    // Add the peer into our map of known peer addresses.
+                    e.insert((connection.connection.clone(), HashSet::from([nonce])));
+                }
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    // Add the transfer nonce to the peer's set of known transfers.
+                    e.get_mut().1.insert(nonce);
+                }
+            }
+
             transfer.progress = TransferProgress::Consent(connection, file_size);
         } else {
             transfer.progress = TransferProgress::Done(TransferResult::Failure(Arc::new(
@@ -1645,7 +1722,10 @@ impl AppState {
         transfer_type: FileYeetCommandType,
     ) -> iced::Command<Message> {
         if let ConnectionState::Connected(ConnectedState {
-            downloads, uploads, ..
+            peers,
+            downloads,
+            uploads,
+            ..
         }) = &mut self.connection_state
         {
             let mut transfers = match transfer_type {
@@ -1654,6 +1734,26 @@ impl AppState {
             };
 
             if let Some(t) = transfers.find(|t| t.nonce == nonce) {
+                // If the transfer was connected to a peer, remove the peer from the list of known peers.
+                if let TransferProgress::Transfering(p, _, _, _) | TransferProgress::Consent(p, _) =
+                    &t.progress
+                {
+                    let connection = &p.connection;
+                    let peer_address = connection.remote_address();
+                    if let std::collections::hash_map::Entry::Occupied(mut e) =
+                        peers.entry(peer_address)
+                    {
+                        let nonces = &mut e.get_mut().1;
+                        nonces.remove(&nonce);
+
+                        // If there are no more streams to the peer, close the connection.
+                        if nonces.is_empty() {
+                            connection.close(GOODBYE_CODE, GOODBYE_MESSAGE.as_bytes());
+                            peers.remove(&peer_address);
+                        }
+                    }
+                }
+
                 t.progress = TransferProgress::Done(result);
             }
         }
