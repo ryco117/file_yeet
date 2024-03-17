@@ -189,6 +189,23 @@ impl IncomingPublishSession {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransferView {
+    Publishes,
+    Downloads,
+}
+
+/// The labels for the transfer view radio buttons.
+const TRANSFER_VIEWS: [TransferView; 2] = [TransferView::Publishes, TransferView::Downloads];
+impl TransferView {
+    fn to_str(self) -> &'static str {
+        match self {
+            TransferView::Publishes => "Uploads",
+            TransferView::Downloads => "Downloads",
+        }
+    }
+}
+
 /// The state of the connection to a `file_yeet` server and peers.
 #[derive(Debug)]
 struct ConnectedState {
@@ -215,6 +232,9 @@ struct ConnectedState {
 
     /// List of file uploads to peers.
     uploads: Vec<Transfer>,
+
+    /// The transfer view being shown.
+    transfer_view: TransferView,
 }
 impl ConnectedState {
     fn new(endpoint: quinn::Endpoint, server: quinn::Connection, external_address: String) -> Self {
@@ -227,6 +247,7 @@ impl ConnectedState {
             downloads: Vec::new(),
             publishes: Vec::new(),
             uploads: Vec::new(),
+            transfer_view: TransferView::Publishes,
         }
     }
 }
@@ -293,6 +314,9 @@ pub enum Message {
 
     /// All async actions to leave a server have completed.
     LeftServer,
+
+    /// The transfer view radio buttons were changed.
+    TransferViewChanged(TransferView),
 
     /// The hash input field was changed.
     HashInputChanged(String),
@@ -448,6 +472,14 @@ impl iced::Application for AppState {
                 iced::Command::none()
             }
 
+            // The transfer view radio buttons were changed.
+            Message::TransferViewChanged(view) => {
+                if let ConnectionState::Connected(connected_state) = &mut self.connection_state {
+                    connected_state.transfer_view = view;
+                }
+                iced::Command::none()
+            }
+
             // Handle the hash input being changed.
             Message::HashInputChanged(hash) => {
                 if let ConnectionState::Connected(ConnectedState { hash_input, .. }) =
@@ -546,19 +578,7 @@ impl iced::Application for AppState {
 
             // Handle a transfer being removed from the downloads list.
             Message::RemoveFromTransfers(nonce, transfer_type) => {
-                if let ConnectionState::Connected(ConnectedState {
-                    downloads, uploads, ..
-                }) = &mut self.connection_state
-                {
-                    let transfers = match transfer_type {
-                        FileYeetCommandType::Sub => downloads,
-                        FileYeetCommandType::Pub => uploads,
-                    };
-                    if let Some(i) = transfers.iter().position(|t| t.nonce == nonce) {
-                        transfers.remove(i);
-                    }
-                }
-                iced::Command::none()
+                self.update_remove_from_transfers(nonce, transfer_type)
             }
 
             // Handle an event that iced did not handle itself.
@@ -856,46 +876,15 @@ impl AppState {
             ))
             .style(iced::theme::Container::Box)
             .width(iced::Length::Fill)
-            .padding(6)
+            .padding([6, 12, 6, 6]) // Extra padding on the right because of optional scrollbar.
             .into()
         }))
         .spacing(6)
         .into()
     }
 
-    /// Draw the main application controls when connected to a server.
-    fn view_connected_page(&self, connected_state: &ConnectedState) -> iced::Element<Message> {
-        let mut publish_button = widget::button("Publish");
-        let mut download_button = widget::button("Download");
-        let mut hash_text_input = widget::text_input("Hash", &connected_state.hash_input);
-
-        // Disable the inputs while a modal is open.
-        if !self.modal {
-            publish_button = publish_button.on_press(Message::PublishClicked);
-            hash_text_input = hash_text_input.on_input(Message::HashInputChanged);
-
-            // Enable the download button if the hash is valid.
-            if connected_state.hash_input.len() == file_yeet_shared::HASH_BYTE_COUNT << 1
-                && faster_hex::hex_check(connected_state.hash_input.as_bytes())
-            {
-                download_button = download_button.on_press(Message::SubscribeStarted);
-                hash_text_input = hash_text_input.on_submit(Message::SubscribeStarted);
-            }
-        }
-
-        // Hash input and download button.
-        let download_input = widget::row!(hash_text_input, download_button).spacing(6);
-
-        // Create a list of downloads.
-        let downloads: Element<Message> =
-            Self::draw_transfers(connected_state.downloads.iter(), FileYeetCommandType::Sub);
-
-        // Create a list of uploads.
-        let uploads =
-            Self::draw_transfers(connected_state.uploads.iter(), FileYeetCommandType::Pub);
-
-        // Create a list of files being published.
-        let pubs = widget::column(connected_state.publishes.iter().map(|pi| {
+    fn draw_pubs<'a>(publishes: &[PublishItem]) -> iced::Element<'a, Message> {
+        widget::column(publishes.iter().map(|pi| {
             widget::container(
                 match &pi.state {
                     PublishState::Hashing(progress) => widget::row!(
@@ -938,10 +927,67 @@ impl AppState {
                 .spacing(12),
             )
             .style(iced::theme::Container::Box)
-            .padding(6)
+            .padding([6, 12, 6, 6]) // Extra padding on the right because of optional scrollbar.
             .into()
         }))
-        .spacing(6);
+        .spacing(6)
+        .into()
+    }
+
+    /// Draw the main application controls when connected to a server.
+    fn view_connected_page(&self, connected_state: &ConnectedState) -> iced::Element<Message> {
+        let mut publish_button = widget::button("Publish");
+        let mut download_button = widget::button("Download");
+        let mut hash_text_input = widget::text_input("Hash", &connected_state.hash_input);
+
+        // Disable the inputs while a modal is open.
+        if !self.modal {
+            publish_button = publish_button.on_press(Message::PublishClicked);
+            hash_text_input = hash_text_input.on_input(Message::HashInputChanged);
+
+            // Enable the download button if the hash is valid.
+            if connected_state.hash_input.len() == file_yeet_shared::HASH_BYTE_COUNT << 1
+                && faster_hex::hex_check(connected_state.hash_input.as_bytes())
+            {
+                download_button = download_button.on_press(Message::SubscribeStarted);
+                hash_text_input = hash_text_input.on_submit(Message::SubscribeStarted);
+            }
+        }
+
+        // Hash input and download button.
+        let download_input = widget::row!(hash_text_input, download_button).spacing(6);
+
+        // Radio buttons for choosing the transfer view.
+        let transfer_view_choice = widget::row(
+            std::iter::once(widget::text("View: ").into()).chain(TRANSFER_VIEWS.iter().map(|l| {
+                widget::radio(
+                    l.to_str(),
+                    *l,
+                    Some(connected_state.transfer_view),
+                    Message::TransferViewChanged,
+                )
+                .size(18)
+                .spacing(8)
+                .into()
+            })),
+        )
+        .spacing(12);
+
+        // Create a view of transfers.
+        let transfer_content = match connected_state.transfer_view {
+            // Create a list of published files and uploads.
+            TransferView::Publishes => widget::column!(
+                Self::draw_pubs(&connected_state.publishes),
+                Self::draw_transfers(connected_state.uploads.iter(), FileYeetCommandType::Pub)
+            )
+            .spacing(6)
+            .into(),
+
+            // Create a list of download attempts.
+            TransferView::Downloads => {
+                Self::draw_transfers(connected_state.downloads.iter(), FileYeetCommandType::Sub)
+            }
+        };
 
         widget::container(
             widget::column!(
@@ -958,7 +1004,8 @@ impl AppState {
                 .align_items(iced::alignment::Alignment::Center)
                 .spacing(6),
                 widget::row!(publish_button, download_input).spacing(6),
-                widget::row!(widget::column!(pubs, uploads).spacing(6), downloads).spacing(6),
+                transfer_view_choice,
+                widget::scrollable(transfer_content),
             )
             .spacing(12),
         )
@@ -976,7 +1023,12 @@ impl AppState {
                 PortMappingGuiOptions::None
             }
             "Port forward" => PortMappingGuiOptions::PortForwarding({
-                let o = self.options.port_forwarding_text.parse::<NonZeroU16>().ok();
+                let o = self
+                    .options
+                    .port_forwarding_text
+                    .trim()
+                    .parse::<NonZeroU16>()
+                    .ok();
                 if o.is_none() {
                     self.status_message = Some(INVALID_PORT_FORWARD.to_owned());
                 }
@@ -1755,6 +1807,27 @@ impl AppState {
                 }
 
                 t.progress = TransferProgress::Done(result);
+            }
+        }
+        iced::Command::none()
+    }
+
+    /// Update the state after the user has chosen to remove a transfer entry.
+    fn update_remove_from_transfers(
+        &mut self,
+        nonce: Nonce,
+        transfer_type: FileYeetCommandType,
+    ) -> iced::Command<Message> {
+        if let ConnectionState::Connected(ConnectedState {
+            downloads, uploads, ..
+        }) = &mut self.connection_state
+        {
+            let transfers = match transfer_type {
+                FileYeetCommandType::Sub => downloads,
+                FileYeetCommandType::Pub => uploads,
+            };
+            if let Some(i) = transfers.iter().position(|t| t.nonce == nonce) {
+                transfers.remove(i);
             }
         }
         iced::Command::none()
