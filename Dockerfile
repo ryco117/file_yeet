@@ -16,7 +16,7 @@ WORKDIR /usr/src/file_yeet/server
 RUN apk add musl-dev
 
 # Build and install the server
-RUN cargo install --path .
+RUN cargo install --path . --bin file_yeet_server
 RUN cargo clean
 
 # Expose the port that the server will be running on
