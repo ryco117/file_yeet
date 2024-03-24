@@ -12,6 +12,8 @@ use crate::core::{humanize_bytes, FileYeetCommandType, PreparedConnection};
 
 mod core;
 mod gui;
+#[cfg(target_os = "windows")]
+mod win_cmd;
 
 /// The command line interface for `file_yeet_client`.
 #[derive(clap::Parser)]
@@ -64,6 +66,12 @@ async fn main() {
 
     // If no subcommand was provided, run the GUI.
     let Some(cmd) = args.cmd else {
+        // If Windows, ensure we aren't displaying an unwanted console window.
+        #[cfg(target_os = "windows")]
+        {
+            win_cmd::free_allocated_console();
+        }
+
         // Run the GUI. Specify that the application should override the default exit behavior.
         if let Err(e) = gui::AppState::run(iced::Settings {
             window: iced::window::Settings {
