@@ -1,4 +1,4 @@
-use std::{io::Write as _, num::NonZeroU16, path::Path, time::Duration};
+use std::{io::Write as _, num::NonZeroU16, path::Path};
 
 use file_yeet_shared::{
     local_now_fmt, BiStream, HashBytes, GOODBYE_CODE, GOODBYE_MESSAGE,
@@ -6,7 +6,6 @@ use file_yeet_shared::{
 };
 use futures_util::{stream::FuturesUnordered, StreamExt};
 use iced::Application;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
 use crate::core::{humanize_bytes, FileYeetCommandType, PreparedConnection};
@@ -121,7 +120,7 @@ async fn main() {
 
     // Close our connection to the server. Send a goodbye to be polite.
     prepared_connection
-        .server_connection
+        .endpoint
         .close(GOODBYE_CODE, GOODBYE_MESSAGE.as_bytes());
 
     // Try to clean up the port mapping if one was made.
@@ -226,25 +225,25 @@ async fn subscribe_command(
 
     // Try to connect to multiple peers concurrently with a list of connection futures.
     let mut connection_attempts = FuturesUnordered::new();
-    for peer_address in peers.drain(..) {
-        connection_attempts.push(core::udp_holepunch(
-            FileYeetCommandType::Sub,
-            hash,
-            endpoint.clone(),
-            peer_address,
-        ));
+    for (peer_address, file_size) in peers.drain(..) {
+        connection_attempts.push(async move {
+            (
+                core::udp_holepunch(
+                    FileYeetCommandType::Sub,
+                    hash,
+                    endpoint.clone(),
+                    peer_address,
+                )
+                .await,
+                file_size,
+            )
+        });
     }
 
     // Iterate through the connection attempts as they resolve and use the first successful connection.
     let peer_connection = loop {
         match connection_attempts.next().await {
-            Some(Some((c, mut b))) => {
-                println!("{} Getting file size from peer...", local_now_fmt());
-
-                // Read the file size from the peer.
-                let Ok(file_size) = b.recv.read_u64().await else {
-                    continue;
-                };
+            Some((Some((c, b)), file_size)) => {
                 let Ok(consent) = file_consent_cli(file_size, &output) else {
                     continue;
                 };
@@ -254,12 +253,10 @@ async fn subscribe_command(
 
                 println!("{} Download cancelled", local_now_fmt());
 
-                // Try to let the peer know that we cancelled the download.
-                // Don't worry about the result since we are done with this peer.
-                let _ = tokio::time::timeout(Duration::from_millis(200), b.send.write_u8(0)).await;
+                // Close the connection since this command can't have multiple connections to a peer.
                 c.close(GOODBYE_CODE, &[]);
             }
-            Some(None) => continue,
+            Some((None, _)) => continue,
             None => break None,
         }
     };
@@ -299,7 +296,8 @@ async fn publish_loop(
     cancellation_token: CancellationToken,
 ) -> anyhow::Result<()> {
     // Create a bi-directional stream to the server.
-    let mut server_streams: BiStream = crate::core::publish(server_connection, bb, hash).await?;
+    let mut server_streams: BiStream =
+        crate::core::publish(server_connection, bb, hash, file_size).await?;
 
     // Enter a loop to listen for the server to send peer connections.
     loop {
@@ -309,7 +307,7 @@ async fn publish_loop(
         );
 
         // Await the server to send a peer connection.
-        let Ok(peer_address) = crate::core::read_publish_response(&mut server_streams.recv).await
+        let Ok(peer_address) = crate::core::read_subscribing_peer(&mut server_streams.recv).await
         else {
             eprintln!("{} Failed to read the server's response", local_now_fmt());
             break;

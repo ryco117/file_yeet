@@ -17,3 +17,5 @@ rustls = { version = "0.21", features = ["dangerous_configuration", "quic"] }
 thiserror = "1.0"
 tokio = { version = "1.36", features = ["io-util", "macros", "net", "rt-multi-thread", "signal"] }
 tokio-util = { version = "0.7", features = ["rt"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"

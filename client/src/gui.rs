@@ -14,7 +14,7 @@ use file_yeet_shared::{
 };
 use futures_util::SinkExt;
 use iced::{widget, window, Element};
-use tokio::io::{AsyncReadExt, AsyncWriteExt as _};
+use tokio::io::AsyncWriteExt as _;
 use tokio_util::sync::CancellationToken;
 
 use crate::core::{
@@ -86,8 +86,8 @@ pub enum TransferResult {
 #[derive(Debug)]
 enum TransferProgress {
     Connecting,
-    Consent(PeerConnection, u64),
-    Transfering(PeerConnection, Arc<RwLock<u64>>, u64, f32),
+    Consent(PeerConnection),
+    Transfering(PeerConnection, Arc<RwLock<u64>>, f32),
     Done(TransferResult),
 }
 
@@ -100,6 +100,7 @@ struct Transfer {
     pub nonce: Nonce,
     pub hash: HashBytes,
     pub hash_hex: String,
+    pub file_size: u64,
     pub peer_string: String,
     pub path: PathBuf,
     pub progress: TransferProgress,
@@ -168,6 +169,24 @@ impl PublishItem {
             hash_hex: faster_hex::hex_string(&hash),
             file_size,
         });
+    }
+}
+
+/// The result of a subscribe request.
+#[derive(Clone, Debug)]
+pub struct IncomingSubscribePeers {
+    pub peers_with_size: Vec<(SocketAddr, u64)>,
+    pub path: PathBuf,
+    pub hash: HashBytes,
+}
+impl IncomingSubscribePeers {
+    #[must_use]
+    pub fn new(peers_with_size: Vec<(SocketAddr, u64)>, path: PathBuf, hash: HashBytes) -> Self {
+        Self {
+            peers_with_size,
+            path,
+            hash,
+        }
     }
 }
 
@@ -343,10 +362,10 @@ pub enum Message {
     SubscribePathChosen(Option<PathBuf>),
 
     /// A subscribe request was completed.
-    SubscribePeersResult(Result<(Vec<SocketAddr>, PathBuf, HashBytes), Arc<anyhow::Error>>),
+    SubscribePeersResult(Result<IncomingSubscribePeers, Arc<anyhow::Error>>),
 
     /// A subscribe connection attempt was completed.
-    SubscribePeerConnectResulted(Nonce, Option<(PeerConnection, u64)>),
+    SubscribePeerConnectResulted(Nonce, Option<PeerConnection>),
 
     // A download was accepted, initiate the download.
     AcceptDownload(Nonce),
@@ -642,7 +661,7 @@ impl iced::Application for AppState {
                                 }
 
                                 // Await the server to send a peer connection.
-                                result = crate::core::read_publish_response(&mut server.recv) => {
+                                result = crate::core::read_subscribing_peer(&mut server.recv) => {
                                     if let Err(e) = output
                                         .send(Message::PublishPeerReceived(
                                             nonce,
@@ -821,9 +840,12 @@ impl AppState {
         widget::column(transfers.map(|t| {
             let progress = match &t.progress {
                 TransferProgress::Connecting => Element::from(widget::text("Connecting...")),
-                TransferProgress::Consent(_, size) => widget::row!(
-                    widget::text(format!("Accept download of size {}", humanize_bytes(*size)))
-                        .width(iced::Length::Fill),
+                TransferProgress::Consent(_) => widget::row!(
+                    widget::text(format!(
+                        "Accept download of size {}",
+                        humanize_bytes(t.file_size)
+                    ))
+                    .width(iced::Length::Fill),
                     widget::button(widget::text("Accept").size(12))
                         .on_press(Message::AcceptDownload(t.nonce)),
                     widget::button(widget::text("Cancel").size(12))
@@ -831,7 +853,7 @@ impl AppState {
                 )
                 .spacing(12)
                 .into(),
-                TransferProgress::Transfering(_, _, _, p) => widget::row!(
+                TransferProgress::Transfering(_, _, p) => widget::row!(
                     widget::text("Transfering..."),
                     widget::progress_bar(0.0..=1., *p),
                     widget::button(widget::text("Cancel").size(12))
@@ -1139,8 +1161,7 @@ impl AppState {
                 downloads, uploads, ..
             }) => {
                 for t in downloads.iter_mut().chain(uploads.iter_mut()) {
-                    if let TransferProgress::Transfering(_, lock, total, progress) = &mut t.progress
-                    {
+                    if let TransferProgress::Transfering(_, lock, progress) = &mut t.progress {
                         let Ok(p) = lock.read() else {
                             t.progress = TransferProgress::Done(TransferResult::Failure(Arc::new(
                                 anyhow::anyhow!("Lock poisoned"),
@@ -1150,7 +1171,7 @@ impl AppState {
 
                         #[allow(clippy::cast_precision_loss)]
                         {
-                            *progress = *p as f32 / *total as f32;
+                            *progress = *p as f32 / t.file_size as f32;
                         }
                     }
                 }
@@ -1200,11 +1221,17 @@ impl AppState {
 
         // Ensure the client is connected to a server.
         let ConnectionState::Connected(ConnectedState {
-            server, publishes, ..
+            server,
+            publishes,
+            transfer_view,
+            ..
         }) = &mut self.connection_state
         else {
             return iced::Command::none();
         };
+
+        // Ensure the transfer view is set to publishing to see the new item.
+        *transfer_view = TransferView::Publishes;
 
         let server = server.clone();
         let progress = Arc::new(RwLock::new(0.));
@@ -1244,7 +1271,7 @@ impl AppState {
 
                         // Create a bi-directional stream to the server for this publish request.
                         (
-                            match crate::core::publish(&server, bb, hash).await {
+                            match crate::core::publish(&server, bb, hash, file_size).await {
                                 Ok(b) => PublishRequestResult::Success(IncomingPublishSession::new(b, hash, file_size)),
                                 Err(e) => PublishRequestResult::Failure(Arc::new(e)),
                             },
@@ -1404,14 +1431,10 @@ impl AppState {
             nonce: upload_nonce,
             hash: publishing.hash,
             hash_hex: faster_hex::hex_string(&publishing.hash),
+            file_size: publishing.file_size,
             peer_string: peer.connection.remote_address().to_string(),
             path: path.clone(),
-            progress: TransferProgress::Transfering(
-                peer.clone(),
-                progress_lock.clone(),
-                publishing.file_size,
-                0.,
-            ),
+            progress: TransferProgress::Transfering(peer.clone(), progress_lock.clone(), 0.),
             cancellation_token: cancellation_token.clone(),
         });
 
@@ -1473,8 +1496,11 @@ impl AppState {
 
         // Ensure the client is connected to a server.
         let ConnectionState::Connected(ConnectedState {
-            server, hash_input, ..
-        }) = &self.connection_state
+            server,
+            hash_input,
+            transfer_view,
+            ..
+        }) = &mut self.connection_state
         else {
             return iced::Command::none();
         };
@@ -1486,13 +1512,16 @@ impl AppState {
             return iced::Command::none();
         }
 
+        // Ensure the transfer view is set to downloads to see the new item.
+        *transfer_view = TransferView::Downloads;
+
         let server = server.clone();
         iced::Command::perform(
             async move {
                 let mut bb = bytes::BytesMut::with_capacity(MAX_PEER_COMMUNICATION_SIZE);
                 crate::core::subscribe(&server, &mut bb, hash)
                     .await
-                    .map(|peers| (peers, path, hash))
+                    .map(|peers| IncomingSubscribePeers::new(peers, path, hash))
                     .map_err(Arc::new)
             },
             Message::SubscribePeersResult,
@@ -1502,21 +1531,14 @@ impl AppState {
     /// Update after server has responded to a subscribe request.
     fn update_subscribe_peers_result(
         &mut self,
-        result: Result<(Vec<SocketAddr>, PathBuf, HashBytes), Arc<anyhow::Error>>,
+        result: Result<IncomingSubscribePeers, Arc<anyhow::Error>>,
     ) -> iced::Command<Message> {
         match result {
-            Ok((peer_addrs, path, hash)) => {
-                // Helper to get the file size from the peer after a successful connection.
-                async fn get_size_from_peer(
-                    (c, mut b): (quinn::Connection, BiStream),
-                ) -> Option<(PeerConnection, u64)> {
-                    b.recv
-                        .read_u64()
-                        .await
-                        .ok()
-                        .map(|file_size| (PeerConnection::new(c, b), file_size))
-                }
-
+            Ok(IncomingSubscribePeers {
+                peers_with_size,
+                path,
+                hash,
+            }) => {
                 if let ConnectionState::Connected(ConnectedState {
                     endpoint,
                     hash_input,
@@ -1526,42 +1548,43 @@ impl AppState {
                 }) = &mut self.connection_state
                 {
                     // Let the user know why nothing else is happening.
-                    if peer_addrs.is_empty() {
+                    if peers_with_size.is_empty() {
                         self.status_message = Some("No peers available".to_owned());
                         return iced::Command::none();
                     }
 
                     // Create a new transfer state and connection attempt for each peer.
-                    let transfers_commands_iter = peer_addrs.into_iter().map(|peer| {
-                        // Create a nonce to identify the transfer.
-                        let nonce = rand::random();
+                    let transfers_commands_iter =
+                        peers_with_size.into_iter().map(|(peer, file_size)| {
+                            // Create a nonce to identify the transfer.
+                            let nonce = rand::random();
 
-                        // New transfer state for this request.
-                        let transfer = Transfer {
-                            nonce,
-                            hash,
-                            hash_hex: hash_input.clone(),
-                            peer_string: peer.to_string(),
-                            path: path.clone(),
-                            progress: TransferProgress::Connecting,
-                            cancellation_token: CancellationToken::new(),
-                        };
-
-                        // New connection attempt for this peer with result command identified by the nonce.
-                        let command = {
-                            // Allow creating a new connection or opening a stream on an existing one.
-                            // TODO: Create an enum for this instead of using a `Result`.
-                            let data = {
-                                if let Some((c, _)) = peers.get(&peer) {
-                                    Ok(c.clone())
-                                } else {
-                                    Err(endpoint.clone())
-                                }
+                            // New transfer state for this request.
+                            let transfer = Transfer {
+                                nonce,
+                                hash,
+                                hash_hex: hash_input.clone(),
+                                file_size,
+                                peer_string: peer.to_string(),
+                                path: path.clone(),
+                                progress: TransferProgress::Connecting,
+                                cancellation_token: CancellationToken::new(),
                             };
-                            // The future to use to create the connection.
-                            let future = async move {
-                                tokio::time::timeout(PEER_CONNECT_TIMEOUT, async move {
-                                    futures_util::future::OptionFuture::from(
+
+                            // New connection attempt for this peer with result command identified by the nonce.
+                            let command = {
+                                // Allow creating a new connection or opening a stream on an existing one.
+                                // TODO: Create an enum for this instead of using a `Result`.
+                                let data = {
+                                    if let Some((c, _)) = peers.get(&peer) {
+                                        Ok(c.clone())
+                                    } else {
+                                        Err(endpoint.clone())
+                                    }
+                                };
+                                // The future to use to create the connection.
+                                let future = async move {
+                                    tokio::time::timeout(PEER_CONNECT_TIMEOUT, async move {
                                         match data {
                                             Ok(c) => crate::core::peer_connection_into_stream(
                                                 &c,
@@ -1580,23 +1603,20 @@ impl AppState {
                                                 .await
                                             }
                                         }
-                                        .map(get_size_from_peer),
-                                    )
+                                        .map(PeerConnection::from)
+                                    })
                                     .await
+                                    .ok()
+                                    .flatten()
+                                };
+                                iced::Command::perform(future, move |r| {
+                                    Message::SubscribePeerConnectResulted(nonce, r)
                                 })
-                                .await
-                                .ok()
-                                .flatten()
-                                .flatten()
                             };
-                            iced::Command::perform(future, move |r| {
-                                Message::SubscribePeerConnectResulted(nonce, r)
-                            })
-                        };
 
-                        // Return the pair to be separated later.
-                        (transfer, command)
-                    });
+                            // Return the pair to be separated later.
+                            (transfer, command)
+                        });
 
                     // Create a new transfer for each peer.
                     let (mut new_transfers, connect_commands): (
@@ -1622,7 +1642,7 @@ impl AppState {
     fn update_subscribe_connect_resulted(
         &mut self,
         nonce: Nonce,
-        result: Option<(PeerConnection, u64)>,
+        result: Option<PeerConnection>,
     ) -> iced::Command<Message> {
         let ConnectionState::Connected(ConnectedState {
             peers,
@@ -1634,12 +1654,16 @@ impl AppState {
         };
 
         // Find the transfer with the matching nonce.
-        let Some(transfer) = transfers.iter_mut().find(|t| t.nonce == nonce) else {
+        let Some((index, transfer)) = transfers
+            .iter_mut()
+            .enumerate()
+            .find(|(_, t)| t.nonce == nonce)
+        else {
             return iced::Command::none();
         };
 
         // Update the state of the transfer with the result.
-        if let Some((connection, file_size)) = result {
+        if let Some(connection) = result {
             let peer_address = connection.connection.remote_address();
             // TODO: Refactor into a function.
             match peers.entry(peer_address) {
@@ -1653,11 +1677,10 @@ impl AppState {
                 }
             }
 
-            transfer.progress = TransferProgress::Consent(connection, file_size);
+            transfer.progress = TransferProgress::Consent(connection);
         } else {
-            transfer.progress = TransferProgress::Done(TransferResult::Failure(Arc::new(
-                anyhow::anyhow!("Connection attempt failed"),
-            )));
+            // Remove unreachable peers from view.
+            transfers.remove(index);
         }
         iced::Command::none()
     }
@@ -1677,21 +1700,17 @@ impl AppState {
             return iced::Command::none();
         };
         let hash = transfer.hash;
-        let (peer_streams, file_size) =
-            if let TransferProgress::Consent(p, s) = &mut transfer.progress {
-                (p.clone(), *s)
-            } else {
-                return iced::Command::none();
-            };
+        let file_size = transfer.file_size;
+        let peer_streams = if let TransferProgress::Consent(p) = &mut transfer.progress {
+            p.clone()
+        } else {
+            return iced::Command::none();
+        };
 
         // Begin the transfer.
         let byte_progress = Arc::new(RwLock::new(0));
-        transfer.progress = TransferProgress::Transfering(
-            peer_streams.clone(),
-            byte_progress.clone(),
-            file_size,
-            0.,
-        );
+        transfer.progress =
+            TransferProgress::Transfering(peer_streams.clone(), byte_progress.clone(), 0.);
         let output_path = transfer.path.clone();
         let cancellation_token = transfer.cancellation_token.clone();
 
@@ -1758,7 +1777,7 @@ impl AppState {
                 t.cancellation_token.cancel();
 
                 // If waiting for user interaction, mark the transfer as cancelled.
-                if matches!(t.progress, TransferProgress::Consent(_, _)) {
+                if matches!(t.progress, TransferProgress::Consent(_)) {
                     t.progress = TransferProgress::Done(TransferResult::Cancelled);
                 }
             }
@@ -1787,7 +1806,7 @@ impl AppState {
 
             if let Some(t) = transfers.find(|t| t.nonce == nonce) {
                 // If the transfer was connected to a peer, remove the peer from the list of known peers.
-                if let TransferProgress::Transfering(p, _, _, _) | TransferProgress::Consent(p, _) =
+                if let TransferProgress::Transfering(p, _, _) | TransferProgress::Consent(p) =
                     &t.progress
                 {
                     let connection = &p.connection;

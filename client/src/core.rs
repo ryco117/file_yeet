@@ -267,6 +267,7 @@ pub async fn publish(
     server_connection: &quinn::Connection,
     mut bb: bytes::BytesMut,
     hash: HashBytes,
+    file_size: u64,
 ) -> anyhow::Result<BiStream> {
     // Create a bi-directional stream to the server.
     let mut server_streams: BiStream = server_connection
@@ -282,6 +283,7 @@ pub async fn publish(
     // Format a publish request.
     bb.put_u16(file_yeet_shared::ClientApiRequest::Publish as u16);
     bb.put(&hash[..]);
+    bb.put_u64(file_size);
 
     // Send the server a publish request.
     server_streams
@@ -294,7 +296,7 @@ pub async fn publish(
 }
 
 /// Read a response to a publish request from the server.
-pub async fn read_publish_response(
+pub async fn read_subscribing_peer(
     server_recv: &mut quinn::RecvStream,
 ) -> anyhow::Result<SocketAddr> {
     let data_len = server_recv
@@ -328,12 +330,13 @@ pub async fn read_publish_response(
     Ok(peer_address)
 }
 
-/// Perform a subscribe request to the server. Returns a list of peers that are sharing the file.
+/// Perform a subscribe request to the server.
+/// Returns a list of peers that are sharing the file and the file size they promise to send.
 pub async fn subscribe(
     server_connection: &quinn::Connection,
     bb: &mut bytes::BytesMut,
     hash: HashBytes,
-) -> anyhow::Result<Vec<SocketAddr>> {
+) -> anyhow::Result<Vec<(SocketAddr, u64)>> {
     // Create a bi-directional stream to the server.
     let mut server_streams: BiStream = server_connection
         .open_bi()
@@ -373,14 +376,17 @@ pub async fn subscribe(
     let mut scratch_space = [0; MAX_SERVER_COMMUNICATION_SIZE];
     let mut peers = Vec::new();
 
-    // Parse each peer socket address.
+    // Parse each peer socket address and file size.
     for _ in 0..response_count {
+        // Read the incoming peer address length.
         let address_len = server_streams
             .recv
             .read_u16()
             .await
             .map_err(|e| anyhow::anyhow!("Failed to read response from server: {e}"))?
             as usize;
+
+        // Read the incoming peer address to memory.
         let peer_string_bytes = &mut scratch_space[..address_len];
         server_streams
             .recv
@@ -391,6 +397,8 @@ pub async fn subscribe(
             })?;
         let peer_address_str = std::str::from_utf8(peer_string_bytes)
             .map_err(|e| anyhow::anyhow!("Server did not send a valid UTF-8 response: {e}"))?;
+
+        // Parse the peer address into a socket address.
         let peer_address = match peer_address_str.parse() {
             Ok(p) => p,
             Err(e) => {
@@ -402,7 +410,10 @@ pub async fn subscribe(
             }
         };
 
-        peers.push(peer_address);
+        // Read the incoming file size.
+        let file_size = server_streams.recv.read_u64().await?;
+
+        peers.push((peer_address, file_size));
     }
 
     Ok(peers)
@@ -614,6 +625,7 @@ pub async fn download_from_peer(
         .map_err(DownloadError::IoError)?;
 
     // Let the peer know that we accepted the download.
+    // TODO: Specify the range of bytes we want to download.
     peer_streams
         .send
         .write_u8(1)
@@ -737,29 +749,33 @@ pub async fn upload_to_peer(
     mut reader: tokio::io::BufReader<tokio::fs::File>,
     byte_progress: Option<Arc<RwLock<u64>>>,
 ) -> anyhow::Result<()> {
-    // Ensure that the file reader is at the start before the upload.
-    reader.rewind().await?;
-
-    // Send the file size to the peer.
-    peer_streams.send.write_u64(file_size).await?;
-
     // Read the peer's response to the file size.
+    // TODO: Read the range that they want to have uploaded.
     let response = peer_streams.recv.read_u8().await?;
     if response == 0 {
         println!("{} Peer cancelled the upload", local_now_fmt());
         return Ok(());
     }
 
+    // Ensure that the file reader is at the start before the upload.
+    reader.rewind().await?;
+
     // Create a scratch space for reading data from the stream.
     let mut buf = [0; MAX_PEER_COMMUNICATION_SIZE];
     let mut bytes_read = 0;
 
     // Read from the file and write to the peer.
-    loop {
+    while bytes_read < file_size {
         // Read a natural amount of bytes from the file.
-        let n = reader.read(&mut buf).await?;
+        let mut n = reader.read(&mut buf).await?;
         if n == 0 {
             break;
+        }
+
+        // Ensure we don't send more bytes than were promised.
+        let remaining = file_size - bytes_read;
+        if (n as u64) > remaining {
+            n = usize::try_from(remaining)?;
         }
 
         // Write the bytes to the peer.
@@ -777,7 +793,7 @@ pub async fn upload_to_peer(
         }
     }
 
-    // Greacefully close our connection after all data has been sent.
+    // Gracefully close our connection after all data has been sent.
     if let Err(e) = peer_streams.send.finish().await {
         eprintln!(
             "{} Failed to close the peer stream gracefully: {e}",

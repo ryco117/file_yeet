@@ -30,9 +30,10 @@ docker build -t file_yeet_server:local .
 
 
 ### Client
+![Client GUI screenshot](images/client_screenshot.png)
 ```text
 $ cargo r --bin file_yeet_client -- -h
-Usage: file_yeet_client.exe [OPTIONS] <COMMAND>
+Usage: file_yeet_client.exe [OPTIONS] [COMMAND]
 
 Commands:
   pub   Publish a file to the server
