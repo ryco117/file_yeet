@@ -13,7 +13,10 @@ use file_yeet_shared::{
     MAX_SERVER_COMMUNICATION_SIZE,
 };
 use futures_util::SinkExt;
-use iced::{widget, window, Element};
+use iced::{
+    widget::{self, horizontal_space},
+    window, Element,
+};
 use tokio::io::AsyncWriteExt as _;
 use tokio_util::sync::CancellationToken;
 
@@ -958,6 +961,25 @@ impl AppState {
 
     /// Draw the main application controls when connected to a server.
     fn view_connected_page(&self, connected_state: &ConnectedState) -> iced::Element<Message> {
+        /// Helper for creating a horizontal line.
+        fn horizontal_line<'a>() -> widget::Container<'a, Message> {
+            widget::container(horizontal_space())
+                .height(3)
+                .style(iced::theme::Container::Box)
+        }
+
+        let header = widget::row!(
+            widget::text("Server address:"),
+            widget::text(&self.options.server_address),
+            widget::button(widget::text("Copy").size(12)).on_press(Message::CopyServer),
+            widget::button(widget::text("Leave").size(12)).on_press(Message::SafelyLeaveServer),
+            widget::horizontal_space(),
+            widget::text("Our External Address:"),
+            widget::text(&connected_state.external_address),
+        )
+        .align_items(iced::alignment::Alignment::Center)
+        .spacing(6);
+
         let mut publish_button = widget::button("Publish");
         let mut download_button = widget::button("Download");
         let mut hash_text_input = widget::text_input("Hash", &connected_state.hash_input);
@@ -998,12 +1020,31 @@ impl AppState {
         // Create a view of transfers.
         let transfer_content = match connected_state.transfer_view {
             // Create a list of published files and uploads.
-            TransferView::Publishes => widget::column!(
-                Self::draw_pubs(&connected_state.publishes),
-                Self::draw_transfers(connected_state.uploads.iter(), FileYeetCommandType::Pub)
-            )
-            .spacing(6)
-            .into(),
+            TransferView::Publishes => {
+                let widget_iter: Box<dyn Iterator<Item = iced::Element<Message>>> = match (
+                    connected_state.publishes.is_empty(),
+                    connected_state.uploads.is_empty(),
+                ) {
+                    (true, true) => Box::new(std::iter::empty()),
+                    (false, true) => {
+                        Box::new(std::iter::once(Self::draw_pubs(&connected_state.publishes)))
+                    }
+                    (true, false) => Box::new(std::iter::once(Self::draw_transfers(
+                        connected_state.uploads.iter(),
+                        FileYeetCommandType::Pub,
+                    ))),
+                    (false, false) => Box::new(
+                        std::iter::once(Self::draw_pubs(&connected_state.publishes))
+                            .chain(std::iter::once(horizontal_line().into()))
+                            .chain(std::iter::once(Self::draw_transfers(
+                                connected_state.uploads.iter(),
+                                FileYeetCommandType::Pub,
+                            ))),
+                    ),
+                };
+
+                widget::column(widget_iter).spacing(12).into()
+            }
 
             // Create a list of download attempts.
             TransferView::Downloads => {
@@ -1013,18 +1054,8 @@ impl AppState {
 
         widget::container(
             widget::column!(
-                widget::row!(
-                    widget::text("Server address:"),
-                    widget::text(&self.options.server_address),
-                    widget::button(widget::text("Copy").size(12)).on_press(Message::CopyServer),
-                    widget::button(widget::text("Leave").size(12))
-                        .on_press(Message::SafelyLeaveServer),
-                    widget::horizontal_space(),
-                    widget::text("Our External Address:"),
-                    widget::text(&connected_state.external_address),
-                )
-                .align_items(iced::alignment::Alignment::Center)
-                .spacing(6),
+                header,
+                horizontal_line(),
                 widget::row!(publish_button, download_input).spacing(6),
                 transfer_view_choice,
                 widget::scrollable(transfer_content),

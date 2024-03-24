@@ -244,9 +244,8 @@ async fn subscribe_command(
     let peer_connection = loop {
         match connection_attempts.next().await {
             Some((Some((c, b)), file_size)) => {
-                let Ok(consent) = file_consent_cli(file_size, &output) else {
-                    continue;
-                };
+                let consent =
+                    file_consent_cli(file_size, &output).expect("Failed to read user input");
                 if consent {
                     break Some((c, b, file_size));
                 }
