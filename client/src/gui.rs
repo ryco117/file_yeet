@@ -1021,29 +1021,34 @@ impl AppState {
         let transfer_content = match connected_state.transfer_view {
             // Create a list of published files and uploads.
             TransferView::Publishes => {
-                let widget_iter: Box<dyn Iterator<Item = iced::Element<Message>>> = match (
+                match (
                     connected_state.publishes.is_empty(),
                     connected_state.uploads.is_empty(),
                 ) {
-                    (true, true) => Box::new(std::iter::empty()),
-                    (false, true) => {
-                        Box::new(std::iter::once(Self::draw_pubs(&connected_state.publishes)))
-                    }
-                    (true, false) => Box::new(std::iter::once(Self::draw_transfers(
+                    // Both are empty, show nothing.
+                    (true, true) => iced::widget::space::Space::new(0, 0).into(),
+
+                    // Only uploads are empty, show publishes.
+                    (false, true) => Self::draw_pubs(&connected_state.publishes),
+
+                    // Only publishes are empty, show uploads.
+                    (true, false) => Self::draw_transfers(
                         connected_state.uploads.iter(),
                         FileYeetCommandType::Pub,
-                    ))),
-                    (false, false) => Box::new(
-                        std::iter::once(Self::draw_pubs(&connected_state.publishes))
-                            .chain(std::iter::once(horizontal_line().into()))
-                            .chain(std::iter::once(Self::draw_transfers(
-                                connected_state.uploads.iter(),
-                                FileYeetCommandType::Pub,
-                            ))),
                     ),
-                };
 
-                widget::column(widget_iter).spacing(12).into()
+                    // Show both publishes and uploads. Separate them with a line.
+                    (false, false) => widget::column!(
+                        Self::draw_pubs(&connected_state.publishes),
+                        horizontal_line(),
+                        Self::draw_transfers(
+                            connected_state.uploads.iter(),
+                            FileYeetCommandType::Pub,
+                        ),
+                    )
+                    .spacing(12)
+                    .into(),
+                }
             }
 
             // Create a list of download attempts.
