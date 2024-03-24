@@ -277,6 +277,7 @@ async fn subscribe_command(
             &mut peer_streams,
             file_size,
             &output,
+            &mut bb,
             None,
         ))
         .await

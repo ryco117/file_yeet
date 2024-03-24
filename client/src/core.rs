@@ -252,12 +252,12 @@ pub async fn port_override_request(
     let mut server_streams: BiStream = server_connection.open_bi().await?.into();
 
     // Format a port override request.
+    bb.clear();
     bb.put_u16(file_yeet_shared::ClientApiRequest::PortOverride as u16);
     bb.put_u16(port.get());
 
     // Send the port override request to the server and clear the buffer.
     server_streams.send.write_all(bb).await?;
-    bb.clear();
 
     Ok(())
 }
@@ -281,6 +281,7 @@ pub async fn publish(
         .into();
 
     // Format a publish request.
+    bb.clear();
     bb.put_u16(file_yeet_shared::ClientApiRequest::Publish as u16);
     bb.put(&hash[..]);
     bb.put_u64(file_size);
@@ -349,6 +350,7 @@ pub async fn subscribe(
         .into();
 
     // Send the server a subscribe request.
+    bb.clear();
     bb.put_u16(file_yeet_shared::ClientApiRequest::Subscribe as u16);
     bb.put(&hash[..]);
     server_streams
@@ -601,6 +603,8 @@ async fn connect_to_peer(
 pub enum DownloadError {
     #[error("An I/O error occurred: {0}")]
     IoError(std::io::Error),
+    #[error("A write error occurred: {0}")]
+    WriteError(quinn::WriteError),
     #[error("The downloaded file hash does not match the expected hash")]
     HashMismatch,
     #[error("Download lock was poisoned: {0}")]
@@ -608,12 +612,14 @@ pub enum DownloadError {
 }
 
 /// Download a file from the peer. Initiates the download by consenting to the peer to receive the file.
+#[allow(clippy::cast_precision_loss)]
 pub async fn download_from_peer(
     hash: HashBytes,
     peer_streams: &mut BiStream,
     file_size: u64,
     output_path: &Path,
-    byte_progress: Option<Arc<RwLock<u64>>>,
+    bb: &mut bytes::BytesMut,
+    byte_progress: Option<Arc<RwLock<f32>>>,
 ) -> Result<(), DownloadError> {
     // Open the file for writing.
     let mut file = tokio::fs::OpenOptions::new()
@@ -624,13 +630,16 @@ pub async fn download_from_peer(
         .await
         .map_err(DownloadError::IoError)?;
 
-    // Let the peer know that we accepted the download.
-    // TODO: Specify the range of bytes we want to download.
+    // Let the peer know which range we want to download using this QUIC stream.
+    // Here we want the entire file.
+    bb.clear();
+    bb.put_u64(0); // Start at the beginning of the file.
+    bb.put_u64(file_size); // Request the file's entire size.
     peer_streams
         .send
-        .write_u8(1)
+        .write(bb)
         .await
-        .map_err(DownloadError::IoError)?;
+        .map_err(DownloadError::WriteError)?;
     peer_streams
         .send
         .finish()
@@ -641,6 +650,7 @@ pub async fn download_from_peer(
     let mut buf = [0; MAX_PEER_COMMUNICATION_SIZE];
     // Read from the peer and write to the file.
     let mut bytes_written = 0;
+    let file_size_f = file_size as f32;
     let mut hasher = sha2::Sha256::new();
     while bytes_written < file_size {
         // Read a natural amount of bytes from the peer.
@@ -669,7 +679,8 @@ pub async fn download_from_peer(
             if let Some(progress) = byte_progress.as_ref() {
                 *progress
                     .write()
-                    .map_err(|e| DownloadError::PoisonedLock(e.to_string()))? = bytes_written;
+                    .map_err(|e| DownloadError::PoisonedLock(e.to_string()))? =
+                    bytes_written as f32 / file_size_f;
             }
         }
     }
@@ -743,37 +754,41 @@ pub async fn file_size_and_hash(
 }
 
 /// Upload the file to the peer. Ensure they consent to the file size before sending the file.
+#[allow(clippy::cast_precision_loss)]
 pub async fn upload_to_peer(
     peer_streams: &mut BiStream,
     file_size: u64,
     mut reader: tokio::io::BufReader<tokio::fs::File>,
-    byte_progress: Option<Arc<RwLock<u64>>>,
+    byte_progress: Option<Arc<RwLock<f32>>>,
 ) -> anyhow::Result<()> {
-    // Read the peer's response to the file size.
-    // TODO: Read the range that they want to have uploaded.
-    let response = peer_streams.recv.read_u8().await?;
-    if response == 0 {
-        println!("{} Peer cancelled the upload", local_now_fmt());
-        return Ok(());
+    // Read the peer's desired upload range.
+    let start_index = peer_streams.recv.read_u64().await?;
+    let upload_length = peer_streams.recv.read_u64().await?;
+    // Sanity check the upload range.
+    match start_index.checked_add(upload_length) {
+        Some(end) if end > file_size => anyhow::bail!("Invalid range requested, exceeds file size"),
+        None => anyhow::bail!("Invalid range requested, 64-bit overflow 🫠"),
+        Some(_) => {}
     }
 
-    // Ensure that the file reader is at the start before the upload.
-    reader.rewind().await?;
+    // Ensure that the file reader is at the starting index for the upload.
+    reader.seek(std::io::SeekFrom::Start(start_index)).await?;
 
     // Create a scratch space for reading data from the stream.
     let mut buf = [0; MAX_PEER_COMMUNICATION_SIZE];
     let mut bytes_read = 0;
+    let upload_length_f = upload_length as f32;
 
     // Read from the file and write to the peer.
-    while bytes_read < file_size {
+    while bytes_read < upload_length {
         // Read a natural amount of bytes from the file.
         let mut n = reader.read(&mut buf).await?;
         if n == 0 {
             break;
         }
 
-        // Ensure we don't send more bytes than were promised.
-        let remaining = file_size - bytes_read;
+        // Ensure we don't send more bytes than were requested in the range.
+        let remaining = upload_length - bytes_read;
         if (n as u64) > remaining {
             n = usize::try_from(remaining)?;
         }
@@ -789,7 +804,7 @@ pub async fn upload_to_peer(
             *progress
                 .write()
                 .map_err(|e| anyhow::anyhow!("Upload progress lock was poisoned: {e}"))? =
-                bytes_read;
+                bytes_read as f32 / upload_length_f;
         }
     }
 

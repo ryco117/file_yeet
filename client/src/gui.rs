@@ -90,7 +90,7 @@ pub enum TransferResult {
 enum TransferProgress {
     Connecting,
     Consent(PeerConnection),
-    Transfering(PeerConnection, Arc<RwLock<u64>>, f32),
+    Transferring(PeerConnection, Arc<RwLock<f32>>, f32),
     Done(TransferResult),
 }
 
@@ -287,6 +287,16 @@ enum ConnectionState {
     /// A connection to the server is active.
     Connected(ConnectedState),
 }
+impl ConnectionState {
+    /// Make a new `ConnectionState` in the stalling state.
+    pub fn new_stalling() -> Self {
+        let now = Instant::now();
+        Self::Stalling {
+            start: now,
+            tick: now,
+        }
+    }
+}
 
 /// The current settings for the app.
 #[derive(Default, serde::Deserialize, serde::Serialize)]
@@ -442,14 +452,21 @@ impl iced::Application for AppState {
         } else if nat_map {
             settings.port_mapping = PortMappingGuiOptions::TryPcpNatPmp;
         }
+        let server_address_is_empty = settings.server_address.is_empty();
 
-        (
-            Self {
-                options: settings,
-                ..Self::default()
-            },
-            iced::Command::none(),
-        )
+        // Create the initial state with the settings.
+        let mut initial_state = Self {
+            options: settings,
+            ..Self::default()
+        };
+
+        // Try connecting immediately if the server address is already set.
+        let command = if server_address_is_empty {
+            iced::Command::none()
+        } else {
+            initial_state.update_connect_clicked()
+        };
+        (initial_state, command)
     }
 
     /// Get the application title text.
@@ -817,18 +834,17 @@ impl AppState {
         tick: Instant,
         max_duration: Duration,
     ) -> iced::Element<'a, Message> {
-        let spinner = widget::container::Container::new(widget::progress_bar(
-            0.0..=1.,
-            (tick - start)
-                .as_secs_f32()
-                .div(max_duration.as_secs_f32())
-                .fract(),
-        ))
-        .width(iced::Length::Fill)
-        .height(iced::Length::Fill)
-        .padding(24)
-        .center_x()
-        .center_y();
+        let fraction_waited = (tick - start)
+            .as_secs_f32()
+            .div(max_duration.as_secs_f32())
+            .min(1.);
+        let spinner =
+            widget::container::Container::new(widget::progress_bar(0.0..=1., fraction_waited))
+                .width(iced::Length::Fill)
+                .height(iced::Length::Fill)
+                .padding(24)
+                .center_x()
+                .center_y();
 
         Element::<'a>::from(spinner)
     }
@@ -856,7 +872,7 @@ impl AppState {
                 )
                 .spacing(12)
                 .into(),
-                TransferProgress::Transfering(_, _, p) => widget::row!(
+                TransferProgress::Transferring(_, _, p) => widget::row!(
                     widget::text("Transfering..."),
                     widget::progress_bar(0.0..=1., *p),
                     widget::button(widget::text("Cancel").size(12))
@@ -968,26 +984,17 @@ impl AppState {
                 .style(iced::theme::Container::Box)
         }
 
-        let header = widget::row!(
-            widget::text("Server address:"),
-            widget::text(&self.options.server_address),
-            widget::button(widget::text("Copy").size(12)).on_press(Message::CopyServer),
-            widget::button(widget::text("Leave").size(12)).on_press(Message::SafelyLeaveServer),
-            widget::horizontal_space(),
-            widget::text("Our External Address:"),
-            widget::text(&connected_state.external_address),
-        )
-        .align_items(iced::alignment::Alignment::Center)
-        .spacing(6);
-
+        // Define the elements that we want to be modal aware first.
         let mut publish_button = widget::button("Publish");
         let mut download_button = widget::button("Download");
         let mut hash_text_input = widget::text_input("Hash", &connected_state.hash_input);
+        let mut leave_server_button = widget::button(widget::text("Leave").size(12));
 
         // Disable the inputs while a modal is open.
         if !self.modal {
             publish_button = publish_button.on_press(Message::PublishClicked);
             hash_text_input = hash_text_input.on_input(Message::HashInputChanged);
+            leave_server_button = leave_server_button.on_press(Message::SafelyLeaveServer);
 
             // Enable the download button if the hash is valid.
             if connected_state.hash_input.len() == file_yeet_shared::HASH_BYTE_COUNT << 1
@@ -997,6 +1004,19 @@ impl AppState {
                 hash_text_input = hash_text_input.on_submit(Message::SubscribeStarted);
             }
         }
+
+        // Define a header exposing the server address and how the server sees us (our IP address).
+        let header = widget::row!(
+            widget::text("Server address:"),
+            widget::text(&self.options.server_address),
+            widget::button(widget::text("Copy").size(12)).on_press(Message::CopyServer),
+            leave_server_button,
+            widget::horizontal_space(),
+            widget::text("Our External Address:"),
+            widget::text(&connected_state.external_address),
+        )
+        .align_items(iced::alignment::Alignment::Center)
+        .spacing(6);
 
         // Hash input and download button.
         let download_input = widget::row!(hash_text_input, download_button).spacing(6);
@@ -1153,10 +1173,7 @@ impl AppState {
         };
 
         // Set the state to `Stalling` before starting the connection attempt.
-        self.connection_state = ConnectionState::Stalling {
-            start: Instant::now(),
-            tick: Instant::now(),
-        };
+        self.connection_state = ConnectionState::new_stalling();
 
         // Try to get the user's intent from the GUI options.
         let port_mapping = match self.options.port_mapping {
@@ -1197,18 +1214,17 @@ impl AppState {
                 downloads, uploads, ..
             }) => {
                 for t in downloads.iter_mut().chain(uploads.iter_mut()) {
-                    if let TransferProgress::Transfering(_, lock, progress) = &mut t.progress {
+                    if let TransferProgress::Transferring(_, lock, progress) = &mut t.progress {
                         let Ok(p) = lock.read() else {
+                            // Note that this transfer has had its lock poisoned and continue.
                             t.progress = TransferProgress::Done(TransferResult::Failure(Arc::new(
                                 anyhow::anyhow!("Lock poisoned"),
                             )));
                             continue;
                         };
 
-                        #[allow(clippy::cast_precision_loss)]
-                        {
-                            *progress = *p as f32 / t.file_size as f32;
-                        }
+                        // Update the progress bar with the most recent value.
+                        *progress = *p;
                     }
                 }
             }
@@ -1236,14 +1252,13 @@ impl AppState {
                     external_address,
                 ));
                 self.port_mapping = port_mapping;
-                iced::Command::none()
             }
             Err(e) => {
                 self.status_message = Some(format!("Error connecting: {e}"));
                 self.connection_state = ConnectionState::Disconnected;
-                iced::Command::none()
             }
         }
+        iced::Command::none()
     }
 
     /// Update the state after the publish button was clicked. Begins a publish request if a file was chosen.
@@ -1461,7 +1476,7 @@ impl AppState {
         };
 
         let upload_nonce = rand::random();
-        let progress_lock = Arc::new(RwLock::new(0));
+        let progress_lock = Arc::new(RwLock::new(0.));
         let cancellation_token = CancellationToken::new();
         uploads.push(Transfer {
             nonce: upload_nonce,
@@ -1470,7 +1485,7 @@ impl AppState {
             file_size: publishing.file_size,
             peer_string: peer.connection.remote_address().to_string(),
             path: path.clone(),
-            progress: TransferProgress::Transfering(peer.clone(), progress_lock.clone(), 0.),
+            progress: TransferProgress::Transferring(peer.clone(), progress_lock.clone(), 0.),
             cancellation_token: cancellation_token.clone(),
         });
 
@@ -1744,15 +1759,18 @@ impl AppState {
         };
 
         // Begin the transfer.
-        let byte_progress = Arc::new(RwLock::new(0));
+        let byte_progress = Arc::new(RwLock::new(0.));
         transfer.progress =
-            TransferProgress::Transfering(peer_streams.clone(), byte_progress.clone(), 0.);
+            TransferProgress::Transferring(peer_streams.clone(), byte_progress.clone(), 0.);
         let output_path = transfer.path.clone();
         let cancellation_token = transfer.cancellation_token.clone();
 
         iced::Command::perform(
             async move {
                 let mut peer_streams_lock = peer_streams.streams.lock().await;
+
+                // Create a buffer for the file transfer range. Need to send a `u64` start index and `u64` length.
+                let mut bb = bytes::BytesMut::with_capacity(16);
                 tokio::select! {
                     // Let the transfer be cancelled. This is not an error if cancelled.
                     () = cancellation_token.cancelled() => TransferResult::Cancelled,
@@ -1763,6 +1781,7 @@ impl AppState {
                         &mut peer_streams_lock,
                         file_size,
                         &output_path,
+                        &mut bb,
                         Some(byte_progress),
                     )) => {
                         match result {
@@ -1842,7 +1861,7 @@ impl AppState {
 
             if let Some(t) = transfers.find(|t| t.nonce == nonce) {
                 // If the transfer was connected to a peer, remove the peer from the list of known peers.
-                if let TransferProgress::Transfering(p, _, _) | TransferProgress::Consent(p) =
+                if let TransferProgress::Transferring(p, _, _) | TransferProgress::Consent(p) =
                     &t.progress
                 {
                     let connection = &p.connection;
@@ -1917,14 +1936,13 @@ impl AppState {
         };
 
         if let Some(port_mapping) = self.port_mapping.take() {
-            let start = Instant::now();
-            let delta = Duration::from_millis(500);
-
             // Set the state to `Stalling` before waiting for the safe close to complete.
-            self.connection_state = ConnectionState::Stalling { start, tick: start };
+            self.connection_state = ConnectionState::new_stalling();
+
             self.safely_closing = true;
+            let port_mapping_timeout = Duration::from_millis(500);
             iced::Command::perform(
-                tokio::time::timeout(delta, async move {
+                tokio::time::timeout(port_mapping_timeout, async move {
                     if let Err((e, _)) = port_mapping.try_drop().await {
                         eprintln!(
                             "{} Could not safely remove port mapping: {e}",
