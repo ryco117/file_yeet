@@ -100,27 +100,7 @@ pub async fn prepare_server_connection(
         .local_addr()
         .expect("Failed to get the local address of our QUIC endpoint");
     if local_address.ip().is_unspecified() {
-        local_address.set_ip({
-            let interface = default_net::get_default_interface()
-                .map_err(|e| anyhow::anyhow!("Failed to get a default interface: {e}"))?;
-            if using_ipv4 {
-                IpAddr::V4(
-                    interface
-                        .ipv4
-                        .first()
-                        .ok_or_else(|| anyhow::anyhow!("Failed to get a default IPv4 address"))?
-                        .addr,
-                )
-            } else {
-                IpAddr::V6(
-                    interface
-                        .ipv6
-                        .first()
-                        .ok_or_else(|| anyhow::anyhow!("Failed to get a default IPv6 address"))?
-                        .addr,
-                )
-            }
-        });
+        local_address.set_ip(probe_local_address(using_ipv4)?);
     }
     println!(
         "{} QUIC endpoint created with local address: {local_address}",
@@ -136,24 +116,34 @@ pub async fn prepare_server_connection(
             .ip_addr
     };
     let (port_mapping, port_override) = match port_config {
+        // Use a port that is explicitly set by the user without PCP/NAT-PMP.
         PortMappingConfig::PortForwarding(p) => (None, Some(p)),
 
-        // Allow the user to skip port mapping.
-        PortMappingConfig::PcpNatPmp(_) => match try_port_mapping(gateway, local_address).await {
-            Ok(m) => {
-                let p = m.external_port();
-                println!(
-                    "{} Success mapping external port {p} -> internal {}",
-                    local_now_fmt(),
-                    m.internal_port(),
-                );
-                (Some(m), Some(p))
+        // Attempt PCP and NAT-PMP port mappings to the gateway.
+        PortMappingConfig::PcpNatPmp(None) => {
+            match try_port_mapping(gateway, local_address).await {
+                Ok(m) => {
+                    let p = m.external_port();
+                    println!(
+                        "{} Success mapping external port {p} -> internal {}",
+                        local_now_fmt(),
+                        m.internal_port(),
+                    );
+                    (Some(m), Some(p))
+                }
+                Err(e) => {
+                    eprintln!("{} Failed to create a port mapping: {e}", local_now_fmt());
+                    (None, None)
+                }
             }
-            Err(e) => {
-                eprintln!("{} Failed to create a port mapping: {e}", local_now_fmt());
-                (None, None)
-            }
-        },
+        }
+
+        // Re-using existing port mapping.
+        PortMappingConfig::PcpNatPmp(Some(m)) => {
+            let p = m.external_port();
+            (Some(m), Some(p))
+        }
+
         PortMappingConfig::None => (None, None),
     };
 
@@ -177,6 +167,31 @@ pub async fn prepare_server_connection(
     })
 }
 
+/// Helper to determine the default interface's IP address.
+fn probe_local_address(using_ipv4: bool) -> anyhow::Result<IpAddr> {
+    let interface = default_net::get_default_interface()
+        .map_err(|e| anyhow::anyhow!("Failed to get a default interface: {e}"))?;
+    let ip = if using_ipv4 {
+        IpAddr::V4(
+            interface
+                .ipv4
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("Failed to get a default IPv4 address"))?
+                .addr,
+        )
+    } else {
+        IpAddr::V6(
+            interface
+                .ipv6
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("Failed to get a default IPv6 address"))?
+                .addr,
+        )
+    };
+
+    Ok(ip)
+}
+
 /// Attempt to create a port mapping using NAT-PMP or PCP.
 async fn try_port_mapping(
     gateway: IpAddr,
@@ -187,7 +202,10 @@ async fn try_port_mapping(
         local_address.ip(),
         crab_nat::InternetProtocol::Udp,
         std::num::NonZeroU16::new(local_address.port()).expect("Socket address has no port"),
-        crab_nat::PortMappingOptions::default(),
+        crab_nat::PortMappingOptions {
+            timeout_config: Some(crab_nat::natpmp::TIMEOUT_CONFIG_DEFAULT),
+            ..Default::default()
+        },
     )
     .await
 }

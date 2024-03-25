@@ -18,7 +18,7 @@ mod win_cmd;
 /// The command line interface for `file_yeet_client`.
 #[derive(clap::Parser)]
 #[command(author, version, about, long_about = None)]
-struct Cli {
+pub struct Cli {
     /// The address of the rendezvous server. Either an IP address or a hostname.
     #[arg(short, long)]
     server_address: Option<String>,
@@ -78,7 +78,7 @@ async fn main() {
                 exit_on_close_request: false,
                 ..iced::window::Settings::default()
             },
-            flags: (args.server_address, args.port_override, args.nat_map),
+            flags: Some(args),
             ..iced::Settings::default()
         }) {
             eprintln!("{} GUI failed to run: {e}", local_now_fmt());

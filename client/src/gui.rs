@@ -302,6 +302,7 @@ impl ConnectionState {
 #[derive(Default, serde::Deserialize, serde::Serialize)]
 struct AppSettings {
     pub server_address: String,
+    pub gateway_address: Option<String>,
     pub port_forwarding_text: String,
     pub port_mapping: PortMappingGuiOptions,
 }
@@ -328,6 +329,9 @@ pub enum Message {
 
     /// The port forward text field was changed.
     PortForwardTextChanged(String),
+
+    /// The gateway text field was changed.
+    GatewayTextChanged(String),
 
     /// The connect button was clicked.
     ConnectClicked,
@@ -421,10 +425,10 @@ impl iced::Application for AppState {
     type Message = Message;
     type Theme = iced::Theme;
     type Executor = iced::executor::Default;
-    type Flags = (Option<String>, Option<NonZeroU16>, bool);
+    type Flags = Option<crate::Cli>;
 
     /// Create a new application state.
-    fn new((server_address, port, nat_map): Self::Flags) -> (AppState, iced::Command<Message>) {
+    fn new(args: Self::Flags) -> (AppState, iced::Command<Message>) {
         // Get base settings from the settings file, or default.
         let mut settings = settings_path()
             .and_then(|p| {
@@ -443,14 +447,26 @@ impl iced::Application for AppState {
             .unwrap_or_default();
 
         // The CLI arguments take final precedence on start.
-        if let Some(server_address) = &server_address {
-            settings.server_address = server_address.clone();
-        }
-        if let Some(port) = port {
-            settings.port_forwarding_text = port.to_string();
-            settings.port_mapping = PortMappingGuiOptions::PortForwarding(Some(port));
-        } else if nat_map {
-            settings.port_mapping = PortMappingGuiOptions::TryPcpNatPmp;
+        if let Some(crate::Cli {
+            server_address,
+            port_override,
+            gateway,
+            nat_map,
+            ..
+        }) = args
+        {
+            if let Some(server_address) = server_address {
+                settings.server_address = server_address;
+            }
+            if let Some(gateway) = gateway {
+                settings.gateway_address = Some(gateway);
+            }
+            if let Some(port) = port_override {
+                settings.port_forwarding_text = port.to_string();
+                settings.port_mapping = PortMappingGuiOptions::PortForwarding(Some(port));
+            } else if nat_map {
+                settings.port_mapping = PortMappingGuiOptions::TryPcpNatPmp;
+            }
         }
         let server_address_is_empty = settings.server_address.is_empty();
 
@@ -488,6 +504,9 @@ impl iced::Application for AppState {
 
             // Handle the port forward text field being changed.
             Message::PortForwardTextChanged(text) => self.update_port_forward_text(text),
+
+            // Handle the gateway text field being changed.
+            Message::GatewayTextChanged(text) => self.update_gateway_text(text),
 
             // Handle the publish button being clicked by picking a file to publish.
             Message::ConnectClicked => self.update_connect_clicked(),
@@ -809,13 +828,26 @@ impl AppState {
         )
         .spacing(6);
 
+        // Create a text input for the gateway address.
+        let gateway = widget::row!(
+            widget::text("Gateway address:"),
+            widget::text_input(
+                "Gateway address (e.g. 192.168.1.1), or leave empty",
+                self.options.gateway_address.as_deref().unwrap_or_default()
+            )
+            .on_input(Message::GatewayTextChanged)
+        )
+        .spacing(6)
+        .align_items(iced::Alignment::Center);
+
         widget::container(
             widget::column!(
                 widget::vertical_space(),
                 server_address,
                 connect_button,
                 widget::vertical_space().height(iced::Length::FillPortion(2)),
-                choose_port_mapping
+                choose_port_mapping,
+                gateway,
             )
             .align_items(iced::Alignment::Center)
             .spacing(6),
@@ -1141,6 +1173,16 @@ impl AppState {
         iced::Command::none()
     }
 
+    // Update the state after the gateway text field was changed.
+    fn update_gateway_text(&mut self, text: String) -> iced::Command<Message> {
+        if text.trim().is_empty() {
+            self.options.gateway_address = None;
+        } else {
+            self.options.gateway_address = Some(text);
+        }
+        iced::Command::none()
+    }
+
     /// Update the state after the connect button was clicked.
     fn update_connect_clicked(&mut self) -> iced::Command<Message> {
         // Clear the status message before starting the connection attempt.
@@ -1187,6 +1229,7 @@ impl AppState {
                 PortMappingConfig::PcpNatPmp(self.port_mapping.take())
             }
         };
+        let gateway = self.options.gateway_address.clone();
 
         // Try to connect to the server in a new task.
         iced::Command::perform(
@@ -1195,7 +1238,7 @@ impl AppState {
                 crate::core::prepare_server_connection(
                     server_address.as_deref(),
                     port,
-                    None,
+                    gateway.as_deref(),
                     port_mapping,
                     &mut bb,
                 )
