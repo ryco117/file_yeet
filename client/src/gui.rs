@@ -305,6 +305,7 @@ struct AppSettings {
     pub gateway_address: Option<String>,
     pub port_forwarding_text: String,
     pub port_mapping: PortMappingGuiOptions,
+    pub last_publish_paths: Vec<PathBuf>,
 }
 
 /// The state of the application for interacting with the GUI.
@@ -917,6 +918,7 @@ impl AppState {
                     let remove = widget::button(widget::text("Remove").size(12))
                         .on_press(Message::RemoveFromTransfers(t.nonce, transfer_type));
                     widget::row!(
+                        // TODO: If the transfer failed, color error text red.
                         widget::text(r).width(iced::Length::Fill),
                         if matches!(transfer_type, FileYeetCommandType::Sub)
                             && matches!(r, TransferResult::Success)
@@ -957,15 +959,14 @@ impl AppState {
     }
 
     fn draw_pubs<'a>(publishes: &[PublishItem]) -> iced::Element<'a, Message> {
-        widget::column(publishes.iter().map(|pi| {
+        let publish_views = publishes.iter().map(|pi| {
             widget::container(
                 match &pi.state {
                     PublishState::Hashing(progress) => widget::row!(
                         widget::column!(
                             widget::row!(
                                 widget::text("Hashing..."),
-                                widget::progress_bar(0.0..=1., *progress.read().unwrap())
-                                    .width(iced::Length::Fill),
+                                widget::progress_bar(0.0..=1., *progress.read().unwrap()),
                             )
                             .spacing(6),
                             widget::text(&pi.path.to_string_lossy()).size(12),
@@ -985,13 +986,21 @@ impl AppState {
                             .on_press(Message::CancelPublish(pi.nonce))
                     ),
                     PublishState::Failure(e) => widget::row!(
-                        widget::text(format!("Failed to publish: {e}"))
-                            .style(iced::theme::Text::Color(ERROR_RED_COLOR)),
+                        widget::column!(
+                            widget::text(format!("Failed to publish: {e}"))
+                                .style(iced::theme::Text::Color(ERROR_RED_COLOR)),
+                            widget::text(&pi.path.to_string_lossy()).size(12),
+                        )
+                        .width(iced::Length::Fill),
                         widget::button(widget::text("Remove").size(12))
                             .on_press(Message::CancelPublish(pi.nonce))
                     ),
                     PublishState::Cancelled => widget::row!(
-                        widget::text("Cancelled"),
+                        widget::column!(
+                            widget::text("Cancelled"),
+                            widget::text(&pi.path.to_string_lossy()).size(12),
+                        )
+                        .width(iced::Length::Fill),
                         widget::button(widget::text("Remove").size(12))
                             .on_press(Message::CancelPublish(pi.nonce))
                     ),
@@ -1000,11 +1009,12 @@ impl AppState {
                 .spacing(12),
             )
             .style(iced::theme::Container::Box)
+            .width(iced::Length::Fill)
             .padding([6, 12, 6, 6]) // Extra padding on the right because of optional scrollbar.
             .into()
-        }))
-        .spacing(6)
-        .into()
+        });
+
+        widget::column(publish_views).spacing(6).into()
     }
 
     /// Draw the main application controls when connected to a server.
@@ -1295,6 +1305,18 @@ impl AppState {
                     external_address,
                 ));
                 self.port_mapping = port_mapping;
+
+                // Attempt to recreate previous publish tasks.
+                if !self.options.last_publish_paths.is_empty() {
+                    return iced::Command::batch(self.options.last_publish_paths.drain(..).map(
+                        |p| {
+                            iced::Command::perform(
+                                std::future::ready(Some(p)),
+                                Message::PublishPathChosen,
+                            )
+                        },
+                    ));
+                }
             }
             Err(e) => {
                 self.status_message = Some(format!("Error connecting: {e}"));
@@ -1958,7 +1980,25 @@ impl AppState {
             ..
         }) = &mut self.connection_state
         {
-            // Save the settings before closing the application.
+            self.options.last_publish_paths = publishes
+                .drain(..)
+                .filter_map(|p| {
+                    // Ensure all publish tasks are cancelled.
+                    p.cancellation_token.cancel();
+
+                    // If the publish is valid or in progress, add it to the list of open publishes.
+                    if matches!(
+                        p.state,
+                        PublishState::Publishing(_) | PublishState::Hashing(_)
+                    ) {
+                        Some(p.path)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            // Save the app settings when closing our connections.
             if let Err(e) = settings_path()
                 .ok_or_else(|| {
                     anyhow::anyhow!("Could not determine a settings path for this environment.")
@@ -1967,11 +2007,6 @@ impl AppState {
                 .and_then(|f| Ok(serde_json::to_writer_pretty(f, &self.options)?))
             {
                 eprintln!("{} Could not save settings: {e}", local_now_fmt());
-            }
-
-            // Cancel all publish tasks.
-            for p in publishes.iter() {
-                p.cancellation_token.cancel();
             }
 
             // TODO: Allow current downloads to be recontinued after a restart.
@@ -2003,7 +2038,7 @@ impl AppState {
             )
         } else {
             match close_type {
-                // Immediately exit if there is no port mapping to remove.
+                // Immediately exit if there isn't a port mapping to remove.
                 CloseType::Application => window::close(window::Id::MAIN),
 
                 CloseType::Connections => {

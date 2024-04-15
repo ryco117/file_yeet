@@ -2,6 +2,7 @@ use windows::Win32::{self, System::Console};
 
 /// A helper for freeing the console if it was allocated by this process.
 /// In practice, it helps avoid viewing a console window when run as a GUI application.
+// TODO: Make this its own library because it is not specific to this project.
 pub fn free_allocated_console() {
     // Get the console window handle.
     let console_window = unsafe { Console::GetConsoleWindow() };
