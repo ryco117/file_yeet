@@ -72,6 +72,9 @@ impl From<(quinn::Connection, BiStream)> for PeerConnection {
     }
 }
 
+/// Nonce used to identifying items locally.
+type Nonce = u64;
+
 /// The result of a file transfer with a peer.
 #[derive(Clone, Debug, displaydoc::Display)]
 pub enum TransferResult {
@@ -93,9 +96,6 @@ enum TransferProgress {
     Transferring(PeerConnection, Arc<RwLock<f32>>, f32),
     Done(TransferResult),
 }
-
-/// Nonce used to identifying items locally.
-type Nonce = u64;
 
 /// A file transfer with a peer in any state.
 #[derive(Debug)]
@@ -249,11 +249,11 @@ struct ConnectedState {
     /// List of download requests to peers.
     downloads: Vec<Transfer>,
 
-    /// List of file publish requests to the server.
-    publishes: Vec<PublishItem>,
-
     /// List of file uploads to peers.
     uploads: Vec<Transfer>,
+
+    /// List of file publish requests to the server.
+    publishes: Vec<PublishItem>,
 
     /// The transfer view being shown.
     transfer_view: TransferView,
@@ -267,8 +267,8 @@ impl ConnectedState {
             hash_input: String::new(),
             peers: HashMap::new(),
             downloads: Vec::new(),
-            publishes: Vec::new(),
             uploads: Vec::new(),
+            publishes: Vec::new(),
             transfer_view: TransferView::Publishes,
         }
     }
@@ -306,6 +306,7 @@ struct AppSettings {
     pub port_forwarding_text: String,
     pub port_mapping: PortMappingGuiOptions,
     pub last_publish_paths: Vec<PathBuf>,
+    pub last_downloads: Vec<(PathBuf, HashBytes)>,
 }
 
 /// The state of the application for interacting with the GUI.
@@ -1515,8 +1516,8 @@ impl AppState {
     ) -> iced::Command<Message> {
         let ConnectionState::Connected(ConnectedState {
             peers,
-            publishes,
             uploads,
+            publishes,
             ..
         }) = &mut self.connection_state
         else {
@@ -1761,16 +1762,14 @@ impl AppState {
         result: Option<PeerConnection>,
     ) -> iced::Command<Message> {
         let ConnectionState::Connected(ConnectedState {
-            peers,
-            downloads: transfers,
-            ..
+            peers, downloads, ..
         }) = &mut self.connection_state
         else {
             return iced::Command::none();
         };
 
         // Find the transfer with the matching nonce.
-        let Some((index, transfer)) = transfers
+        let Some((index, transfer)) = downloads
             .iter_mut()
             .enumerate()
             .find(|(_, t)| t.nonce == nonce)
@@ -1796,23 +1795,21 @@ impl AppState {
             transfer.progress = TransferProgress::Consent(connection);
         } else {
             // Remove unreachable peers from view.
-            transfers.remove(index);
+            downloads.remove(index);
         }
         iced::Command::none()
     }
 
     /// Tell the peer to send the file and begin recieving and writing the file.
     fn update_accept_download(&mut self, nonce: Nonce) -> iced::Command<Message> {
-        let ConnectionState::Connected(ConnectedState {
-            downloads: transfers,
-            ..
-        }) = &mut self.connection_state
+        let ConnectionState::Connected(ConnectedState { downloads, .. }) =
+            &mut self.connection_state
         else {
             return iced::Command::none();
         };
 
         // Get the current transfer status.
-        let Some(transfer) = transfers.iter_mut().find(|t| t.nonce == nonce) else {
+        let Some(transfer) = downloads.iter_mut().find(|t| t.nonce == nonce) else {
             return iced::Command::none();
         };
         let hash = transfer.hash;
@@ -1976,6 +1973,7 @@ impl AppState {
     fn safely_close(&mut self, close_type: CloseType) -> iced::Command<Message> {
         if let ConnectionState::Connected(ConnectedState {
             endpoint,
+            downloads,
             publishes,
             ..
         }) = &mut self.connection_state
@@ -1998,6 +1996,23 @@ impl AppState {
                 })
                 .collect();
 
+            self.options.last_downloads = downloads
+                .drain(..)
+                .filter_map(|d| {
+                    // If the download is in progress, cancel it.
+                    d.cancellation_token.cancel();
+
+                    // Ensure all downloads that were in-progress are saved.
+                    if matches!(d.progress, TransferProgress::Transferring(_, _, _)) {
+                        Some((d.path, d.hash))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            endpoint.close(GOODBYE_CODE, GOODBYE_MESSAGE.as_bytes());
+
             // Save the app settings when closing our connections.
             if let Err(e) = settings_path()
                 .ok_or_else(|| {
@@ -2008,9 +2023,6 @@ impl AppState {
             {
                 eprintln!("{} Could not save settings: {e}", local_now_fmt());
             }
-
-            // TODO: Allow current downloads to be recontinued after a restart.
-            endpoint.close(GOODBYE_CODE, GOODBYE_MESSAGE.as_bytes());
         };
 
         if let Some(port_mapping) = self.port_mapping.take() {

@@ -21,7 +21,7 @@ pub type HashBytes = [u8; HASH_BYTE_COUNT];
 
 /// The maximum number of seconds of inactivity before a QUIC connection is closed.
 /// Same for both the server and the client.
-pub const QUIC_TIMEOUT_SECONDS: u64 = 60;
+pub const QUIC_TIMEOUT_SECONDS: u64 = 120;
 
 /// Code sent on a graceful disconnect.
 pub const GOODBYE_CODE: quinn::VarInt = quinn::VarInt::from_u32(0);
@@ -51,6 +51,9 @@ pub enum ClientApiRequest {
 
     /// Specify a file hash that this client wants to subscribe to.
     Subscribe,
+
+    /// Request to be introduced to a specific peer over a certain file hash.
+    Introduction,
 }
 impl std::fmt::Display for ClientApiRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -59,6 +62,7 @@ impl std::fmt::Display for ClientApiRequest {
             ClientApiRequest::PortOverride => "PORT_OVERRIDE",
             ClientApiRequest::Publish => "PUBLISH      ",
             ClientApiRequest::Subscribe => "SUBSCRIBE    ",
+            ClientApiRequest::Introduction => "INTRODUCTION ",
         };
         write!(f, "REQ: {str}")
     }

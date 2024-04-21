@@ -393,7 +393,6 @@ pub async fn subscribe(
         return Ok(Vec::with_capacity(0));
     }
 
-    let mut scratch_space = [0; MAX_SERVER_COMMUNICATION_SIZE];
     let mut peers = Vec::new();
 
     // Parse each peer socket address and file size.
@@ -401,22 +400,13 @@ pub async fn subscribe(
         // Read the incoming peer address length.
         let address_len = server_streams
             .recv
-            .read_u16()
+            .read_u8()
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to read response from server: {e}"))?
-            as usize;
+            .map_err(|e| anyhow::anyhow!("Failed to read response from server: {e}"))?;
 
         // Read the incoming peer address to memory.
-        let peer_string_bytes = &mut scratch_space[..address_len];
-        server_streams
-            .recv
-            .read_exact(peer_string_bytes)
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!("Failed to read a valid UTF-8 response from the server: {e}")
-            })?;
-        let peer_address_str = std::str::from_utf8(peer_string_bytes)
-            .map_err(|e| anyhow::anyhow!("Server did not send a valid UTF-8 response: {e}"))?;
+        let peer_address_str =
+            expect_server_text(&mut server_streams.recv, u16::from(address_len)).await?;
 
         // Parse the peer address into a socket address.
         let peer_address = match peer_address_str.parse() {
@@ -493,7 +483,7 @@ pub async fn udp_holepunch(
 /// Try to finalize a peer connection attempt by turning it into a bi-directional stream.
 pub async fn peer_connection_into_stream(
     connection: &quinn::Connection,
-    hash: HashBytes,
+    expected_hash: HashBytes,
     cmd: FileYeetCommandType,
 ) -> Option<BiStream> {
     let streams = match cmd {
@@ -504,8 +494,8 @@ pub async fn peer_connection_into_stream(
                 let mut requested_hash = HashBytes::default();
                 s.1.read_exact(&mut requested_hash).await.ok()?;
 
-                // Ensure the requested hash matches the file hash.
-                if requested_hash != hash {
+                // Ensure the requested hash matches the expected file hash.
+                if requested_hash != expected_hash {
                     eprintln!(
                         "{} Peer requested a file with an unexpected hash",
                         local_now_fmt(),
@@ -521,7 +511,7 @@ pub async fn peer_connection_into_stream(
             // Open a bi-directional stream to the publishing peer.
             let mut r = connection.open_bi().await;
             if let Ok(s) = &mut r {
-                s.0.write_all(&hash).await.ok()?;
+                s.0.write_all(&expected_hash).await.ok()?;
 
                 println!("{} New peer stream opened", local_now_fmt());
             }
@@ -885,7 +875,9 @@ fn configure_peer_verification() -> quinn::ClientConfig {
     ));
 
     // Send keep alive packets at a fraction of the idle timeout.
-    transport_config.keep_alive_interval(Some(Duration::from_secs(10)));
+    transport_config.keep_alive_interval(Some(Duration::from_secs(
+        file_yeet_shared::QUIC_TIMEOUT_SECONDS / 6,
+    )));
     client_config.transport_config(Arc::new(transport_config));
 
     client_config

@@ -188,6 +188,10 @@ enum ClientRequestError {
     /// An I/O error on occurred when reading or writing to a QUIC stream.
     #[error("I/O error on peer stream: {0}")]
     IoError(std::io::Error),
+
+    /// Invalid content was sent by the client in the request.
+    #[error("Invalid request content was sent by the client")]
+    InvalidRequestContent,
 }
 
 #[derive(Debug)]
@@ -200,7 +204,9 @@ struct ClientSession {
 }
 impl ClientSession {
     pub fn new(socket_addr: SocketAddr, cancellation_token: CancellationToken) -> Self {
-        let sock_string = Arc::new(RwLock::new(socket_addr.to_string()));
+        let mut sock_string = socket_addr.to_string();
+        sock_string.make_ascii_lowercase();
+        let sock_string = Arc::new(RwLock::new(sock_string));
         let nonce = random_nonce();
         let bb = bytes::BytesMut::with_capacity(MAX_SERVER_COMMUNICATION_SIZE);
 
@@ -297,19 +303,12 @@ async fn handle_quic_connection(
             // Handle the client's file-subscription request.
             // Close the connection if we can't complete the request.
             ClientApiRequest::Subscribe => {
-                let mut hash = HashBytes::default();
-                client_streams
-                    .recv
-                    .read_exact(&mut hash)
-                    .await
-                    .map_err(|_| {
-                        ClientRequestError::IoError(std::io::Error::from(
-                            std::io::ErrorKind::UnexpectedEof,
-                        ))
-                    })?;
+                handle_subscribe(&mut session, client_streams, &publishers).await?;
+            }
 
-                // Now that we have the peer's socket address and the file hash, we can handle the subscribe request.
-                handle_subscribe(&mut session, &mut client_streams.send, hash, &publishers).await?;
+            // Handle the client's request to be introduced to a specific peer over a certain file hash.
+            ClientApiRequest::Introduction => {
+                handle_introduction(&mut session, client_streams, &publishers).await?;
             }
         }
         // Clear the scratch space before the next iteration.
@@ -494,14 +493,23 @@ async fn handle_publish(
     });
 }
 
-/// Handle QUIC connections for clients that want to subscribe to a file hash.
-#[tracing::instrument(skip(session, quic_send, clients))]
+/// Handle a client request to subscribe to a file hash, receiving a list of peers that are publishing this hash.
+#[tracing::instrument(skip(session, client_streams, clients))]
 async fn handle_subscribe(
     session: &mut ClientSession,
-    quic_send: &mut quinn::SendStream,
-    hash: HashBytes,
+    mut client_streams: BiStream,
     clients: &PublishersRef,
 ) -> Result<(), ClientRequestError> {
+    // Start by getting the file hash from the client.
+    let mut hash = HashBytes::default();
+    client_streams
+        .recv
+        .read_exact(&mut hash)
+        .await
+        .map_err(|_| {
+            ClientRequestError::IoError(std::io::Error::from(std::io::ErrorKind::UnexpectedEof))
+        })?;
+
     // Attempt to get the client from the map.
     let read_lock = clients.read().await;
     let Some(client_list) = read_lock.get(&hash).filter(|v| !v.is_empty()) else {
@@ -516,7 +524,8 @@ async fn handle_subscribe(
         }
 
         // Send the subscriber a message that no publishers are available.
-        quic_send
+        client_streams
+            .send
             .write_u16(0)
             .await
             .map_err(ClientRequestError::IoError)?;
@@ -524,7 +533,7 @@ async fn handle_subscribe(
     };
 
     // Write a temporary zero to the buffer for space efficiency.
-    // This will be overwritten later.
+    // This will be overwritten later with the actual number of peers introduced.
     session.bb.put_u16(0);
 
     let clients = client_list.iter();
@@ -537,13 +546,13 @@ async fn handle_subscribe(
         let client_address = pub_client.address.read().await;
 
         // Ensure that the message doesn't exceed the maximum size.
-        if session.bb.len() + (size_of::<u64>() + size_of::<u16>()) + client_address.len()
+        if session.bb.len() + (size_of::<u64>() + size_of::<u8>()) + client_address.len()
             > MAX_SERVER_COMMUNICATION_SIZE
         {
             break;
         }
 
-        // Feed the publishing client socket address to the task that handles communicating with this client.
+        // Feed the subscribing client's socket address to the task that handles communicating with the publisher.
         // Only include the peer if the message was successfully passed.
         if let Ok(()) = pub_client
             .stream
@@ -553,7 +562,7 @@ async fn handle_subscribe(
             // Send the publisher's socket address to the subscribing client.
             session
                 .bb
-                .put_u16(u16::try_from(client_address.len()).unwrap());
+                .put_u8(u8::try_from(client_address.len()).unwrap());
             session.bb.put(client_address.as_bytes());
 
             // Send the file size to the subscribing client.
@@ -567,7 +576,8 @@ async fn handle_subscribe(
     session.bb[..2].copy_from_slice(&n.to_be_bytes());
 
     // Send the message to the client.
-    quic_send
+    client_streams
+        .send
         .write_all(&session.bb)
         .await
         .map_err(|e| ClientRequestError::IoError(e.into()))?;
@@ -579,6 +589,93 @@ async fn handle_subscribe(
             n,
             session.sock_string.read().await,
         );
+    }
+
+    Ok(())
+}
+
+/// Handle a client request to be introduced to a specific client regarding a file they are publishing.
+#[tracing::instrument(skip(session, client_streams, clients))]
+async fn handle_introduction(
+    session: &mut ClientSession,
+    mut client_streams: BiStream,
+    clients: &PublishersRef,
+) -> Result<(), ClientRequestError> {
+    let mut hash = HashBytes::default();
+    client_streams
+        .recv
+        .read_exact(&mut hash)
+        .await
+        .map_err(|_| {
+            ClientRequestError::IoError(std::io::Error::from(std::io::ErrorKind::UnexpectedEof))
+        })?;
+
+    let address_len = client_streams.recv.read_u8().await.map_err(|_| {
+        ClientRequestError::IoError(std::io::Error::from(std::io::ErrorKind::UnexpectedEof))
+    })?;
+
+    let mut scratch_space = [0; 256];
+    let slice = &mut scratch_space[..address_len as usize];
+    client_streams.recv.read_exact(slice).await.map_err(|_| {
+        ClientRequestError::IoError(std::io::Error::from(std::io::ErrorKind::UnexpectedEof))
+    })?;
+    let peer_address = std::str::from_utf8(slice)
+        .map(str::to_lowercase)
+        .map_err(|_| ClientRequestError::InvalidRequestContent)?;
+
+    // Attempt to get the clients from the file-hash map.
+    let read_lock = clients.read().await;
+    let Some(client_list) = read_lock.get(&hash).filter(|v| !v.is_empty()) else {
+        #[cfg(debug_assertions)]
+        {
+            let mut hex_hash_bytes = [0; 2 * file_yeet_shared::HASH_BYTE_COUNT];
+            tracing::debug!(
+                "Failed to find client for hash {}",
+                faster_hex::hex_encode(&hash, &mut hex_hash_bytes)
+                    .expect("Failed to encode hash in hexadecimal"),
+            );
+        }
+
+        // Send the subscriber a message that no publishers are available.
+        client_streams
+            .send
+            .write_u8(0)
+            .await
+            .map_err(ClientRequestError::IoError)?;
+        return Ok(());
+    };
+
+    let clients = client_list.iter();
+    for (_, pub_client) in clients {
+        // Get read access on client lock.
+        let pub_client = pub_client.publisher.read().await;
+        let client_address = pub_client.address.read().await;
+
+        if client_address.eq(&peer_address) {
+            // Feed the subscribing client's socket address to the task that handles communicating with the publisher.
+            if let Ok(()) = pub_client
+                .stream
+                .send(session.sock_string.read().await.clone())
+                .await
+            {
+                // Send the file size to the subscribing client.
+                client_streams
+                    .send
+                    .write_u8(1)
+                    .await
+                    .map_err(ClientRequestError::IoError)?;
+
+                #[cfg(debug_assertions)]
+                tracing::debug!(
+                    "Introduced publisher {} to {}",
+                    peer_address,
+                    session.sock_string.read().await,
+                );
+            }
+
+            // We found the correct socket address, stop searching the client list.
+            break;
+        }
     }
 
     Ok(())
