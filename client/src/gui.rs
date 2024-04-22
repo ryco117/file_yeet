@@ -50,23 +50,24 @@ enum PortMappingGuiOptions {
     TryPcpNatPmp,
 }
 
-/// A peer connection in QUIC for requesting or serving a file to a peer.
+/// A peer connection representing a single request/command.
+/// Peers may have multiple connections to the same peer for different requests.
 #[derive(Clone, Debug)]
-pub struct PeerConnection {
+pub struct PeerRequestStream {
     pub connection: quinn::Connection,
-    pub streams: Arc<tokio::sync::Mutex<BiStream>>,
+    pub bistream: Arc<tokio::sync::Mutex<BiStream>>,
 }
-impl PeerConnection {
+impl PeerRequestStream {
     /// Make a new `PeerConnection` from a QUIC connection and a bi-directional stream.
     #[must_use]
     pub fn new(connection: quinn::Connection, streams: BiStream) -> Self {
         Self {
             connection,
-            streams: Arc::new(tokio::sync::Mutex::new(streams)),
+            bistream: Arc::new(tokio::sync::Mutex::new(streams)),
         }
     }
 }
-impl From<(quinn::Connection, BiStream)> for PeerConnection {
+impl From<(quinn::Connection, BiStream)> for PeerRequestStream {
     fn from((connection, streams): (quinn::Connection, BiStream)) -> Self {
         Self::new(connection, streams)
     }
@@ -92,8 +93,8 @@ pub enum TransferResult {
 #[derive(Debug)]
 enum TransferProgress {
     Connecting,
-    Consent(PeerConnection),
-    Transferring(PeerConnection, Arc<RwLock<f32>>, f32),
+    Consent(PeerRequestStream),
+    Transferring(PeerRequestStream, Arc<RwLock<f32>>, f32),
     Done(TransferResult),
 }
 
@@ -108,6 +109,15 @@ struct Transfer {
     pub path: PathBuf,
     pub progress: TransferProgress,
     pub cancellation_token: CancellationToken,
+}
+
+/// The fundamental elements of a file transfer.
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+pub struct TransferBase {
+    pub hash: HashBytes,
+    pub file_size: u64,
+    pub peer_socket: SocketAddr,
+    pub path: PathBuf,
 }
 
 #[derive(Clone, Debug)]
@@ -306,7 +316,7 @@ struct AppSettings {
     pub port_forwarding_text: String,
     pub port_mapping: PortMappingGuiOptions,
     pub last_publish_paths: Vec<PathBuf>,
-    pub last_downloads: Vec<(PathBuf, HashBytes)>,
+    pub last_downloads: Vec<TransferBase>,
 }
 
 /// The state of the application for interacting with the GUI.
@@ -353,6 +363,15 @@ pub enum Message {
     /// All async actions to leave a server have completed.
     LeftServer,
 
+    /// A peer has connected to our endpoint directly.
+    PeerConnected(quinn::Connection),
+
+    /// A peer has requested a new transfer from an existing connection.
+    PeerRequestedTransfer((HashBytes, PeerRequestStream)),
+
+    /// A connection to a peer has been disconnected.
+    PeerDisconnected(SocketAddr),
+
     /// The transfer view radio buttons were changed.
     TransferViewChanged(TransferView),
 
@@ -368,11 +387,11 @@ pub enum Message {
     /// The result of a publish request.
     PublishRequestResulted(Nonce, PathBuf, PublishRequestResult),
 
-    /// The result of trying to recieve a peer to publish to from the server.
+    /// The result of trying to receive a peer to publish to from the server.
     PublishPeerReceived(Nonce, Result<SocketAddr, Arc<anyhow::Error>>),
 
     /// The result of trying to connect to a peer to publish to.
-    PublishPeerConnectResulted(Nonce, Option<PeerConnection>),
+    PublishPeerConnectResulted(Nonce, Option<PeerRequestStream>),
 
     /// The subscribe button was clicked or the hash field was submitted.
     SubscribeStarted,
@@ -380,11 +399,14 @@ pub enum Message {
     /// The path to save a file to was chosen or cancelled.
     SubscribePathChosen(Option<PathBuf>),
 
+    /// A download is being recreated from the open transfers at last close.
+    SubscribeRecreated(TransferBase),
+
     /// A subscribe request was completed.
     SubscribePeersResult(Result<IncomingSubscribePeers, Arc<anyhow::Error>>),
 
     /// A subscribe connection attempt was completed.
-    SubscribePeerConnectResulted(Nonce, Option<PeerConnection>),
+    SubscribePeerConnectResulted(Nonce, Option<PeerRequestStream>),
 
     // A download was accepted, initiate the download.
     AcceptDownload(Nonce),
@@ -501,34 +523,40 @@ impl iced::Application for AppState {
                 iced::Command::none()
             }
 
-            // Handle the port mapping radio button being changed.
             Message::PortMappingRadioChanged(label) => self.update_port_radio_changed(label),
-
-            // Handle the port forward text field being changed.
             Message::PortForwardTextChanged(text) => self.update_port_forward_text(text),
-
-            // Handle the gateway text field being changed.
             Message::GatewayTextChanged(text) => self.update_gateway_text(text),
-
-            // Handle the publish button being clicked by picking a file to publish.
             Message::ConnectClicked => self.update_connect_clicked(),
-
-            // The animation tick doesn't need anything special besides updating the tick state.
             Message::AnimationTick => self.update_animation_tick(),
-
-            // Handle the result of a connection attempt.
             Message::ConnectResulted(r) => self.update_connect_resulted(r),
 
             // Copy the connected server address to the clipboard.
             Message::CopyServer => iced::clipboard::write(self.options.server_address.clone()),
 
-            // Leave the server and disconnect.
             Message::SafelyLeaveServer => self.safely_close(CloseType::Connections),
 
             // All async actions to leave a server have completed.
             Message::LeftServer => {
                 self.safely_closing = false;
                 self.connection_state = ConnectionState::Disconnected;
+                iced::Command::none()
+            }
+
+            Message::PeerConnected(connection) => self.update_peer_connected(connection),
+
+            // A peer has requested a new transfer from an existing connection.
+            Message::PeerRequestedTransfer((hash, peer_request)) => {
+                self.update_peer_requested_transfer(hash, peer_request)
+            }
+
+            // A peer has disconnected from the endpoint. Remove them from our map.
+            Message::PeerDisconnected(peer_addr) => {
+                if let ConnectionState::Connected(ConnectedState { peers, .. }) =
+                    &mut self.connection_state
+                {
+                    peers.remove(&peer_addr);
+                };
+
                 iced::Command::none()
             }
 
@@ -566,18 +594,11 @@ impl iced::Application for AppState {
                 )
             }
 
-            // Begin the process of publishing a file to the server.
             Message::PublishPathChosen(path) => self.update_publish_path_chosen(path),
-
-            // Handle the result of a publish request.
             Message::PublishRequestResulted(nonce, path, r) => {
                 self.update_publish_request_resulted(nonce, &path, r)
             }
-
-            // Handle a peer connection being received for a publish request.
             Message::PublishPeerReceived(nonce, r) => self.update_publish_peer_received(nonce, r),
-
-            // Handle the result of a peer connection attempt for a publish request.
             Message::PublishPeerConnectResulted(pub_nonce, peer) => {
                 self.update_publish_peer_connect_resulted(pub_nonce, peer)
             }
@@ -598,32 +619,23 @@ impl iced::Application for AppState {
                 )
             }
 
-            // Begin the process of subscribing to a file from the server.
             Message::SubscribePathChosen(path) => self.update_subscribe_path_chosen(path),
-
-            // Handle the result of a subscribe request.
+            Message::SubscribeRecreated(transfer_base) => {
+                self.update_subscribe_recreated(transfer_base)
+            }
             Message::SubscribePeersResult(r) => self.update_subscribe_peers_result(r),
-
-            // Handle the result of a subscribe connection attempt to a peer.
             Message::SubscribePeerConnectResulted(nonce, r) => {
                 self.update_subscribe_connect_resulted(nonce, r)
             }
-
-            // Handle the download being accepted, initiate the download.
             Message::AcceptDownload(nonce) => self.update_accept_download(nonce),
 
             // Copy a hash to the clipboard.
             Message::CopyHash(hash) => iced::clipboard::write(hash),
 
-            // Set the cancellation token to notify the publishing thread to cancel.
             Message::CancelPublish(nonce) => self.update_cancel_publish(nonce),
-
-            // Handle a transfer being cancelled.
             Message::CancelTransfer(nonce, transfer_type) => {
                 self.update_cancel_transfer(nonce, transfer_type)
             }
-
-            // Handle the conclusive result of a transfer.
             Message::TransferResulted(nonce, r, transfer_type) => {
                 self.update_transfer_resulted(nonce, r, transfer_type)
             }
@@ -636,7 +648,6 @@ impl iced::Application for AppState {
                 iced::Command::none()
             }
 
-            // Handle a transfer being removed from the downloads list.
             Message::RemoveFromTransfers(nonce, transfer_type) => {
                 self.update_remove_from_transfers(nonce, transfer_type)
             }
@@ -668,7 +679,7 @@ impl iced::Application for AppState {
 
         // Listen for timing intervals to update animations.
         let animation =
-            || iced::time::every(Duration::from_millis(33)).map(|_| Message::AnimationTick);
+            || iced::time::every(Duration::from_millis(20)).map(|_| Message::AnimationTick);
 
         match &self.connection_state {
             // Listen for close events and animation ticks when connecting/stalling.
@@ -676,7 +687,13 @@ impl iced::Application for AppState {
                 iced::Subscription::batch([close_event(), animation()])
             }
 
-            ConnectionState::Connected(ConnectedState { publishes, .. }) => {
+            ConnectionState::Connected(ConnectedState {
+                endpoint,
+                peers,
+                publishes,
+                ..
+            }) => {
+                // Create a listener for each file we are publishing for new peers from the server.
                 let pubs = publishes.iter().filter_map(|publish| {
                     // If the publish is still hashing, nothing to loop yet.
                     let PublishItem { nonce, cancellation_token, state: PublishState::Publishing(publish), .. } = &publish else { return None; };
@@ -685,7 +702,7 @@ impl iced::Application for AppState {
                     let publish = publish.clone();
 
                     // Subscribe to the server for new peers to upload to.
-                    Some(iced::subscription::channel(nonce, 10, move |mut output| async move {
+                    Some(iced::subscription::channel(nonce, 8, move |mut output| async move {
                         loop {
                             let mut server = publish.server_streams.lock().await;
 
@@ -698,7 +715,7 @@ impl iced::Application for AppState {
 
                                     // Provide a brief wait for the task to be cancelled.
                                     tokio::time::sleep(Duration::from_millis(200)).await;
-                                    println!("{} Dead publish task is still running...", local_now_fmt());
+                                    eprintln!("{} Dead publish task is still running...", local_now_fmt());
                                 }
 
                                 // Await the server to send a peer connection.
@@ -718,10 +735,94 @@ impl iced::Application for AppState {
                     }))
                 });
 
-                iced::Subscription::batch([close_event(), animation()].into_iter().chain(pubs))
+                // Create a task to listen for incoming connections to our QUIC endpoint.
+                let incoming_connections = {
+                    let endpoint = endpoint.clone();
+                    iced::subscription::channel(0, 4, move |mut output| async move {
+                        loop {
+                            let incoming = endpoint.accept().await;
+                            if let Some(connection) = incoming {
+                                if let Ok(connection) = connection.await {
+                                    if let Err(e) =
+                                        output.send(Message::PeerConnected(connection)).await
+                                    {
+                                        eprintln!(
+                                            "{} Failed to perform internal message passing: {e}",
+                                            local_now_fmt()
+                                        );
+                                    }
+                                }
+                            } else {
+                                // The local endpoint has been closed.
+                                // Provide a brief wait for the task to be cancelled.
+                                tokio::time::sleep(Duration::from_millis(200)).await;
+                                eprintln!(
+                                    "{} Endpoint task is still running after being closed...",
+                                    local_now_fmt()
+                                );
+                            }
+                        }
+                    })
+                };
+
+                // Create a listener for each peer that may want a new request stream.
+                let peer_requests = peers.iter().map(|(peer_addr, (connection, _))| {
+                    let peer_addr = *peer_addr;
+                    let connection = connection.clone();
+                    iced::subscription::channel(peer_addr, 8, move |mut output| async move {
+                        loop {
+                            // Wait for a new bi-directional stream request from the peer.
+                            match connection.accept_bi().await.map(BiStream::from) {
+                                Ok(mut streams) => {
+                                    // Get the file hash desired by the peer.
+                                    let mut hash = HashBytes::default();
+                                    if let Err(e) = streams.recv.read_exact(&mut hash).await {
+                                        eprintln!(
+                                            "{} Failed to read hash from peer: {e}",
+                                            local_now_fmt()
+                                        );
+                                        continue;
+                                    }
+
+                                    if let Err(e) = output
+                                        .send(Message::PeerRequestedTransfer((
+                                            hash,
+                                            PeerRequestStream::new(connection.clone(), streams),
+                                        )))
+                                        .await
+                                    {
+                                        eprintln!(
+                                            "{} Failed to perform internal message passing: {e}",
+                                            local_now_fmt()
+                                        );
+                                    }
+                                }
+                                Err(_) => {
+                                    // The peer has disconnected or the connection deteriorated.
+                                    if let Err(e) =
+                                        output.send(Message::PeerDisconnected(peer_addr)).await
+                                    {
+                                        eprintln!(
+                                            "{} Failed to perform internal message passing: {e}",
+                                            local_now_fmt()
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    })
+                });
+
+                // Batch all the listeners together.
+                iced::Subscription::batch(
+                    [close_event(), animation(), incoming_connections]
+                        .into_iter()
+                        .chain(pubs)
+                        .chain(peer_requests),
+                )
             }
 
-            // Listen for close events alone when disconnected.
+            // Listen for application close events when disconnected.
             ConnectionState::Disconnected => close_event(),
         }
     }
@@ -1184,7 +1285,7 @@ impl AppState {
         iced::Command::none()
     }
 
-    // Update the state after the gateway text field was changed.
+    /// Update the state after the gateway text field was changed.
     fn update_gateway_text(&mut self, text: String) -> iced::Command<Message> {
         if text.trim().is_empty() {
             self.options.gateway_address = None;
@@ -1308,15 +1409,26 @@ impl AppState {
                 self.port_mapping = port_mapping;
 
                 // Attempt to recreate previous publish tasks.
-                if !self.options.last_publish_paths.is_empty() {
-                    return iced::Command::batch(self.options.last_publish_paths.drain(..).map(
-                        |p| {
-                            iced::Command::perform(
-                                std::future::ready(Some(p)),
-                                Message::PublishPathChosen,
-                            )
-                        },
-                    ));
+                if !self.options.last_publish_paths.is_empty()
+                    || !self.options.last_downloads.is_empty()
+                {
+                    return iced::Command::batch(
+                        self.options
+                            .last_publish_paths
+                            .drain(..)
+                            .map(|p| {
+                                iced::Command::perform(
+                                    std::future::ready(Some(p)),
+                                    Message::PublishPathChosen,
+                                )
+                            })
+                            .chain(self.options.last_downloads.drain(..).map(|d| {
+                                iced::Command::perform(
+                                    std::future::ready(d),
+                                    Message::SubscribeRecreated,
+                                )
+                            })),
+                    );
                 }
             }
             Err(e) => {
@@ -1325,6 +1437,39 @@ impl AppState {
             }
         }
         iced::Command::none()
+    }
+
+    /// Update the state after a peer connected to the endpoint.
+    fn update_peer_connected(&mut self, connection: quinn::Connection) -> iced::Command<Message> {
+        if let ConnectionState::Connected(ConnectedState { peers, .. }) = &mut self.connection_state
+        {
+            peers.insert(connection.remote_address(), (connection, HashSet::new()));
+        }
+
+        iced::Command::none()
+    }
+
+    /// Update after an existing peer requested a new file transfer.
+    fn update_peer_requested_transfer(
+        &mut self,
+        hash: HashBytes,
+        peer_request: PeerRequestStream,
+    ) -> iced::Command<Message> {
+        let ConnectionState::Connected(ConnectedState { publishes, .. }) =
+            &mut self.connection_state
+        else {
+            return iced::Command::none();
+        };
+
+        // Find the publish-nonce corresponding to the hash.
+        let Some(nonce) = publishes.iter_mut().find_map(|pi| match &pi.state {
+            PublishState::Publishing(p) if p.hash == hash => Some(pi.nonce),
+            _ => None,
+        }) else {
+            return iced::Command::none();
+        };
+
+        self.update_publish_peer_connect_resulted(nonce, Some(peer_request))
     }
 
     /// Update the state after the publish button was clicked. Begins a publish request if a file was chosen.
@@ -1469,33 +1614,18 @@ impl AppState {
             .cloned();
         match (result, publish) {
             (Ok(peer), Some(publish)) => {
-                // TODO: A task will listen for connected peers. At that point we should only attempt something if not already connected.
                 let data = if let Some((c, _)) = peers.get(&peer) {
-                    Ok(c.clone())
+                    PeerConnectionOrTarget::Connection(c.clone())
                 } else {
-                    Err(endpoint.clone())
+                    PeerConnectionOrTarget::Target(endpoint.clone(), peer)
                 };
                 let hash = publish.hash;
                 iced::Command::perform(
-                    async move {
-                        match data {
-                            Ok(c) => crate::core::peer_connection_into_stream(
-                                &c,
-                                hash,
-                                FileYeetCommandType::Pub,
-                            )
-                            .await
-                            .map(|b| (c, b)),
-                            Err(e) => {
-                                crate::core::udp_holepunch(FileYeetCommandType::Pub, hash, e, peer)
-                                    .await
-                            }
-                        }
-                    },
+                    try_peer_connection(data, hash, FileYeetCommandType::Pub),
                     move |r| {
                         Message::PublishPeerConnectResulted(
                             nonce,
-                            r.map(Into::<PeerConnection>::into),
+                            r.map(Into::<PeerRequestStream>::into),
                         )
                     },
                 )
@@ -1512,7 +1642,7 @@ impl AppState {
     fn update_publish_peer_connect_resulted(
         &mut self,
         pub_nonce: Nonce,
-        peer: Option<PeerConnection>,
+        peer: Option<PeerRequestStream>,
     ) -> iced::Command<Message> {
         let ConnectionState::Connected(ConnectedState {
             peers,
@@ -1555,17 +1685,7 @@ impl AppState {
             cancellation_token: cancellation_token.clone(),
         });
 
-        let peer_address = peer.connection.remote_address();
-        match peers.entry(peer_address) {
-            std::collections::hash_map::Entry::Vacant(e) => {
-                // Add the peer into our map of known peer addresses.
-                e.insert((peer.connection.clone(), HashSet::from([upload_nonce])));
-            }
-            std::collections::hash_map::Entry::Occupied(mut e) => {
-                // Add the transfer nonce to the peer's set of known transfer nonces.
-                e.get_mut().1.insert(upload_nonce);
-            }
-        }
+        insert_nonce_for_peer(&peer, peers, peer.connection.remote_address(), upload_nonce);
 
         let file_size = publishing.file_size;
         iced::Command::perform(
@@ -1583,7 +1703,7 @@ impl AppState {
                 let reader = tokio::io::BufReader::new(file);
 
                 // Try to upload the file to the peer connection.
-                let mut streams = peer.streams.lock().await;
+                let mut streams = peer.bistream.lock().await;
 
                 tokio::select! {
                     () = cancellation_token.cancelled() => TransferResult::Cancelled,
@@ -1645,6 +1765,49 @@ impl AppState {
         )
     }
 
+    /// Update the state after loading a download from the last session.
+    fn update_subscribe_recreated(
+        &mut self,
+        transfer_base: TransferBase,
+    ) -> iced::Command<Message> {
+        // Ensure the client is connected to a server.
+        let ConnectionState::Connected(ConnectedState {
+            endpoint,
+            downloads,
+            ..
+        }) = &mut self.connection_state
+        else {
+            return iced::Command::none();
+        };
+
+        let TransferBase {
+            hash,
+            file_size,
+            peer_socket,
+            path,
+        } = transfer_base;
+        let nonce = rand::random();
+        downloads.push(Transfer {
+            nonce,
+            hash,
+            hash_hex: faster_hex::hex_string(&transfer_base.hash),
+            file_size,
+            peer_string: peer_socket.to_string(),
+            path,
+            progress: TransferProgress::Connecting,
+            cancellation_token: CancellationToken::new(),
+        });
+
+        iced::Command::perform(
+            try_peer_connection(
+                PeerConnectionOrTarget::Target(endpoint.clone(), peer_socket),
+                hash,
+                FileYeetCommandType::Sub,
+            ),
+            move |c| Message::SubscribePeerConnectResulted(nonce, c),
+        )
+    }
+
     /// Update after server has responded to a subscribe request.
     fn update_subscribe_peers_result(
         &mut self,
@@ -1690,42 +1853,15 @@ impl AppState {
 
                             // New connection attempt for this peer with result command identified by the nonce.
                             let command = {
-                                // Allow creating a new connection or opening a stream on an existing one.
-                                // TODO: Create an enum for this instead of using a `Result`.
-                                let data = {
-                                    if let Some((c, _)) = peers.get(&peer) {
-                                        Ok(c.clone())
-                                    } else {
-                                        Err(endpoint.clone())
-                                    }
+                                // Create a new connection or open a stream on an existing one.
+                                let peer = if let Some((c, _)) = peers.get(&peer) {
+                                    PeerConnectionOrTarget::Connection(c.clone())
+                                } else {
+                                    PeerConnectionOrTarget::Target(endpoint.clone(), peer)
                                 };
                                 // The future to use to create the connection.
-                                let future = async move {
-                                    tokio::time::timeout(PEER_CONNECT_TIMEOUT, async move {
-                                        match data {
-                                            Ok(c) => crate::core::peer_connection_into_stream(
-                                                &c,
-                                                hash,
-                                                FileYeetCommandType::Sub,
-                                            )
-                                            .await
-                                            .map(|s| (c, s)),
-                                            Err(e) => {
-                                                crate::core::udp_holepunch(
-                                                    FileYeetCommandType::Sub,
-                                                    hash,
-                                                    e,
-                                                    peer,
-                                                )
-                                                .await
-                                            }
-                                        }
-                                        .map(PeerConnection::from)
-                                    })
-                                    .await
-                                    .ok()
-                                    .flatten()
-                                };
+                                let future =
+                                    try_peer_connection(peer, hash, FileYeetCommandType::Sub);
                                 iced::Command::perform(future, move |r| {
                                     Message::SubscribePeerConnectResulted(nonce, r)
                                 })
@@ -1759,7 +1895,7 @@ impl AppState {
     fn update_subscribe_connect_resulted(
         &mut self,
         nonce: Nonce,
-        result: Option<PeerConnection>,
+        result: Option<PeerRequestStream>,
     ) -> iced::Command<Message> {
         let ConnectionState::Connected(ConnectedState {
             peers, downloads, ..
@@ -1780,17 +1916,7 @@ impl AppState {
         // Update the state of the transfer with the result.
         if let Some(connection) = result {
             let peer_address = connection.connection.remote_address();
-            // TODO: Refactor into a function.
-            match peers.entry(peer_address) {
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    // Add the peer into our map of known peer addresses.
-                    e.insert((connection.connection.clone(), HashSet::from([nonce])));
-                }
-                std::collections::hash_map::Entry::Occupied(mut e) => {
-                    // Add the transfer nonce to the peer's set of known transfers.
-                    e.get_mut().1.insert(nonce);
-                }
-            }
+            insert_nonce_for_peer(&connection, peers, peer_address, nonce);
 
             transfer.progress = TransferProgress::Consent(connection);
         } else {
@@ -1800,7 +1926,7 @@ impl AppState {
         iced::Command::none()
     }
 
-    /// Tell the peer to send the file and begin recieving and writing the file.
+    /// Tell the peer to send the file and begin receiving and writing the file.
     fn update_accept_download(&mut self, nonce: Nonce) -> iced::Command<Message> {
         let ConnectionState::Connected(ConnectedState { downloads, .. }) =
             &mut self.connection_state
@@ -1829,7 +1955,7 @@ impl AppState {
 
         iced::Command::perform(
             async move {
-                let mut peer_streams_lock = peer_streams.streams.lock().await;
+                let mut peer_streams_lock = peer_streams.bistream.lock().await;
 
                 // Create a buffer for the file transfer range. Need to send a `u64` start index and `u64` length.
                 let mut bb = bytes::BytesMut::with_capacity(16);
@@ -1857,7 +1983,7 @@ impl AppState {
         )
     }
 
-    /// Update the state after a transfer was cancelled.
+    /// Update the state after a publish was cancelled.
     fn update_cancel_publish(&mut self, nonce: Nonce) -> iced::Command<Message> {
         if let ConnectionState::Connected(ConnectedState { publishes, .. }) =
             &mut self.connection_state
@@ -1902,7 +2028,7 @@ impl AppState {
         iced::Command::none()
     }
 
-    /// Update the state after a transfer was completed.
+    /// Update the state after a transfer has concluded, successfully or not.
     fn update_transfer_resulted(
         &mut self,
         nonce: Nonce,
@@ -2003,8 +2129,13 @@ impl AppState {
                     d.cancellation_token.cancel();
 
                     // Ensure all downloads that were in-progress are saved.
-                    if matches!(d.progress, TransferProgress::Transferring(_, _, _)) {
-                        Some((d.path, d.hash))
+                    if let TransferProgress::Transferring(p, _, _) = d.progress {
+                        Some(TransferBase {
+                            hash: d.hash,
+                            file_size: d.file_size,
+                            peer_socket: p.connection.remote_address(),
+                            path: d.path,
+                        })
                     } else {
                         None
                     }
@@ -2058,6 +2189,54 @@ impl AppState {
                     iced::Command::none()
                 }
             }
+        }
+    }
+}
+
+/// Either an existing peer connection or a local endpoint and peer address to connect to.
+enum PeerConnectionOrTarget {
+    Connection(quinn::Connection),
+    Target(quinn::Endpoint, SocketAddr),
+}
+
+/// Try to establish a peer connection for a command type.
+/// Either starts from an existing connection or attempts to holepunch.
+async fn try_peer_connection(
+    peer: PeerConnectionOrTarget,
+    hash: HashBytes,
+    cmd: FileYeetCommandType,
+) -> Option<PeerRequestStream> {
+    use PeerConnectionOrTarget::{Connection, Target};
+    tokio::time::timeout(PEER_CONNECT_TIMEOUT, async move {
+        match peer {
+            Connection(c) => crate::core::peer_connection_into_stream(&c, hash, cmd)
+                .await
+                .map(|s| (c, s)),
+
+            Target(e, peer) => crate::core::udp_holepunch(cmd, hash, e, peer).await,
+        }
+        .map(PeerRequestStream::from)
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Add the nonce of a transaction to a peer's set of known transactions.
+fn insert_nonce_for_peer(
+    connection: &PeerRequestStream,
+    peers: &mut HashMap<SocketAddr, (quinn::Connection, HashSet<Nonce>)>,
+    peer_address: SocketAddr,
+    nonce: Nonce,
+) {
+    match peers.entry(peer_address) {
+        std::collections::hash_map::Entry::Vacant(e) => {
+            // Add the peer into our map of known peer addresses.
+            e.insert((connection.connection.clone(), HashSet::from([nonce])));
+        }
+        std::collections::hash_map::Entry::Occupied(mut e) => {
+            // Add the transfer nonce to the peer's set of known transfer nonces.
+            e.get_mut().1.insert(nonce);
         }
     }
 }
