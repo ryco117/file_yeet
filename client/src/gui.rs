@@ -714,7 +714,10 @@ impl AppState {
             },
 
             // Exit the application immediately.
-            Message::ForceExit => iced::window::close(self.main_window.expect("Main window not available at force exit")),
+            Message::ForceExit => iced::window::close(
+                self.main_window
+                    .expect("Main window not available at force exit"),
+            ),
         }
     }
 
@@ -745,72 +748,41 @@ impl AppState {
                 publishes,
                 ..
             }) => {
-                // Create a listener for each file we are publishing for new peers from the server.
+                // For publish we listen to the server for new peers requesting them.
                 let pubs = publishes.iter().filter_map(|publish| {
-                    // If the publish is still hashing, nothing to loop yet.
-                    let PublishItem { nonce, cancellation_token, state: PublishState::Publishing(publish), .. } = &publish else { return None; };
+                    // If the publish is still hashing, skip for now.
+                    let PublishItem {
+                        nonce,
+                        cancellation_token,
+                        state: PublishState::Publishing(publish),
+                        ..
+                    } = &publish
+                    else {
+                        return None;
+                    };
                     let nonce = *nonce;
                     let cancellation_token = cancellation_token.clone();
                     let publish = publish.clone();
 
                     // Subscribe to the server for new peers to upload to.
-                    Some(iced::stream::channel(8, move |mut output| async move {
-                        loop {
-                            let mut server = publish.server_streams.lock().await;
-
-                            tokio::select! {
-                                // Let the task be cancelled.
-                                () = cancellation_token.cancelled() => {
-                                    if let Err(e) = server.send.write_u8(0).await {
-                                        eprintln!("{} Failed to cancel publish: {e}", local_now_fmt());
-                                    }
-
-                                    return;
-                                }
-
-                                // Await the server to send a peer connection.
-                                result = crate::core::read_subscribing_peer(&mut server.recv) => {
-                                    if let Err(e) = output.try_send(Message::PublishPeerReceived(
-                                            nonce,
-                                            result.map_err(Arc::new),
-                                        ))
-                                    {
-                                        eprintln!("{} Failed to perform internal message passing for subscription peer: {e}", local_now_fmt());
-
-                                    }
-                                }
-                            }
-                        }
-                    }))
+                    Some(iced::Subscription::run_with_id(
+                        nonce,
+                        iced::stream::channel(8, move |output| {
+                            peers_requesting_publish_loop(
+                                publish,
+                                nonce,
+                                cancellation_token,
+                                output,
+                            )
+                        }),
+                    ))
                 });
 
                 // Create a task to listen for incoming connections to our QUIC endpoint.
                 let incoming_connections = {
                     let endpoint = endpoint.clone();
-                    iced::stream::channel(4, move |mut output| async move {
-                        loop {
-                            let incoming = endpoint.accept().await;
-                            if let Some(connection) = incoming {
-                                if let Ok(connection) = connection.await {
-                                    if let Err(e) =
-                                        output.try_send(Message::PeerConnected(connection))
-                                    {
-                                        eprintln!(
-                                            "{} Failed to perform internal message passing for peer connected: {e}",
-                                            local_now_fmt()
-                                        );
-                                    }
-                                }
-                            } else {
-                                // The local endpoint has been closed.
-                                // Provide a brief wait for the task to be cancelled.
-                                tokio::time::sleep(Duration::from_millis(200)).await;
-                                eprintln!(
-                                    "{} Endpoint task is still running after being closed...",
-                                    local_now_fmt()
-                                );
-                            }
-                        }
+                    iced::stream::channel(4, move |output| {
+                        incoming_peer_connection_loop(endpoint, output)
                     })
                 };
 
@@ -818,51 +790,12 @@ impl AppState {
                 let peer_requests = peers.iter().map(|(peer_addr, (connection, _))| {
                     let peer_addr = *peer_addr;
                     let connection = connection.clone();
-                    iced::stream::channel(8, move |mut output| async move {
-                        loop {
-                            // Wait for a new bi-directional stream request from the peer.
-                            match connection.accept_bi().await.map(BiStream::from) {
-                                Ok(mut streams) => {
-                                    // Get the file hash desired by the peer.
-                                    let mut hash = HashBytes::default();
-                                    if let Err(e) = streams.recv.read_exact(&mut hash).await {
-                                        eprintln!(
-                                            "{} Failed to read hash from peer: {e}",
-                                            local_now_fmt()
-                                        );
-                                        continue;
-                                    }
-
-                                    if let Err(e) = output.try_send(Message::PeerRequestedTransfer(
-                                        (hash, PeerRequestStream::new(connection.clone(), streams)),
-                                    )) {
-                                        eprintln!(
-                                            "{} Failed to perform internal message passing for peer requested stream: {e}",
-                                            local_now_fmt()
-                                        );
-                                    }
-                                }
-
-                                Err(e) => {
-                                    eprintln!(
-                                        "{} Peer connection closed: {peer_addr} {e}",
-                                        local_now_fmt()
-                                    );
-
-                                    // The peer has disconnected or the connection deteriorated.
-                                    if let Err(e) =
-                                        output.try_send(Message::PeerDisconnected(peer_addr))
-                                    {
-                                        eprintln!(
-                                            "{} Failed to perform internal message passing for failed peer stream: {e}",
-                                            local_now_fmt()
-                                        );
-                                    }
-                                    return;
-                                }
-                            }
-                        }
-                    })
+                    iced::Subscription::run_with_id(
+                        peer_addr,
+                        iced::stream::channel(8, move |output| {
+                            connected_peer_request_loop(connection, peer_addr, output)
+                        }),
+                    )
                 });
 
                 // Batch all the listeners together.
@@ -873,8 +806,8 @@ impl AppState {
                         iced::Subscription::run_with_id(0, incoming_connections),
                     ]
                     .into_iter()
-                    .chain(pubs.map(|p| iced::Subscription::run_with_id(1, p)))
-                    .chain(peer_requests.map(|p| iced::Subscription::run_with_id(2, p))),
+                    .chain(pubs)
+                    .chain(peer_requests),
                 )
             }
 
@@ -2321,6 +2254,106 @@ impl AppState {
 enum PeerConnectionOrTarget {
     Connection(quinn::Connection),
     Target(quinn::Endpoint, SocketAddr),
+}
+
+/// A loop to await the server to send peers requesting the specified publish.
+async fn peers_requesting_publish_loop(
+    publish: Publish,
+    nonce: Nonce,
+    cancellation_token: CancellationToken,
+    mut output: futures_channel::mpsc::Sender<Message>,
+) {
+    loop {
+        let mut server = publish.server_streams.lock().await;
+
+        tokio::select! {
+            // Let the task be cancelled.
+            () = cancellation_token.cancelled() => {
+                if let Err(e) = server.send.write_u8(0).await {
+                    eprintln!("{} Failed to cancel publish: {e}", local_now_fmt());
+                }
+
+                return;
+            }
+
+            // Await the server to send a peer connection.
+            result = crate::core::read_subscribing_peer(&mut server.recv) => {
+                if let Err(e) = output.try_send(Message::PublishPeerReceived(
+                        nonce,
+                        result.map_err(Arc::new),
+                    ))
+                {
+                    eprintln!("{} Failed to perform internal message passing for subscription peer: {e}", local_now_fmt());
+                }
+            }
+        }
+    }
+}
+
+/// An asynchronous loop to await new peer connections.
+async fn incoming_peer_connection_loop(
+    endpoint: quinn::Endpoint,
+    mut output: futures_channel::mpsc::Sender<Message>,
+) {
+    while let Some(connection) = endpoint.accept().await {
+        if let Ok(connection) = connection.await {
+            if let Err(e) = output.try_send(Message::PeerConnected(connection)) {
+                eprintln!(
+                    "{} Failed to perform internal message passing for peer connected: {e}",
+                    local_now_fmt()
+                );
+            }
+        }
+    }
+
+    // The endpoint has been closed.
+}
+
+/// An asynchronous loop to await new requests from a peer connection.
+async fn connected_peer_request_loop(
+    connection: quinn::Connection,
+    peer_address: SocketAddr,
+    mut output: futures_channel::mpsc::Sender<Message>,
+) {
+    loop {
+        // Wait for a new bi-directional stream request from the peer.
+        match connection.accept_bi().await.map(BiStream::from) {
+            Ok(mut streams) => {
+                // Get the file hash desired by the peer.
+                let mut hash = HashBytes::default();
+                if let Err(e) = streams.recv.read_exact(&mut hash).await {
+                    eprintln!("{} Failed to read hash from peer: {e}", local_now_fmt());
+                    continue;
+                }
+
+                if let Err(e) = output.try_send(Message::PeerRequestedTransfer((
+                    hash,
+                    PeerRequestStream::new(connection.clone(), streams),
+                ))) {
+                    eprintln!(
+                        "{} Failed to perform internal message passing for peer requested stream: {e}",
+                        local_now_fmt()
+                    );
+                }
+            }
+
+            Err(e) => {
+                println!(
+                    "{} Peer connection closed: {peer_address} {e}",
+                    local_now_fmt()
+                );
+
+                // The peer has disconnected or the connection deteriorated.
+                if let Err(e) = output.try_send(Message::PeerDisconnected(peer_address)) {
+                    eprintln!(
+                        "{} Failed to perform internal message passing for failed peer stream: {e}",
+                        local_now_fmt()
+                    );
+                }
+                return;
+            }
+        }
+    }
 }
 
 /// Try to establish a peer connection for a command type.

@@ -1256,6 +1256,7 @@ dependencies = [
  "displaydoc",
  "faster-hex",
  "file_yeet_shared",
+ "futures-channel",
  "futures-util",
  "human_bytes",
  "iced",
