@@ -8,13 +8,13 @@ license = "MIT"
 bytes = "1.5"
 clap = { version = "4.4", features = ["derive"] }
 displaydoc = "0.2"
-faster-hex = "0.9"
+faster-hex = "0.10"
 file_yeet_shared = { path = "../shared" }
 futures-util = "0.3"
-quinn = "0.10"
-rand = "0.8"
-rustls = { version = "0.21", features = ["dangerous_configuration", "quic"] }
-thiserror = "1.0"
+quinn = "0.11"
+rand = "0.9"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+thiserror = "2.0"
 tokio = { version = "1.36", features = ["io-util", "macros", "net", "rt-multi-thread", "signal"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"

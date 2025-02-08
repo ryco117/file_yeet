@@ -4,7 +4,7 @@ use std::{
     num::NonZeroU16,
     ops::Div as _,
     path::{Path, PathBuf},
-    sync::{Arc, RwLock},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -12,7 +12,6 @@ use file_yeet_shared::{
     local_now_fmt, BiStream, HashBytes, DEFAULT_PORT, GOODBYE_CODE, GOODBYE_MESSAGE,
     MAX_SERVER_COMMUNICATION_SIZE,
 };
-use futures_util::SinkExt;
 use iced::{
     widget::{self, horizontal_space},
     window, Element,
@@ -25,7 +24,7 @@ use crate::core::{
     MAX_PEER_COMMUNICATION_SIZE, PEER_CONNECT_TIMEOUT, SERVER_CONNECTION_TIMEOUT,
 };
 
-/// Lazyily initialized regex for parsing server addresses.
+/// Lazily initialized regex for parsing server addresses.
 /// Produces match groups `host` and `port` for the server address and optional port.
 static SERVER_ADDRESS_REGEX: once_cell::sync::Lazy<regex::Regex> =
     once_cell::sync::Lazy::new(|| {
@@ -38,16 +37,39 @@ const MAX_SHUTDOWN_WAIT: Duration = Duration::from_secs(3);
 /// The red used to display errors to the user.
 const ERROR_RED_COLOR: iced::Color = iced::Color::from_rgb(1., 0.4, 0.5);
 
-/// The labels for the port mapping radio buttons.
-const PORT_MAPPING_OPTION_LABELS: [&str; 3] = ["None", "Port forward", "NAT-PMP / PCP"];
-
 /// The state of the port mapping options in the GUI.
-#[derive(Debug, Default, serde::Deserialize, serde::Serialize)]
-enum PortMappingGuiOptions {
+#[derive(
+    Clone,
+    Copy,
+    std::cmp::PartialEq,
+    std::cmp::Eq,
+    Debug,
+    Default,
+    serde::Deserialize,
+    serde::Serialize,
+)]
+pub enum PortMappingGuiOptions {
     #[default]
     None,
     PortForwarding(Option<NonZeroU16>),
     TryPcpNatPmp,
+}
+impl PortMappingGuiOptions {
+    /// Get the port mapping option as a human-readable string.
+    fn to_label(self) -> &'static str {
+        match self {
+            PortMappingGuiOptions::None => "None",
+            PortMappingGuiOptions::PortForwarding(_) => "Port Forward",
+            PortMappingGuiOptions::TryPcpNatPmp => "NAT-PMP / PCP",
+        }
+    }
+}
+impl std::fmt::Display for PortMappingGuiOptions {
+    /// Display the port mapping option as a human-readable string.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let label = self.to_label();
+        write!(f, "{label}")
+    }
 }
 
 /// A peer connection representing a single request/command.
@@ -94,7 +116,7 @@ pub enum TransferResult {
 enum TransferProgress {
     Connecting,
     Consent(PeerRequestStream),
-    Transferring(PeerRequestStream, Arc<RwLock<f32>>, f32),
+    Transferring(PeerRequestStream, Arc<std::sync::RwLock<f32>>, f32),
     Done(TransferResult),
 }
 
@@ -139,7 +161,7 @@ struct Publish {
 /// The state of a file publish request.
 #[derive(Clone, Debug)]
 enum PublishState {
-    Hashing(Arc<RwLock<f32>>),
+    Hashing(Arc<std::sync::RwLock<f32>>),
     Publishing(Publish),
     Failure(Arc<anyhow::Error>),
     Cancelled,
@@ -159,7 +181,7 @@ impl PublishItem {
         nonce: Nonce,
         path: PathBuf,
         cancellation_token: CancellationToken,
-        hash_progress: Arc<RwLock<f32>>,
+        hash_progress: Arc<std::sync::RwLock<f32>>,
     ) -> Self {
         Self {
             nonce,
@@ -314,6 +336,7 @@ struct AppSettings {
     pub server_address: String,
     pub gateway_address: Option<String>,
     pub port_forwarding_text: String,
+    pub internal_port_text: String,
     pub port_mapping: PortMappingGuiOptions,
     pub last_publish_paths: Vec<PathBuf>,
     pub last_downloads: Vec<TransferBase>,
@@ -328,16 +351,23 @@ pub struct AppState {
     modal: bool,
     safely_closing: bool,
     port_mapping: Option<crab_nat::PortMapping>,
+    main_window: Option<window::Id>,
 }
 
 /// The messages that can be sent to the update loop of the application.
 #[derive(Clone, Debug)]
 pub enum Message {
+    /// The `Id` of the main (oldest) window, if one exists.
+    MainWindowId(Option<window::Id>),
+
     /// The server text field was changed.
     ServerAddressChanged(String),
 
+    /// The text field for the internal port was changed.
+    InternalPortTextChanged(String),
+
     /// The port mapping radio button was changed.
-    PortMappingRadioChanged(&'static str),
+    PortMappingRadioChanged(PortMappingGuiOptions),
 
     /// The port forward text field was changed.
     PortForwardTextChanged(String),
@@ -430,7 +460,7 @@ pub enum Message {
     RemoveFromTransfers(Nonce, FileYeetCommandType),
 
     /// An unhandled event occurred.
-    UnhandledEvent(iced::Event),
+    UnhandledEvent(iced::window::Id, iced::Event),
 
     /// Exit the application immediately. Ensure we aren't waiting for async tasks forever.
     ForceExit,
@@ -445,14 +475,9 @@ fn settings_path() -> Option<std::path::PathBuf> {
 }
 
 /// The application state and logic.
-impl iced::Application for AppState {
-    type Message = Message;
-    type Theme = iced::Theme;
-    type Executor = iced::executor::Default;
-    type Flags = Option<crate::Cli>;
-
+impl AppState {
     /// Create a new application state.
-    fn new(args: Self::Flags) -> (AppState, iced::Command<Message>) {
+    pub fn new(args: crate::Cli) -> (Self, iced::Task<Message>) {
         // Get base settings from the settings file, or default.
         let mut settings = settings_path()
             .and_then(|p| {
@@ -471,28 +496,29 @@ impl iced::Application for AppState {
             .unwrap_or_default();
 
         // The CLI arguments take final precedence on start.
-        if let Some(crate::Cli {
+        let crate::Cli {
             server_address,
-            port_override,
+            external_port_override,
+            internal_port,
             gateway,
             nat_map,
             ..
-        }) = args
-        {
-            if let Some(server_address) = server_address {
-                settings.server_address = server_address;
-            }
-            if let Some(gateway) = gateway {
-                settings.gateway_address = Some(gateway);
-            }
-            if let Some(port) = port_override {
-                settings.port_forwarding_text = port.to_string();
-                settings.port_mapping = PortMappingGuiOptions::PortForwarding(Some(port));
-            } else if nat_map {
-                settings.port_mapping = PortMappingGuiOptions::TryPcpNatPmp;
-            }
+        } = args;
+        if let Some(server_address) = server_address {
+            settings.server_address = server_address;
         }
-        let server_address_is_empty = settings.server_address.is_empty();
+        if let Some(gateway) = gateway {
+            settings.gateway_address = Some(gateway);
+        }
+        if let Some(port) = internal_port {
+            settings.internal_port_text = port.to_string();
+        }
+        if let Some(port) = external_port_override {
+            settings.port_forwarding_text = port.to_string();
+            settings.port_mapping = PortMappingGuiOptions::PortForwarding(Some(port));
+        } else if nat_map {
+            settings.port_mapping = PortMappingGuiOptions::TryPcpNatPmp;
+        }
 
         // Create the initial state with the settings.
         let mut initial_state = Self {
@@ -500,30 +526,47 @@ impl iced::Application for AppState {
             ..Self::default()
         };
 
+        // Get the ID of the main window.
+        let window_task = window::get_oldest().map(Message::MainWindowId);
+
         // Try connecting immediately if the server address is already set.
-        let command = if server_address_is_empty {
-            iced::Command::none()
+        if initial_state.options.server_address.is_empty() {
+            // Just return the initial state.
+            (initial_state, window_task)
         } else {
-            initial_state.update_connect_clicked()
-        };
-        (initial_state, command)
+            // Attempt to connect to the given server on start.
+            let connect_task = initial_state.update_connect_clicked();
+            (initial_state, window_task.chain(connect_task))
+        }
     }
 
     /// Get the application title text.
-    fn title(&self) -> String {
-        String::from("file_yeet_client")
+    pub const fn title() -> &'static str {
+        "file_yeet_client"
     }
 
     /// Update the application state based on a message.
-    fn update(&mut self, message: Message) -> iced::Command<Message> {
+    pub fn update(&mut self, message: Message) -> iced::Task<Message> {
         match message {
+            // Set the ID of the main window.
+            Message::MainWindowId(id) => {
+                self.main_window = id;
+                iced::Task::none()
+            }
+
             // Handle the server address being changed.
             Message::ServerAddressChanged(address) => {
                 self.options.server_address = address;
-                iced::Command::none()
+                iced::Task::none()
             }
 
-            Message::PortMappingRadioChanged(label) => self.update_port_radio_changed(label),
+            Message::InternalPortTextChanged(text) => {
+                self.options.internal_port_text = text;
+                iced::Task::none()
+            }
+            Message::PortMappingRadioChanged(selection) => {
+                self.update_port_radio_changed(selection)
+            }
             Message::PortForwardTextChanged(text) => self.update_port_forward_text(text),
             Message::GatewayTextChanged(text) => self.update_gateway_text(text),
             Message::ConnectClicked => self.update_connect_clicked(),
@@ -539,7 +582,7 @@ impl iced::Application for AppState {
             Message::LeftServer => {
                 self.safely_closing = false;
                 self.connection_state = ConnectionState::Disconnected;
-                iced::Command::none()
+                iced::Task::none()
             }
 
             Message::PeerConnected(connection) => self.update_peer_connected(connection),
@@ -555,9 +598,8 @@ impl iced::Application for AppState {
                     &mut self.connection_state
                 {
                     peers.remove(&peer_addr);
-                };
-
-                iced::Command::none()
+                }
+                iced::Task::none()
             }
 
             // The transfer view radio buttons were changed.
@@ -565,7 +607,7 @@ impl iced::Application for AppState {
                 if let ConnectionState::Connected(connected_state) = &mut self.connection_state {
                     connected_state.transfer_view = view;
                 }
-                iced::Command::none()
+                iced::Task::none()
             }
 
             // Handle the hash input being changed.
@@ -575,7 +617,7 @@ impl iced::Application for AppState {
                 {
                     *hash_input = hash;
                 }
-                iced::Command::none()
+                iced::Task::none()
             }
 
             // Handle the publish button being clicked by picking a file to publish.
@@ -586,7 +628,7 @@ impl iced::Application for AppState {
                 // Let state know that a modal dialog is open.
                 self.modal = true;
 
-                iced::Command::perform(
+                iced::Task::perform(
                     rfd::AsyncFileDialog::new()
                         .set_title("Choose a file to publish")
                         .pick_file(),
@@ -611,7 +653,7 @@ impl iced::Application for AppState {
                 // Let state know that a modal dialog is open.
                 self.modal = true;
 
-                iced::Command::perform(
+                iced::Task::perform(
                     rfd::AsyncFileDialog::new()
                         .set_title("Choose a file path to save to")
                         .save_file(),
@@ -645,7 +687,7 @@ impl iced::Application for AppState {
                 open::that(path).unwrap_or_else(|e| {
                     eprintln!("{} Failed to open file: {e}", local_now_fmt());
                 });
-                iced::Command::none()
+                iced::Task::none()
             }
 
             Message::RemoveFromTransfers(nonce, transfer_type) => {
@@ -654,37 +696,47 @@ impl iced::Application for AppState {
 
             // Handle an event that iced did not handle itself.
             // This is used to allow for custom exit handling in this instance.
-            Message::UnhandledEvent(event) => match event {
-                iced::Event::Window(id, window::Event::CloseRequested) => {
-                    if id == window::Id::MAIN && !self.safely_closing {
-                        self.safely_close(CloseType::Application)
+            Message::UnhandledEvent(window, event) => match event {
+                iced::Event::Window(window::Event::CloseRequested) => {
+                    if self.safely_closing
+                        || self
+                            .main_window
+                            .expect("Main window not available at unhandled event")
+                            == window
+                    {
+                        // Allow force closing if the safe exit is taking too long for the user.
+                        iced::window::close(window)
                     } else {
-                        // Non-main windows (if ever implemented) can be closed immediately.
-                        // This is also used to cancel the safe-close operation.
-                        window::close(id)
+                        self.safely_close(CloseType::Application)
                     }
                 }
-                _ => iced::Command::none(),
+                _ => iced::Task::none(),
             },
 
             // Exit the application immediately.
-            Message::ForceExit => window::close(window::Id::MAIN),
+            Message::ForceExit => iced::window::close(self.main_window.expect("Main window not available at force exit")),
         }
     }
 
     /// Listen for events that should be translated into messages.
-    fn subscription(&self) -> iced::Subscription<Message> {
+    pub fn subscription(&self) -> iced::Subscription<Message> {
         // Listen for runtime events that iced did not handle internally. Used for safe exit handling.
-        let close_event = || iced::event::listen().map(Message::UnhandledEvent);
+        fn unhandled_events() -> iced::Subscription<Message> {
+            iced::event::listen_with(|event, status, window| match status {
+                iced::event::Status::Ignored => Some(Message::UnhandledEvent(window, event)),
+                iced::event::Status::Captured => None,
+            })
+        }
 
         // Listen for timing intervals to update animations.
-        let animation =
-            || iced::time::every(Duration::from_millis(20)).map(|_| Message::AnimationTick);
+        fn animation() -> iced::Subscription<Message> {
+            iced::time::every(Duration::from_millis(35)).map(|_| Message::AnimationTick)
+        }
 
         match &self.connection_state {
             // Listen for close events and animation ticks when connecting/stalling.
             ConnectionState::Stalling { .. } => {
-                iced::Subscription::batch([close_event(), animation()])
+                iced::Subscription::batch([unhandled_events(), animation()])
             }
 
             ConnectionState::Connected(ConnectedState {
@@ -702,7 +754,7 @@ impl iced::Application for AppState {
                     let publish = publish.clone();
 
                     // Subscribe to the server for new peers to upload to.
-                    Some(iced::subscription::channel(nonce, 8, move |mut output| async move {
+                    Some(iced::stream::channel(8, move |mut output| async move {
                         loop {
                             let mut server = publish.server_streams.lock().await;
 
@@ -713,21 +765,18 @@ impl iced::Application for AppState {
                                         eprintln!("{} Failed to cancel publish: {e}", local_now_fmt());
                                     }
 
-                                    // Provide a brief wait for the task to be cancelled.
-                                    tokio::time::sleep(Duration::from_millis(200)).await;
-                                    eprintln!("{} Dead publish task is still running...", local_now_fmt());
+                                    return;
                                 }
 
                                 // Await the server to send a peer connection.
                                 result = crate::core::read_subscribing_peer(&mut server.recv) => {
-                                    if let Err(e) = output
-                                        .send(Message::PublishPeerReceived(
+                                    if let Err(e) = output.try_send(Message::PublishPeerReceived(
                                             nonce,
                                             result.map_err(Arc::new),
                                         ))
-                                        .await
                                     {
-                                        eprintln!("{} Failed to perform internal message passing: {e}", local_now_fmt());
+                                        eprintln!("{} Failed to perform internal message passing for subscription peer: {e}", local_now_fmt());
+
                                     }
                                 }
                             }
@@ -738,16 +787,16 @@ impl iced::Application for AppState {
                 // Create a task to listen for incoming connections to our QUIC endpoint.
                 let incoming_connections = {
                     let endpoint = endpoint.clone();
-                    iced::subscription::channel(0, 4, move |mut output| async move {
+                    iced::stream::channel(4, move |mut output| async move {
                         loop {
                             let incoming = endpoint.accept().await;
                             if let Some(connection) = incoming {
                                 if let Ok(connection) = connection.await {
                                     if let Err(e) =
-                                        output.send(Message::PeerConnected(connection)).await
+                                        output.try_send(Message::PeerConnected(connection))
                                     {
                                         eprintln!(
-                                            "{} Failed to perform internal message passing: {e}",
+                                            "{} Failed to perform internal message passing for peer connected: {e}",
                                             local_now_fmt()
                                         );
                                     }
@@ -769,7 +818,7 @@ impl iced::Application for AppState {
                 let peer_requests = peers.iter().map(|(peer_addr, (connection, _))| {
                     let peer_addr = *peer_addr;
                     let connection = connection.clone();
-                    iced::subscription::channel(peer_addr, 8, move |mut output| async move {
+                    iced::stream::channel(8, move |mut output| async move {
                         loop {
                             // Wait for a new bi-directional stream request from the peer.
                             match connection.accept_bi().await.map(BiStream::from) {
@@ -784,29 +833,32 @@ impl iced::Application for AppState {
                                         continue;
                                     }
 
-                                    if let Err(e) = output
-                                        .send(Message::PeerRequestedTransfer((
-                                            hash,
-                                            PeerRequestStream::new(connection.clone(), streams),
-                                        )))
-                                        .await
-                                    {
+                                    if let Err(e) = output.try_send(Message::PeerRequestedTransfer(
+                                        (hash, PeerRequestStream::new(connection.clone(), streams)),
+                                    )) {
                                         eprintln!(
-                                            "{} Failed to perform internal message passing: {e}",
+                                            "{} Failed to perform internal message passing for peer requested stream: {e}",
                                             local_now_fmt()
                                         );
                                     }
                                 }
-                                Err(_) => {
+
+                                Err(e) => {
+                                    eprintln!(
+                                        "{} Peer connection closed: {peer_addr} {e}",
+                                        local_now_fmt()
+                                    );
+
                                     // The peer has disconnected or the connection deteriorated.
                                     if let Err(e) =
-                                        output.send(Message::PeerDisconnected(peer_addr)).await
+                                        output.try_send(Message::PeerDisconnected(peer_addr))
                                     {
                                         eprintln!(
-                                            "{} Failed to perform internal message passing: {e}",
+                                            "{} Failed to perform internal message passing for failed peer stream: {e}",
                                             local_now_fmt()
                                         );
                                     }
+                                    return;
                                 }
                             }
                         }
@@ -815,20 +867,24 @@ impl iced::Application for AppState {
 
                 // Batch all the listeners together.
                 iced::Subscription::batch(
-                    [close_event(), animation(), incoming_connections]
-                        .into_iter()
-                        .chain(pubs)
-                        .chain(peer_requests),
+                    [
+                        unhandled_events(),
+                        animation(),
+                        iced::Subscription::run_with_id(0, incoming_connections),
+                    ]
+                    .into_iter()
+                    .chain(pubs.map(|p| iced::Subscription::run_with_id(1, p)))
+                    .chain(peer_requests.map(|p| iced::Subscription::run_with_id(2, p))),
                 )
             }
 
             // Listen for application close events when disconnected.
-            ConnectionState::Disconnected => close_event(),
+            ConnectionState::Disconnected => unhandled_events(),
         }
     }
 
     /// Draw the application GUI.
-    fn view(&self) -> iced::Element<Message> {
+    pub fn view(&self) -> Element<Message> {
         // Create a different top-level page based on the connection state.
         let page: Element<Message> = match &self.connection_state {
             // Display a prompt for the server address when disconnected.
@@ -841,7 +897,7 @@ impl iced::Application for AppState {
                         Self::view_connecting_page(start, tick, MAX_SHUTDOWN_WAIT),
                         widget::text("Closing... Pressing close a second time will cancel safety operations.").size(24),
                         widget::vertical_space(),
-                    ).align_items(iced::Alignment::Center).into()
+                    ).align_x(iced::Alignment::Center).into()
                 } else {
                     Self::view_connecting_page(start, tick, SERVER_CONNECTION_TIMEOUT)
                 }
@@ -857,7 +913,7 @@ impl iced::Application for AppState {
         let status_bar = widget::container(if let Some(status_message) = &self.status_message {
             Element::from(
                 widget::text(status_message)
-                    .style(iced::theme::Text::Color(ERROR_RED_COLOR))
+                    .color(ERROR_RED_COLOR)
                     .width(iced::Length::Fill)
                     .height(iced::Length::Shrink),
             )
@@ -868,12 +924,11 @@ impl iced::Application for AppState {
     }
 
     /// Prefer a dark theme.
-    fn theme(&self) -> iced::Theme {
+    #[allow(clippy::unused_self)]
+    pub fn theme(&self) -> iced::Theme {
         iced::Theme::Dark
     }
-}
 
-impl AppState {
     /// Draw the disconnected page with a server address input and connect button.
     fn view_disconnected_page(&self) -> iced::Element<Message> {
         let mut server_address = widget::text_input(
@@ -882,10 +937,12 @@ impl AppState {
         );
 
         let mut connect_button = widget::button("Connect");
-        let mut port_forward_text = widget::text_input(
-            "External port forward. E.g., 8888",
-            &self.options.port_forwarding_text,
+        let mut internal_port_text = widget::text_input(
+            "E.g., 12345. Leave empty to use any available port",
+            &self.options.internal_port_text,
         );
+        let mut port_forward_text =
+            widget::text_input("E.g., 8888", &self.options.port_forwarding_text);
 
         if !self.modal {
             server_address = server_address
@@ -893,39 +950,41 @@ impl AppState {
                 .on_submit(Message::ConnectClicked);
             connect_button = connect_button.on_press(Message::ConnectClicked);
 
+            internal_port_text = internal_port_text.on_input(Message::InternalPortTextChanged);
             if let PortMappingGuiOptions::PortForwarding(_) = &self.options.port_mapping {
                 port_forward_text = port_forward_text.on_input(Message::PortForwardTextChanged);
             }
         }
 
-        let selected = match self.options.port_mapping {
-            PortMappingGuiOptions::None => PORT_MAPPING_OPTION_LABELS[0],
-            PortMappingGuiOptions::PortForwarding(_) => PORT_MAPPING_OPTION_LABELS[1],
-            PortMappingGuiOptions::TryPcpNatPmp => PORT_MAPPING_OPTION_LABELS[2],
+        // Ignore the data field in the radio selection status.
+        let selected_mapping = match self.options.port_mapping {
+            PortMappingGuiOptions::PortForwarding(_) => PortMappingGuiOptions::PortForwarding(None),
+            other => other,
         };
 
-        // Create a bottom section for choosing port forwaring/mapping options.
+        // Create a bottom section for choosing port forwarding/mapping options.
         let choose_port_mapping = widget::column!(
+            widget::row!(widget::text("Internal Port to Bind"), internal_port_text).spacing(12),
             widget::radio(
-                PORT_MAPPING_OPTION_LABELS[0],
-                PORT_MAPPING_OPTION_LABELS[0],
-                Some(selected),
+                PortMappingGuiOptions::None.to_label(),
+                PortMappingGuiOptions::None,
+                Some(selected_mapping),
                 Message::PortMappingRadioChanged,
             ),
             widget::row!(
                 widget::radio(
-                    PORT_MAPPING_OPTION_LABELS[1],
-                    PORT_MAPPING_OPTION_LABELS[1],
-                    Some(selected),
+                    PortMappingGuiOptions::PortForwarding(None).to_label(),
+                    PortMappingGuiOptions::PortForwarding(None),
+                    Some(selected_mapping),
                     Message::PortMappingRadioChanged,
                 ),
                 port_forward_text,
             )
             .spacing(32),
             widget::radio(
-                PORT_MAPPING_OPTION_LABELS[2],
-                PORT_MAPPING_OPTION_LABELS[2],
-                Some(selected),
+                PortMappingGuiOptions::TryPcpNatPmp.to_label(),
+                PortMappingGuiOptions::TryPcpNatPmp,
+                Some(selected_mapping),
                 Message::PortMappingRadioChanged,
             ),
         )
@@ -941,7 +1000,7 @@ impl AppState {
             .on_input(Message::GatewayTextChanged)
         )
         .spacing(6)
-        .align_items(iced::Alignment::Center);
+        .align_y(iced::Alignment::Center);
 
         widget::container(
             widget::column!(
@@ -952,13 +1011,11 @@ impl AppState {
                 choose_port_mapping,
                 gateway,
             )
-            .align_items(iced::Alignment::Center)
+            .align_x(iced::Alignment::Center)
             .spacing(6),
         )
-        .width(iced::Length::Fill)
-        .height(iced::Length::Fill)
-        .center_x()
-        .center_y()
+        .center_x(iced::Length::Fill)
+        .center_y(iced::Length::Fill)
         .padding(12)
         .into()
     }
@@ -975,25 +1032,24 @@ impl AppState {
             .min(1.);
         let spinner =
             widget::container::Container::new(widget::progress_bar(0.0..=1., fraction_waited))
-                .width(iced::Length::Fill)
-                .height(iced::Length::Fill)
                 .padding(24)
-                .center_x()
-                .center_y();
+                .center_x(iced::Length::Fill)
+                .center_y(iced::Length::Fill);
 
         Element::<'a>::from(spinner)
     }
 
-    fn draw_transfers<'a, 'b, I>(
+    fn draw_transfers<'a, I>(
         transfers: I,
         transfer_type: FileYeetCommandType,
-    ) -> iced::Element<'b, Message>
+    ) -> iced::Element<'a, Message>
     where
         I: Iterator<Item = &'a Transfer>,
     {
         widget::column(transfers.map(|t| {
             let progress = match &t.progress {
                 TransferProgress::Connecting => Element::from(widget::text("Connecting...")),
+
                 TransferProgress::Consent(_) => widget::row!(
                     widget::text(format!(
                         "Accept download of size {}",
@@ -1008,7 +1064,7 @@ impl AppState {
                 .spacing(12)
                 .into(),
                 TransferProgress::Transferring(_, _, p) => widget::row!(
-                    widget::text("Transfering..."),
+                    widget::text("Transferring..."),
                     widget::progress_bar(0.0..=1., *p),
                     widget::button(widget::text("Cancel").size(12))
                         .on_press(Message::CancelTransfer(t.nonce, transfer_type))
@@ -1016,12 +1072,13 @@ impl AppState {
                 )
                 .spacing(6)
                 .into(),
+
                 TransferProgress::Done(r) => {
                     let remove = widget::button(widget::text("Remove").size(12))
                         .on_press(Message::RemoveFromTransfers(t.nonce, transfer_type));
                     widget::row!(
                         // TODO: If the transfer failed, color error text red.
-                        widget::text(r).width(iced::Length::Fill),
+                        widget::text(r.to_string()).width(iced::Length::Fill),
                         if matches!(transfer_type, FileYeetCommandType::Sub)
                             && matches!(r, TransferResult::Success)
                         {
@@ -1047,20 +1104,20 @@ impl AppState {
                 widget::row!(
                     widget::text(&t.peer_string).size(12),
                     widget::horizontal_space(),
-                    widget::text(&t.path.to_string_lossy()).size(12),
+                    widget::text(t.path.to_string_lossy()).size(12),
                 )
                 .spacing(6),
             ))
-            .style(iced::theme::Container::Box)
+            .style(widget::container::bordered_box)
             .width(iced::Length::Fill)
-            .padding([6, 12, 6, 6]) // Extra padding on the right because of optional scrollbar.
+            .padding([6, 12]) // Extra padding on the right because of optional scrollbar.
             .into()
         }))
         .spacing(6)
         .into()
     }
 
-    fn draw_pubs<'a>(publishes: &[PublishItem]) -> iced::Element<'a, Message> {
+    fn draw_pubs(publishes: &[PublishItem]) -> iced::Element<Message> {
         let publish_views = publishes.iter().map(|pi| {
             widget::container(
                 match &pi.state {
@@ -1071,7 +1128,7 @@ impl AppState {
                                 widget::progress_bar(0.0..=1., *progress.read().unwrap()),
                             )
                             .spacing(6),
-                            widget::text(&pi.path.to_string_lossy()).size(12),
+                            widget::text(pi.path.to_string_lossy()).size(12),
                         )
                         .spacing(6),
                         widget::button("Cancel").on_press(Message::CancelPublish(pi.nonce))
@@ -1079,7 +1136,7 @@ impl AppState {
                     PublishState::Publishing(p) => widget::row!(
                         widget::column!(
                             widget::text(&p.hash_hex).size(12),
-                            widget::text(&pi.path.to_string_lossy()).size(12)
+                            widget::text(pi.path.to_string_lossy()).size(12)
                         ),
                         widget::horizontal_space(),
                         widget::button(widget::text("Copy Hash").size(12))
@@ -1089,9 +1146,8 @@ impl AppState {
                     ),
                     PublishState::Failure(e) => widget::row!(
                         widget::column!(
-                            widget::text(format!("Failed to publish: {e}"))
-                                .style(iced::theme::Text::Color(ERROR_RED_COLOR)),
-                            widget::text(&pi.path.to_string_lossy()).size(12),
+                            widget::text(format!("Failed to publish: {e}")).color(ERROR_RED_COLOR),
+                            widget::text(pi.path.to_string_lossy()).size(12),
                         )
                         .width(iced::Length::Fill),
                         widget::button(widget::text("Remove").size(12))
@@ -1100,19 +1156,18 @@ impl AppState {
                     PublishState::Cancelled => widget::row!(
                         widget::column!(
                             widget::text("Cancelled"),
-                            widget::text(&pi.path.to_string_lossy()).size(12),
+                            widget::text(pi.path.to_string_lossy()).size(12),
                         )
                         .width(iced::Length::Fill),
                         widget::button(widget::text("Remove").size(12))
                             .on_press(Message::CancelPublish(pi.nonce))
                     ),
                 }
-                .align_items(iced::Alignment::Center)
+                .align_y(iced::Alignment::Center)
                 .spacing(12),
             )
-            .style(iced::theme::Container::Box)
             .width(iced::Length::Fill)
-            .padding([6, 12, 6, 6]) // Extra padding on the right because of optional scrollbar.
+            .padding([6, 12]) // Extra padding on the right because of optional scrollbar.
             .into()
         });
 
@@ -1120,12 +1175,13 @@ impl AppState {
     }
 
     /// Draw the main application controls when connected to a server.
-    fn view_connected_page(&self, connected_state: &ConnectedState) -> iced::Element<Message> {
+    fn view_connected_page<'a, 'b: 'a>(
+        &'b self,
+        connected_state: &'a ConnectedState,
+    ) -> iced::Element<'a, Message> {
         /// Helper for creating a horizontal line.
-        fn horizontal_line<'a>() -> widget::Container<'a, Message> {
-            widget::container(horizontal_space())
-                .height(3)
-                .style(iced::theme::Container::Box)
+        fn horizontal_line<'b>() -> widget::Container<'b, Message> {
+            widget::container(horizontal_space()).height(3)
         }
 
         // Define the elements that we want to be modal aware first.
@@ -1159,7 +1215,7 @@ impl AppState {
             widget::text("Our External Address:"),
             widget::text(&connected_state.external_address),
         )
-        .align_items(iced::alignment::Alignment::Center)
+        .align_y(iced::alignment::Alignment::Center)
         .spacing(6);
 
         // Hash input and download button.
@@ -1190,7 +1246,7 @@ impl AppState {
                     connected_state.uploads.is_empty(),
                 ) {
                     // Both are empty, show nothing.
-                    (true, true) => iced::widget::space::Space::new(0, 0).into(),
+                    (true, true) => iced::widget::Space::new(0, 0).into(),
 
                     // Only uploads are empty, show publishes.
                     (false, true) => Self::draw_pubs(&connected_state.publishes),
@@ -1238,13 +1294,16 @@ impl AppState {
     }
 
     /// Handle the port mapping radio button being changed.
-    fn update_port_radio_changed(&mut self, label: &'static str) -> iced::Command<Message> {
-        self.options.port_mapping = match label {
-            "None" => {
+    fn update_port_radio_changed(
+        &mut self,
+        selection: PortMappingGuiOptions,
+    ) -> iced::Task<Message> {
+        self.options.port_mapping = match selection {
+            PortMappingGuiOptions::None => {
                 self.status_message = None;
                 PortMappingGuiOptions::None
             }
-            "Port forward" => PortMappingGuiOptions::PortForwarding({
+            PortMappingGuiOptions::PortForwarding(_) => PortMappingGuiOptions::PortForwarding({
                 let o = self
                     .options
                     .port_forwarding_text
@@ -1256,17 +1315,16 @@ impl AppState {
                 }
                 o
             }),
-            "NAT-PMP / PCP" => {
+            PortMappingGuiOptions::TryPcpNatPmp => {
                 self.status_message = None;
                 PortMappingGuiOptions::TryPcpNatPmp
             }
-            _ => unreachable!(),
         };
-        iced::Command::none()
+        iced::Task::none()
     }
 
     /// Update the state after the port forward text field was changed.
-    fn update_port_forward_text(&mut self, text: String) -> iced::Command<Message> {
+    fn update_port_forward_text(&mut self, text: String) -> iced::Task<Message> {
         self.options.port_forwarding_text = text;
         if let PortMappingGuiOptions::PortForwarding(port) = &mut self.options.port_mapping {
             if let Ok(p) = self
@@ -1282,28 +1340,28 @@ impl AppState {
                 self.status_message = Some(INVALID_PORT_FORWARD.to_owned());
             }
         }
-        iced::Command::none()
+        iced::Task::none()
     }
 
     /// Update the state after the gateway text field was changed.
-    fn update_gateway_text(&mut self, text: String) -> iced::Command<Message> {
+    fn update_gateway_text(&mut self, text: String) -> iced::Task<Message> {
         if text.trim().is_empty() {
             self.options.gateway_address = None;
         } else {
             self.options.gateway_address = Some(text);
         }
-        iced::Command::none()
+        iced::Task::none()
     }
 
     /// Update the state after the connect button was clicked.
-    fn update_connect_clicked(&mut self) -> iced::Command<Message> {
+    fn update_connect_clicked(&mut self) -> iced::Task<Message> {
         // Clear the status message before starting the connection attempt.
         self.status_message = None;
 
         // Determine if a valid server address was entered.
         let regex_match = if self.options.server_address.trim().is_empty() {
             // If empty, use sane defaults.
-            self.options.server_address = "localhost".to_owned();
+            "localhost".clone_into(&mut self.options.server_address);
             Some((Some(self.options.server_address.clone()), DEFAULT_PORT))
         } else {
             // Otherwise, parse the server address and optional port.
@@ -1323,7 +1381,20 @@ impl AppState {
         // If the server address is invalid, display an error message and return.
         let Some((server_address, port)) = regex_match else {
             self.status_message = Some("Invalid server address".to_owned());
-            return iced::Command::none();
+            return iced::Task::none();
+        };
+
+        // Validate the internal port.
+        let internal_port = {
+            let text = self.options.internal_port_text.trim();
+            if text.is_empty() {
+                None
+            } else if let Ok(n) = text.parse::<NonZeroU16>() {
+                Some(n)
+            } else {
+                self.status_message = Some("Invalid internal port".to_owned());
+                return iced::Task::none();
+            }
         };
 
         // Set the state to `Stalling` before starting the connection attempt.
@@ -1344,13 +1415,14 @@ impl AppState {
         let gateway = self.options.gateway_address.clone();
 
         // Try to connect to the server in a new task.
-        iced::Command::perform(
+        iced::Task::perform(
             async move {
                 let mut bb = bytes::BytesMut::with_capacity(MAX_PEER_COMMUNICATION_SIZE);
                 crate::core::prepare_server_connection(
                     server_address.as_deref(),
                     port,
                     gateway.as_deref(),
+                    internal_port,
                     port_mapping,
                     &mut bb,
                 )
@@ -1362,7 +1434,7 @@ impl AppState {
     }
 
     /// Update the state after a tick when animations are occurring.
-    fn update_animation_tick(&mut self) -> iced::Command<Message> {
+    fn update_animation_tick(&mut self) -> iced::Task<Message> {
         match &mut self.connection_state {
             ConnectionState::Stalling { tick, .. } => *tick = Instant::now(),
             ConnectionState::Connected(ConnectedState {
@@ -1385,14 +1457,14 @@ impl AppState {
             }
             ConnectionState::Disconnected => {}
         }
-        iced::Command::none()
+        iced::Task::none()
     }
 
     /// Update the state after a connection attempt to the server completed.
     fn update_connect_resulted(
         &mut self,
         result: Result<PreparedConnection, Arc<anyhow::Error>>,
-    ) -> iced::Command<Message> {
+    ) -> iced::Task<Message> {
         match result {
             Ok(prepared) => {
                 let PreparedConnection {
@@ -1412,18 +1484,18 @@ impl AppState {
                 if !self.options.last_publish_paths.is_empty()
                     || !self.options.last_downloads.is_empty()
                 {
-                    return iced::Command::batch(
+                    return iced::Task::batch(
                         self.options
                             .last_publish_paths
                             .drain(..)
                             .map(|p| {
-                                iced::Command::perform(
+                                iced::Task::perform(
                                     std::future::ready(Some(p)),
                                     Message::PublishPathChosen,
                                 )
                             })
                             .chain(self.options.last_downloads.drain(..).map(|d| {
-                                iced::Command::perform(
+                                iced::Task::perform(
                                     std::future::ready(d),
                                     Message::SubscribeRecreated,
                                 )
@@ -1436,17 +1508,16 @@ impl AppState {
                 self.connection_state = ConnectionState::Disconnected;
             }
         }
-        iced::Command::none()
+        iced::Task::none()
     }
 
     /// Update the state after a peer connected to the endpoint.
-    fn update_peer_connected(&mut self, connection: quinn::Connection) -> iced::Command<Message> {
+    fn update_peer_connected(&mut self, connection: quinn::Connection) -> iced::Task<Message> {
         if let ConnectionState::Connected(ConnectedState { peers, .. }) = &mut self.connection_state
         {
             peers.insert(connection.remote_address(), (connection, HashSet::new()));
         }
-
-        iced::Command::none()
+        iced::Task::none()
     }
 
     /// Update after an existing peer requested a new file transfer.
@@ -1454,11 +1525,15 @@ impl AppState {
         &mut self,
         hash: HashBytes,
         peer_request: PeerRequestStream,
-    ) -> iced::Command<Message> {
+    ) -> iced::Task<Message> {
         let ConnectionState::Connected(ConnectedState { publishes, .. }) =
             &mut self.connection_state
         else {
-            return iced::Command::none();
+            eprintln!(
+                "{} Peer requested transfer while not connected",
+                local_now_fmt()
+            );
+            return iced::Task::none();
         };
 
         // Find the publish-nonce corresponding to the hash.
@@ -1466,19 +1541,23 @@ impl AppState {
             PublishState::Publishing(p) if p.hash == hash => Some(pi.nonce),
             _ => None,
         }) else {
-            return iced::Command::none();
+            eprintln!(
+                "{} Peer requested transfer for unknown hash",
+                local_now_fmt()
+            );
+            return iced::Task::none();
         };
 
         self.update_publish_peer_connect_resulted(nonce, Some(peer_request))
     }
 
     /// Update the state after the publish button was clicked. Begins a publish request if a file was chosen.
-    fn update_publish_path_chosen(&mut self, path: Option<PathBuf>) -> iced::Command<Message> {
+    fn update_publish_path_chosen(&mut self, path: Option<PathBuf>) -> iced::Task<Message> {
         self.modal = false;
 
-        // Ensure a path was chosen.
+        // Ensure a path was chosen, otherwise safely cancel.
         let Some(path) = path else {
-            return iced::Command::none();
+            return iced::Task::none();
         };
 
         // Ensure the client is connected to a server.
@@ -1489,14 +1568,14 @@ impl AppState {
             ..
         }) = &mut self.connection_state
         else {
-            return iced::Command::none();
+            return iced::Task::none();
         };
 
         // Ensure the transfer view is set to publishing to see the new item.
         *transfer_view = TransferView::Publishes;
 
         let server = server.clone();
-        let progress = Arc::new(RwLock::new(0.));
+        let progress = Arc::new(std::sync::RwLock::new(0.));
         let nonce = rand::random();
         let cancellation_token = CancellationToken::new();
         let cancellation_path = path.clone();
@@ -1507,7 +1586,7 @@ impl AppState {
             cancellation_token.clone(),
             progress.clone(),
         ));
-        iced::Command::perform(
+        iced::Task::perform(
             async move {
                 tokio::select! {
                     // Allow cancelling the publish request thread.
@@ -1516,7 +1595,7 @@ impl AppState {
                     r = async move {
                         // Get the file size and hash of the chosen file to publish.
                         let (file_size, hash) =
-                            match crate::core::file_size_and_hash(&path, Some(progress)).await {
+                            match crate::core::file_size_and_hash(&path, Some(&progress)).await {
                                 Ok(p) => p,
                                 Err(e) => {
                                     return (
@@ -1552,7 +1631,7 @@ impl AppState {
         nonce: Nonce,
         path: &Path,
         result: PublishRequestResult,
-    ) -> iced::Command<Message> {
+    ) -> iced::Task<Message> {
         if let ConnectionState::Connected(ConnectedState { publishes, .. }) =
             &mut self.connection_state
         {
@@ -1579,7 +1658,7 @@ impl AppState {
                 }
             }
         }
-        iced::Command::none()
+        iced::Task::none()
     }
 
     /// Update after the server has sent a peer to publish to, or there was an error.
@@ -1587,7 +1666,7 @@ impl AppState {
         &mut self,
         nonce: Nonce,
         result: Result<SocketAddr, Arc<anyhow::Error>>,
-    ) -> iced::Command<Message> {
+    ) -> iced::Task<Message> {
         let ConnectionState::Connected(ConnectedState {
             endpoint,
             peers,
@@ -1595,7 +1674,8 @@ impl AppState {
             ..
         }) = &mut self.connection_state
         else {
-            return iced::Command::none();
+            eprintln!("{} Peer received while not connected", local_now_fmt());
+            return iced::Task::none();
         };
 
         let publish = publishes
@@ -1620,7 +1700,7 @@ impl AppState {
                     PeerConnectionOrTarget::Target(endpoint.clone(), peer)
                 };
                 let hash = publish.hash;
-                iced::Command::perform(
+                iced::Task::perform(
                     try_peer_connection(data, hash, FileYeetCommandType::Pub),
                     move |r| {
                         Message::PublishPeerConnectResulted(
@@ -1632,9 +1712,9 @@ impl AppState {
             }
             (Err(e), _) => {
                 self.status_message = Some(format!("Error receiving peer: {e}"));
-                iced::Command::none()
+                iced::Task::none()
             }
-            (_, None) => iced::Command::none(),
+            (_, None) => iced::Task::none(),
         }
     }
 
@@ -1643,7 +1723,7 @@ impl AppState {
         &mut self,
         pub_nonce: Nonce,
         peer: Option<PeerRequestStream>,
-    ) -> iced::Command<Message> {
+    ) -> iced::Task<Message> {
         let ConnectionState::Connected(ConnectedState {
             peers,
             uploads,
@@ -1651,11 +1731,15 @@ impl AppState {
             ..
         }) = &mut self.connection_state
         else {
-            return iced::Command::none();
+            eprintln!(
+                "{} Publish peer connect resulted while not connected",
+                local_now_fmt()
+            );
+            return iced::Task::none();
         };
         let Some(peer) = peer else {
-            // Silently fail if the peer connection was not successful.
-            return iced::Command::none();
+            // Silently fail if the peer connection was not successful when publishing.
+            return iced::Task::none();
         };
         let Some((publishing, path)) = publishes.iter().find_map(|pi| {
             if let PublishState::Publishing(p) = &pi.state {
@@ -1668,11 +1752,15 @@ impl AppState {
                 None
             }
         }) else {
-            return iced::Command::none();
+            eprintln!(
+                "{} Peer connected for unknown publish nonce {pub_nonce}",
+                local_now_fmt()
+            );
+            return iced::Task::none();
         };
 
         let upload_nonce = rand::random();
-        let progress_lock = Arc::new(RwLock::new(0.));
+        let progress_lock = Arc::new(std::sync::RwLock::new(0.));
         let cancellation_token = CancellationToken::new();
         uploads.push(Transfer {
             nonce: upload_nonce,
@@ -1688,7 +1776,7 @@ impl AppState {
         insert_nonce_for_peer(&peer, peers, peer.connection.remote_address(), upload_nonce);
 
         let file_size = publishing.file_size;
-        iced::Command::perform(
+        iced::Task::perform(
             async move {
                 let file = match tokio::fs::File::open(path).await {
                     Ok(f) => f,
@@ -1711,7 +1799,7 @@ impl AppState {
                         &mut streams,
                         file_size,
                         reader,
-                        Some(progress_lock),
+                        Some(&progress_lock),
                     )) => match result {
                         Ok(()) => TransferResult::Success,
                         Err(e) => TransferResult::Failure(Arc::new(e)),
@@ -1723,12 +1811,12 @@ impl AppState {
     }
 
     /// Update the state after the publish button was clicked. Begins a subscribe request.
-    fn update_subscribe_path_chosen(&mut self, path: Option<PathBuf>) -> iced::Command<Message> {
+    fn update_subscribe_path_chosen(&mut self, path: Option<PathBuf>) -> iced::Task<Message> {
         self.modal = false;
 
-        // Ensure a path was chosen.
+        // Ensure a path was chosen, otherwise safely cancel.
         let Some(path) = path else {
-            return iced::Command::none();
+            return iced::Task::none();
         };
 
         // Ensure the client is connected to a server.
@@ -1739,21 +1827,27 @@ impl AppState {
             ..
         }) = &mut self.connection_state
         else {
-            return iced::Command::none();
+            eprintln!(
+                "{} Subscribe path chosen while not connected",
+                local_now_fmt()
+            );
+            return iced::Task::none();
         };
 
         // Ensure the hash is valid.
         let mut hash = HashBytes::default();
         if let Err(e) = faster_hex::hex_decode(hash_input.as_bytes(), &mut hash) {
-            self.status_message = Some(format!("Invalid hash: {e}"));
-            return iced::Command::none();
+            let error = format!("Invalid hash: {e}");
+            eprintln!("{} {error}", local_now_fmt());
+            self.status_message = Some(error);
+            return iced::Task::none();
         }
 
         // Ensure the transfer view is set to downloads to see the new item.
         *transfer_view = TransferView::Downloads;
 
         let server = server.clone();
-        iced::Command::perform(
+        iced::Task::perform(
             async move {
                 let mut bb = bytes::BytesMut::with_capacity(MAX_PEER_COMMUNICATION_SIZE);
                 crate::core::subscribe(&server, &mut bb, hash)
@@ -1766,10 +1860,7 @@ impl AppState {
     }
 
     /// Update the state after loading a download from the last session.
-    fn update_subscribe_recreated(
-        &mut self,
-        transfer_base: TransferBase,
-    ) -> iced::Command<Message> {
+    fn update_subscribe_recreated(&mut self, transfer_base: TransferBase) -> iced::Task<Message> {
         // Ensure the client is connected to a server.
         let ConnectionState::Connected(ConnectedState {
             endpoint,
@@ -1777,7 +1868,11 @@ impl AppState {
             ..
         }) = &mut self.connection_state
         else {
-            return iced::Command::none();
+            eprintln!(
+                "{} Subscribe recreated while not connected",
+                local_now_fmt()
+            );
+            return iced::Task::none();
         };
 
         let TransferBase {
@@ -1798,7 +1893,7 @@ impl AppState {
             cancellation_token: CancellationToken::new(),
         });
 
-        iced::Command::perform(
+        iced::Task::perform(
             try_peer_connection(
                 PeerConnectionOrTarget::Target(endpoint.clone(), peer_socket),
                 hash,
@@ -1812,7 +1907,7 @@ impl AppState {
     fn update_subscribe_peers_result(
         &mut self,
         result: Result<IncomingSubscribePeers, Arc<anyhow::Error>>,
-    ) -> iced::Command<Message> {
+    ) -> iced::Task<Message> {
         match result {
             Ok(IncomingSubscribePeers {
                 peers_with_size,
@@ -1830,7 +1925,7 @@ impl AppState {
                     // Let the user know why nothing else is happening.
                     if peers_with_size.is_empty() {
                         self.status_message = Some("No peers available".to_owned());
-                        return iced::Command::none();
+                        return iced::Task::none();
                     }
 
                     // Create a new transfer state and connection attempt for each peer.
@@ -1862,7 +1957,7 @@ impl AppState {
                                 // The future to use to create the connection.
                                 let future =
                                     try_peer_connection(peer, hash, FileYeetCommandType::Sub);
-                                iced::Command::perform(future, move |r| {
+                                iced::Task::perform(future, move |r| {
                                     Message::SubscribePeerConnectResulted(nonce, r)
                                 })
                             };
@@ -1874,19 +1969,23 @@ impl AppState {
                     // Create a new transfer for each peer.
                     let (mut new_transfers, connect_commands): (
                         Vec<Transfer>,
-                        Vec<iced::Command<Message>>,
+                        Vec<iced::Task<Message>>,
                     ) = transfers_commands_iter.unzip();
 
                     // Add the new transfers to the list of active transfers.
                     downloads.append(&mut new_transfers);
-                    iced::Command::batch(connect_commands)
+                    iced::Task::batch(connect_commands)
                 } else {
-                    iced::Command::none()
+                    eprintln!(
+                        "{} Subscribe peers result while not connected",
+                        local_now_fmt()
+                    );
+                    iced::Task::none()
                 }
             }
             Err(e) => {
                 self.status_message = Some(format!("Error subscribing to the server: {e}"));
-                iced::Command::none()
+                iced::Task::none()
             }
         }
     }
@@ -1896,12 +1995,16 @@ impl AppState {
         &mut self,
         nonce: Nonce,
         result: Option<PeerRequestStream>,
-    ) -> iced::Command<Message> {
+    ) -> iced::Task<Message> {
         let ConnectionState::Connected(ConnectedState {
             peers, downloads, ..
         }) = &mut self.connection_state
         else {
-            return iced::Command::none();
+            eprintln!(
+                "{} Subscribe connect resulted while not connected",
+                local_now_fmt()
+            );
+            return iced::Task::none();
         };
 
         // Find the transfer with the matching nonce.
@@ -1910,7 +2013,11 @@ impl AppState {
             .enumerate()
             .find(|(_, t)| t.nonce == nonce)
         else {
-            return iced::Command::none();
+            eprintln!(
+                "{} Subscribe connect resulted for unknown nonce",
+                local_now_fmt()
+            );
+            return iced::Task::none();
         };
 
         // Update the state of the transfer with the result.
@@ -1923,37 +2030,40 @@ impl AppState {
             // Remove unreachable peers from view.
             downloads.remove(index);
         }
-        iced::Command::none()
+        iced::Task::none()
     }
 
     /// Tell the peer to send the file and begin receiving and writing the file.
-    fn update_accept_download(&mut self, nonce: Nonce) -> iced::Command<Message> {
+    fn update_accept_download(&mut self, nonce: Nonce) -> iced::Task<Message> {
         let ConnectionState::Connected(ConnectedState { downloads, .. }) =
             &mut self.connection_state
         else {
-            return iced::Command::none();
+            eprintln!("{} No connected state to accept download", local_now_fmt());
+            return iced::Task::none();
         };
 
         // Get the current transfer status.
         let Some(transfer) = downloads.iter_mut().find(|t| t.nonce == nonce) else {
-            return iced::Command::none();
+            eprintln!("{} No transfer found to accept download", local_now_fmt());
+            return iced::Task::none();
         };
         let hash = transfer.hash;
         let file_size = transfer.file_size;
         let peer_streams = if let TransferProgress::Consent(p) = &mut transfer.progress {
             p.clone()
         } else {
-            return iced::Command::none();
+            eprintln!("{} Transfer is not in consent state", local_now_fmt());
+            return iced::Task::none();
         };
 
         // Begin the transfer.
-        let byte_progress = Arc::new(RwLock::new(0.));
+        let byte_progress = Arc::new(std::sync::RwLock::new(0.));
         transfer.progress =
             TransferProgress::Transferring(peer_streams.clone(), byte_progress.clone(), 0.);
         let output_path = transfer.path.clone();
         let cancellation_token = transfer.cancellation_token.clone();
 
-        iced::Command::perform(
+        iced::Task::perform(
             async move {
                 let mut peer_streams_lock = peer_streams.bistream.lock().await;
 
@@ -1970,7 +2080,7 @@ impl AppState {
                         file_size,
                         &output_path,
                         &mut bb,
-                        Some(byte_progress),
+                        Some(&byte_progress),
                     )) => {
                         match result {
                             Ok(()) => TransferResult::Success,
@@ -1984,7 +2094,7 @@ impl AppState {
     }
 
     /// Update the state after a publish was cancelled.
-    fn update_cancel_publish(&mut self, nonce: Nonce) -> iced::Command<Message> {
+    fn update_cancel_publish(&mut self, nonce: Nonce) -> iced::Task<Message> {
         if let ConnectionState::Connected(ConnectedState { publishes, .. }) =
             &mut self.connection_state
         {
@@ -1997,8 +2107,10 @@ impl AppState {
                     publishes.remove(i);
                 }
             }
+        } else {
+            eprintln!("{} No connected state to cancel publish", local_now_fmt());
         }
-        iced::Command::none()
+        iced::Task::none()
     }
 
     /// Update the state after a transfer was cancelled.
@@ -2006,7 +2118,7 @@ impl AppState {
         &mut self,
         nonce: Nonce,
         transfer_type: FileYeetCommandType,
-    ) -> iced::Command<Message> {
+    ) -> iced::Task<Message> {
         if let ConnectionState::Connected(ConnectedState {
             downloads, uploads, ..
         }) = &mut self.connection_state
@@ -2024,8 +2136,10 @@ impl AppState {
                     t.progress = TransferProgress::Done(TransferResult::Cancelled);
                 }
             }
+        } else {
+            eprintln!("{} No connected state to cancel transfer", local_now_fmt());
         }
-        iced::Command::none()
+        iced::Task::none()
     }
 
     /// Update the state after a transfer has concluded, successfully or not.
@@ -2034,7 +2148,7 @@ impl AppState {
         nonce: Nonce,
         result: TransferResult,
         transfer_type: FileYeetCommandType,
-    ) -> iced::Command<Message> {
+    ) -> iced::Task<Message> {
         if let ConnectionState::Connected(ConnectedState {
             peers,
             downloads,
@@ -2070,8 +2184,13 @@ impl AppState {
 
                 t.progress = TransferProgress::Done(result);
             }
+        } else {
+            eprintln!(
+                "{} No connected state to update transfer result",
+                local_now_fmt()
+            );
         }
-        iced::Command::none()
+        iced::Task::none()
     }
 
     /// Update the state after the user has chosen to remove a transfer entry.
@@ -2079,7 +2198,7 @@ impl AppState {
         &mut self,
         nonce: Nonce,
         transfer_type: FileYeetCommandType,
-    ) -> iced::Command<Message> {
+    ) -> iced::Task<Message> {
         if let ConnectionState::Connected(ConnectedState {
             downloads, uploads, ..
         }) = &mut self.connection_state
@@ -2091,12 +2210,14 @@ impl AppState {
             if let Some(i) = transfers.iter().position(|t| t.nonce == nonce) {
                 transfers.remove(i);
             }
+        } else {
+            eprintln!("{} No connected state to remove transfer", local_now_fmt());
         }
-        iced::Command::none()
+        iced::Task::none()
     }
 
     /// Try to safely close.
-    fn safely_close(&mut self, close_type: CloseType) -> iced::Command<Message> {
+    fn safely_close(&mut self, close_type: CloseType) -> iced::Task<Message> {
         if let ConnectionState::Connected(ConnectedState {
             endpoint,
             downloads,
@@ -2162,7 +2283,7 @@ impl AppState {
 
             self.safely_closing = true;
             let port_mapping_timeout = Duration::from_millis(500);
-            iced::Command::perform(
+            iced::Task::perform(
                 tokio::time::timeout(port_mapping_timeout, async move {
                     if let Err((e, _)) = port_mapping.try_drop().await {
                         eprintln!(
@@ -2173,7 +2294,7 @@ impl AppState {
                         println!("{} Port mapping safely removed", local_now_fmt());
                     }
                 }),
-                // Force exist after completing the request or after a timeout.
+                // Force exit after completing the request or after a timeout.
                 move |_| match close_type {
                     CloseType::Application => Message::ForceExit,
                     CloseType::Connections => Message::LeftServer,
@@ -2182,11 +2303,14 @@ impl AppState {
         } else {
             match close_type {
                 // Immediately exit if there isn't a port mapping to remove.
-                CloseType::Application => window::close(window::Id::MAIN),
+                CloseType::Application => {
+                    iced::window::close(self.main_window.expect("Main window ID not found"))
+                }
 
+                // Close connections and return to the main screen.
                 CloseType::Connections => {
                     self.connection_state = ConnectionState::Disconnected;
-                    iced::Command::none()
+                    iced::Task::none()
                 }
             }
         }

@@ -9,31 +9,31 @@ anyhow = "1.0"
 bytes = "1.5"
 clap = { version = "4.4", features = ["derive"] }
 crab_nat = "0.6"
-default-net = "0.22"
-dirs = "5.0"
+dirs = "6.0"
 displaydoc = "0.2"
-faster-hex = "0.9"
+faster-hex = "0.10"
 file_yeet_shared = { path = "../shared" }
 futures-util = "0.3"
 human_bytes = { version = "0.4", features = ["fast"] }
-iced = { version = "0.12", features = ["tokio"] }
+iced = { version = "0.13", features = ["tokio"] }
+netdev = "0.32"
 once_cell = "1.19"
 open = "5.1"
-quinn = "0.10"
-rand = "0.8"
+quinn = "0.11"
+rand = "0.9"
 regex = "1.10"
-rfd = "0.14"
-rustls = { version = "0.21", features = ["dangerous_configuration", "quic"] }
+rfd = "0.15"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
-thiserror = "1.0"
+thiserror = "2.0"
 tokio = { version = "1.36", features = ["fs", "macros", "net", "rt-multi-thread", "signal"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 
 # Handle special case of windows-rs crate.
 [dependencies.windows]
-version = "0.56"
+version = "0.59"
 features = [
     "Win32_Foundation",
     "Win32_System_Console",

@@ -1,17 +1,26 @@
 use std::{
+    collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
     num::NonZeroU16,
     path::Path,
-    sync::{Arc, RwLock},
+    sync::Arc,
     time::Duration,
 };
 
 use bytes::BufMut as _;
 use file_yeet_shared::{
-    local_now_fmt, BiStream, HashBytes, SocketAddrHelper, MAX_SERVER_COMMUNICATION_SIZE,
+    local_now_fmt, BiStream, HashBytes, SocketAddrHelper, GOODBYE_CODE,
+    MAX_SERVER_COMMUNICATION_SIZE,
 };
+use futures_util::TryFutureExt;
+use once_cell::sync::OnceCell;
+use rustls::pki_types::CertificateDer;
 use sha2::Digest as _;
-use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
+use tokio::{
+    io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _},
+    sync::RwLock,
+};
+use tokio_util::task::TaskTracker;
 
 /// Use a sane default timeout for server connections.
 pub const SERVER_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -56,7 +65,8 @@ pub async fn prepare_server_connection(
     server_address: Option<&str>,
     server_port: NonZeroU16,
     suggested_gateway: Option<&str>,
-    port_config: PortMappingConfig,
+    interal_port: Option<NonZeroU16>,
+    external_port_config: PortMappingConfig,
     bb: &mut bytes::BytesMut,
 ) -> anyhow::Result<PreparedConnection> {
     // Create a self-signed certificate for the peer communications.
@@ -79,20 +89,24 @@ pub async fn prepare_server_connection(
 
     let using_ipv4 = server_socket.address.is_ipv4();
 
-    // Create our QUIC endpoint. Use an unspecified address and port since we don't have any preference.
-    let mut endpoint = quinn::Endpoint::server(
-        server_config,
-        if using_ipv4 {
-            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
-        } else {
-            SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0))
-        },
-    )?;
+    // Create our QUIC endpoint. Use an unspecified address since we don't have any preference.
+    let mut endpoint = {
+        let port = interal_port.map(NonZeroU16::get).unwrap_or_default();
+        quinn::Endpoint::server(
+            server_config,
+            if using_ipv4 {
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port))
+            } else {
+                SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0))
+            },
+        )?
+    };
 
     // Use an insecure client configuration when connecting to peers.
     // TODO: Use a secure client configuration when connecting to the server.
     endpoint.set_default_client_config(configure_peer_verification());
-    // Connect to the public file_yeet_server.
+
+    // Connect to the specified `file_yeet` server.
     let connection = connect_to_server(server_socket, &endpoint).await?;
 
     // Share debug information about the QUIC endpoints.
@@ -109,13 +123,29 @@ pub async fn prepare_server_connection(
 
     // Attempt to get a port forwarding, starting with user's override and then attempting NAT-PMP and PCP.
     let gateway = if let Some(g) = suggested_gateway {
+        // Parse the string to an IP address.
         g.parse()?
     } else {
-        default_net::get_default_gateway()
-            .map_err(|s| anyhow::anyhow!(s))?
-            .ip_addr
+        // Determine the default gateway.
+        let gateway = netdev::get_default_gateway().map_err(|s| anyhow::anyhow!(s))?;
+
+        // Use the local address as preference for which IP version to use.
+        if local_address.is_ipv4() {
+            gateway
+                .ipv4
+                .first()
+                .map(|ip| IpAddr::V4(*ip))
+                .or_else(|| gateway.ipv6.first().map(|ip| IpAddr::V6(*ip)))
+        } else {
+            gateway
+                .ipv6
+                .first()
+                .map(|ip| IpAddr::V6(*ip))
+                .or_else(|| gateway.ipv4.first().map(|ip| IpAddr::V4(*ip)))
+        }
+        .expect("Gateway has no associated IP address")
     };
-    let (port_mapping, port_override) = match port_config {
+    let (port_mapping, port_override) = match external_port_config {
         // Use a port that is explicitly set by the user without PCP/NAT-PMP.
         PortMappingConfig::PortForwarding(p) => (None, Some(p)),
 
@@ -169,7 +199,7 @@ pub async fn prepare_server_connection(
 
 /// Helper to determine the default interface's IP address.
 fn probe_local_address(using_ipv4: bool) -> anyhow::Result<IpAddr> {
-    let interface = default_net::get_default_interface()
+    let interface = netdev::get_default_interface()
         .map_err(|e| anyhow::anyhow!("Failed to get a default interface: {e}"))?;
     let ip = if using_ipv4 {
         IpAddr::V4(
@@ -177,7 +207,7 @@ fn probe_local_address(using_ipv4: bool) -> anyhow::Result<IpAddr> {
                 .ipv4
                 .first()
                 .ok_or_else(|| anyhow::anyhow!("Failed to get a default IPv4 address"))?
-                .addr,
+                .addr(),
         )
     } else {
         IpAddr::V6(
@@ -185,7 +215,7 @@ fn probe_local_address(using_ipv4: bool) -> anyhow::Result<IpAddr> {
                 .ipv6
                 .first()
                 .ok_or_else(|| anyhow::anyhow!("Failed to get a default IPv6 address"))?
-                .addr,
+                .addr(),
         )
     };
 
@@ -444,12 +474,9 @@ pub async fn udp_holepunch(
     endpoint: quinn::Endpoint,
     peer_address: SocketAddr,
 ) -> Option<(quinn::Connection, BiStream)> {
-    // Spawn a thread that listens for a peer and will set the boolean lock when connected.
-    let endpoint_listen = endpoint.clone();
-    let listen_future = tokio::time::timeout(
-        PEER_LISTEN_TIMEOUT,
-        listen_for_peer(endpoint_listen, peer_address),
-    );
+    // Poll incoming connections that are handled by a background task.
+    let mut manager = IncomingManager::get();
+    let listen_future = manager.await_peer(peer_address, PEER_LISTEN_TIMEOUT);
 
     // Attempt to connect to the peer's public address.
     let connect_future = tokio::time::timeout(
@@ -459,7 +486,6 @@ pub async fn udp_holepunch(
 
     // Return the peer stream if we have one.
     let (listen_stream, connect_stream) = futures_util::join!(listen_future, connect_future);
-    let listen_stream = listen_stream.ok().flatten();
     let connect_stream = connect_stream.ok().flatten();
     let connections =
         // TODO: It could be interesting and possible to create a more general stream negotiation.
@@ -525,52 +551,6 @@ pub async fn peer_connection_into_stream(
     }
 }
 
-/// Spawn a thread that listens for a peer and will assign the peer `Connection` lock when connected.
-async fn listen_for_peer(
-    endpoint: quinn::Endpoint,
-    expected_peer: SocketAddr,
-) -> Option<quinn::Connection> {
-    // Print and create binding from the local address.
-    println!(
-        "{} Listening for peer on the QUIC endpoint",
-        local_now_fmt()
-    );
-
-    // Accept a peer connection.
-    let connecting = endpoint.accept().await?;
-
-    // Ensure we are connecting to the expected peer.
-    // TODO: Allow returning an unexpected peer connection to the caller to be routed appropriately.
-    if connecting.remote_address() != expected_peer {
-        eprintln!(
-            "{} Peer connection from unexpected address: {}",
-            local_now_fmt(),
-            connecting.remote_address(),
-        );
-        return None;
-    }
-
-    let connection = match connecting.await {
-        Ok(connection) => connection,
-        Err(e) => {
-            eprintln!(
-                "{} Failed to accept a peer connection: {e}",
-                local_now_fmt()
-            );
-            return None;
-        }
-    };
-
-    // Connected to a peer on the listening stream, print their address.
-    let peer_addr = connection.remote_address();
-    println!(
-        "{} New connection accepted from peer at: {peer_addr:?}",
-        local_now_fmt()
-    );
-
-    Some(connection)
-}
-
 /// Try to connect to a peer at the given address.
 async fn connect_to_peer(
     endpoint: quinn::Endpoint,
@@ -609,12 +589,24 @@ async fn connect_to_peer(
 /// Errors that may occur when downloading a file from a peer.
 #[derive(Debug, thiserror::Error)]
 pub enum DownloadError {
-    #[error("An I/O error occurred: {0}")]
-    IoError(std::io::Error),
-    #[error("A write error occurred: {0}")]
-    WriteError(quinn::WriteError),
+    #[error("A file access error occurred: {0}")]
+    FileAccess(std::io::Error),
+
+    #[error("An error occurred performing a QUIC read: {0}")]
+    QuicRead(quinn::ReadError),
+
+    #[error("An error occurred performing a QUIC write: {0}")]
+    QuicWrite(quinn::WriteError),
+
+    #[error("A file write error occurred: {0}")]
+    FileWrite(std::io::Error),
+
+    #[error("Unexpected end of file")]
+    UnexpectedEof,
+
     #[error("The downloaded file hash does not match the expected hash")]
     HashMismatch,
+
     #[error("Download lock was poisoned: {0}")]
     PoisonedLock(String),
 }
@@ -627,7 +619,7 @@ pub async fn download_from_peer(
     file_size: u64,
     output_path: &Path,
     bb: &mut bytes::BytesMut,
-    byte_progress: Option<Arc<RwLock<f32>>>,
+    byte_progress: Option<&std::sync::RwLock<f32>>,
 ) -> Result<(), DownloadError> {
     // Open the file for writing.
     let mut file = tokio::fs::OpenOptions::new()
@@ -636,7 +628,7 @@ pub async fn download_from_peer(
         .write(true)
         .open(&output_path)
         .await
-        .map_err(DownloadError::IoError)?;
+        .map_err(DownloadError::FileAccess)?;
 
     // Let the peer know which range we want to download using this QUIC stream.
     // Here we want the entire file.
@@ -645,14 +637,9 @@ pub async fn download_from_peer(
     bb.put_u64(file_size); // Request the file's entire size.
     peer_streams
         .send
-        .write(bb)
+        .write_all(bb)
         .await
-        .map_err(DownloadError::WriteError)?;
-    peer_streams
-        .send
-        .finish()
-        .await
-        .map_err(|e| DownloadError::IoError(e.into()))?;
+        .map_err(DownloadError::QuicWrite)?;
 
     // Create a scratch space for reading data from the stream.
     let mut buf = [0; MAX_PEER_COMMUNICATION_SIZE];
@@ -666,11 +653,8 @@ pub async fn download_from_peer(
             .recv
             .read(&mut buf)
             .await
-            .map_err(|e| DownloadError::IoError(e.into()))?
-            .ok_or(DownloadError::IoError(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "Peer closed the upload early",
-            )))?;
+            .map_err(DownloadError::QuicRead)?
+            .ok_or(DownloadError::UnexpectedEof)?;
 
         if size > 0 {
             // Write the bytes to the file and update the hash.
@@ -678,7 +662,7 @@ pub async fn download_from_peer(
             let f = file.write_all(bb);
             // Update hash while future may be pending.
             hasher.update(bb);
-            f.await.map_err(DownloadError::IoError)?;
+            f.await.map_err(DownloadError::FileWrite)?;
 
             // Update the number of bytes written.
             bytes_written += size as u64;
@@ -692,6 +676,10 @@ pub async fn download_from_peer(
             }
         }
     }
+
+    // No more data is required from this stream.
+    // Let the peer know they can close their end of the stream.
+    let _ = peer_streams.recv.stop(GOODBYE_CODE);
 
     // Ensure the file hash is correct.
     let downloaded_hash = hasher.finalize();
@@ -712,7 +700,7 @@ pub async fn download_from_peer(
 #[allow(clippy::cast_precision_loss)]
 pub async fn file_size_and_hash(
     file_path: &Path,
-    progress: Option<Arc<RwLock<f32>>>,
+    progress: Option<&std::sync::RwLock<f32>>,
 ) -> anyhow::Result<(u64, HashBytes)> {
     let mut hasher = sha2::Sha256::new();
     let mut reader = tokio::io::BufReader::new(
@@ -752,7 +740,7 @@ pub async fn file_size_and_hash(
         if let Some(progress) = progress.as_ref() {
             *progress
                 .write()
-                .map_err(|e| anyhow::anyhow!("Progress lock was poisoned: {e}"))? =
+                .map_err(|e| anyhow::anyhow!("Hashing progress lock was poisoned: {e}"))? =
                 bytes_hashed as f32 / size_float;
         }
     }
@@ -767,11 +755,15 @@ pub async fn upload_to_peer(
     peer_streams: &mut BiStream,
     file_size: u64,
     mut reader: tokio::io::BufReader<tokio::fs::File>,
-    byte_progress: Option<Arc<RwLock<f32>>>,
+    byte_progress: Option<&std::sync::RwLock<f32>>,
 ) -> anyhow::Result<()> {
     // Read the peer's desired upload range.
     let start_index = peer_streams.recv.read_u64().await?;
     let upload_length = peer_streams.recv.read_u64().await?;
+
+    // No more data is required from this stream.
+    let _ = peer_streams.recv.stop(GOODBYE_CODE);
+
     // Sanity check the upload range.
     match start_index.checked_add(upload_length) {
         Some(end) if end > file_size => anyhow::bail!("Invalid range requested, exceeds file size"),
@@ -784,11 +776,11 @@ pub async fn upload_to_peer(
 
     // Create a scratch space for reading data from the stream.
     let mut buf = [0; MAX_PEER_COMMUNICATION_SIZE];
-    let mut bytes_read = 0;
+    let mut bytes_sent = 0;
     let upload_length_f = upload_length as f32;
 
     // Read from the file and write to the peer.
-    while bytes_read < upload_length {
+    while bytes_sent < upload_length {
         // Read a natural amount of bytes from the file.
         let mut n = reader.read(&mut buf).await?;
         if n == 0 {
@@ -796,7 +788,7 @@ pub async fn upload_to_peer(
         }
 
         // Ensure we don't send more bytes than were requested in the range.
-        let remaining = upload_length - bytes_read;
+        let remaining = upload_length - bytes_sent;
         if (n as u64) > remaining {
             n = usize::try_from(remaining)?;
         }
@@ -805,19 +797,19 @@ pub async fn upload_to_peer(
         peer_streams.send.write_all(&buf[..n]).await?;
 
         // Update the number of bytes read.
-        bytes_read += n as u64;
+        bytes_sent += n as u64;
 
         // Update the caller with the number of bytes sent to the peer.
         if let Some(progress) = byte_progress.as_ref() {
             *progress
                 .write()
                 .map_err(|e| anyhow::anyhow!("Upload progress lock was poisoned: {e}"))? =
-                bytes_read as f32 / upload_length_f;
+                bytes_sent as f32 / upload_length_f;
         }
     }
 
     // Gracefully close our connection after all data has been sent.
-    if let Err(e) = peer_streams.send.finish().await {
+    if let Err(e) = peer_streams.send.stopped().await {
         eprintln!(
             "{} Failed to close the peer stream gracefully: {e}",
             local_now_fmt()
@@ -835,23 +827,161 @@ pub fn humanize_bytes(bytes: u64) -> String {
     human_bytes::human_bytes(bytes as f64)
 }
 
-/// Allow peers to connect using self-signed certificates.
-/// Necessary for using the QUIC protocol.
-#[derive(Debug)]
-struct SkipAllServerVerification;
+/// Type for determining whether a peer connection is being requested or has already been established.
+enum IncomingPeerState {
+    Awaiting(tokio::sync::oneshot::Sender<quinn::Connection>),
+    Connected(quinn::Connection),
+}
 
-/// Skip all server verification.
-impl rustls::client::ServerCertVerifier for SkipAllServerVerification {
+/// A manager for incoming peer connections.
+pub struct IncomingManager {
+    map: Arc<RwLock<HashMap<SocketAddr, IncomingPeerState>>>,
+}
+
+impl IncomingManager {
+    /// Create a new `IncomingManager` object with a reference to the singleton mapping of incoming connections.
+    pub fn get() -> Self {
+        static MAPPING: OnceCell<Arc<RwLock<HashMap<SocketAddr, IncomingPeerState>>>> =
+            OnceCell::new();
+        Self {
+            map: MAPPING
+                .get_or_init(|| Arc::new(RwLock::new(HashMap::new())))
+                .clone(),
+        }
+    }
+
+    /// Await the connection of a peer from a specified socket address.
+    pub async fn await_peer(
+        &mut self,
+        peer_address: SocketAddr,
+        timeout: Duration,
+    ) -> Option<quinn::Connection> {
+        let rx = {
+            let mut map = self.map.write().await;
+            if let Some(IncomingPeerState::Connected(c)) = map.remove(&peer_address) {
+                return Some(c);
+            }
+
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            map.insert(peer_address, IncomingPeerState::Awaiting(tx));
+            rx
+        };
+
+        tokio::time::timeout(timeout, rx.into_future())
+            .await
+            .ok()
+            .and_then(Result::ok)
+    }
+
+    /// Accept a peer connection and hand-off to any threads awaiting the connection.
+    pub async fn accept_peer(&mut self, connection: quinn::Connection) {
+        let peer_address = {
+            let mut map = self.map.write().await;
+            let peer_address = connection.remote_address();
+            if let Some(IncomingPeerState::Awaiting(tx)) = map.remove(&peer_address) {
+                // Fails if the receiver is no longer waiting for this message.
+                let _ = tx.send(connection);
+            } else {
+                map.insert(peer_address, IncomingPeerState::Connected(connection));
+            }
+            peer_address
+        };
+        println!(
+            "{} Peer connection accepted: {peer_address}",
+            local_now_fmt()
+        );
+    }
+
+    /// Create a new task to manage incoming peer connections in the background.
+    pub fn new_manage_task(endpoint: quinn::Endpoint, task_master: &mut TaskTracker) {
+        task_master.spawn(async move {
+            let mut manager = Self::get();
+            while let Some(connecting) = endpoint.accept().await {
+                let connecting = match connecting.accept() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!(
+                            "{} Failed to accept an incoming peer connection: {e}",
+                            local_now_fmt()
+                        );
+                        // Skip incomplete connections.
+                        continue;
+                    }
+                };
+                let connection = match connecting.await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!(
+                            "{} Failed to complete a peer connection: {e}",
+                            local_now_fmt()
+                        );
+                        // Skip incomplete connections.
+                        continue;
+                    }
+                };
+
+                // Notify any thread waiting for this connection if available, otherwise store it.
+                manager.accept_peer(connection).await;
+            }
+        });
+    }
+}
+
+/// Allow peers to connect using self-signed certificates.
+/// Necessary for using the QUIC protocol with peer-to-peer connections where
+/// peers likely won't have a certificate signed by a certificate authority.
+#[derive(Debug)]
+struct SkipServerCertVerification(Arc<rustls::crypto::CryptoProvider>);
+
+impl SkipServerCertVerification {
+    fn new() -> Arc<Self> {
+        Arc::new(Self(Arc::new(rustls::crypto::ring::default_provider())))
+    }
+}
+
+/// Skip server certificate verification. Still verify signatures.
+impl rustls::client::danger::ServerCertVerifier for SkipServerCertVerification {
     fn verify_server_cert(
         &self,
-        _end_entity: &rustls::Certificate,
-        _intermediates: &[rustls::Certificate],
-        _server_name: &rustls::ServerName,
-        _scts: &mut dyn Iterator<Item = &[u8]>,
-        _ocsp_response: &[u8],
-        _now: std::time::SystemTime,
-    ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::ServerCertVerified::assertion())
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
     }
 }
 
@@ -859,10 +989,13 @@ impl rustls::client::ServerCertVerifier for SkipAllServerVerification {
 /// # Panics
 /// If the conversion from `Duration` to `IdleTimeout` fails.
 fn configure_peer_verification() -> quinn::ClientConfig {
-    let crypto = rustls::ClientConfig::builder()
-        .with_safe_defaults()
-        .with_custom_certificate_verifier(Arc::new(SkipAllServerVerification {}))
-        .with_no_client_auth();
+    let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(
+        rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(SkipServerCertVerification::new())
+            .with_no_client_auth(),
+    )
+    .expect("Failed to create a QUIC client configuration");
 
     let mut client_config = quinn::ClientConfig::new(Arc::new(crypto));
 

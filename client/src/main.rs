@@ -5,8 +5,7 @@ use file_yeet_shared::{
     MAX_SERVER_COMMUNICATION_SIZE,
 };
 use futures_util::{stream::FuturesUnordered, StreamExt};
-use iced::Application;
-use tokio_util::sync::CancellationToken;
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use crate::core::{humanize_bytes, FileYeetCommandType, PreparedConnection};
 
@@ -27,10 +26,16 @@ pub struct Cli {
     #[arg(short='p', long, default_value_t = file_yeet_shared::DEFAULT_PORT)]
     server_port: NonZeroU16,
 
-    /// Override the port seen by the server to communicate a custom port to peers.
-    /// Useful when port-forwarding.
-    #[arg(short = 'o', long)]
-    port_override: Option<NonZeroU16>,
+    /// Override the port seen by the server to communicate a custom external port to peers.
+    /// Useful when manually port forwarding.
+    /// Takes precedence over the `nat_map` option.
+    #[arg(short = 'x', long)]
+    external_port_override: Option<NonZeroU16>,
+
+    /// Require the client to bind to a specific local port.
+    /// Useful when manually port forwarding.
+    #[arg(short, long)]
+    internal_port: Option<NonZeroU16>,
 
     /// The IP address of local gateway to use when attempting the Port Control Protocol.
     /// If not specified, a default gateway will be searched for.
@@ -69,33 +74,40 @@ async fn main() {
         // If Windows, ensure we aren't displaying an unwanted console window.
         #[cfg(target_os = "windows")]
         {
+            #[config(debug_assertions)]
+            println!("{} Freeing Windows console for GUI", local_now_fmt());
+
             win_cmd::free_allocated_console();
         }
 
         // Run the GUI. Specify that the application should override the default exit behavior.
-        if let Err(e) = gui::AppState::run(iced::Settings {
-            window: iced::window::Settings {
-                exit_on_close_request: false,
-                ..iced::window::Settings::default()
-            },
-            flags: Some(args),
-            ..iced::Settings::default()
-        }) {
+        if let Err(e) = iced::application(
+            gui::AppState::title(),
+            gui::AppState::update,
+            gui::AppState::view,
+        )
+        .exit_on_close_request(false)
+        .subscription(gui::AppState::subscription)
+        .theme(gui::AppState::theme)
+        .run_with(|| gui::AppState::new(args))
+        {
             eprintln!("{} GUI failed to run: {e}", local_now_fmt());
         }
 
+        println!("{} Closing GUI...", local_now_fmt());
         return;
     };
 
     // Create a buffer for sending and receiving data within the payload size for `file_yeet`.
     let mut bb = bytes::BytesMut::with_capacity(MAX_SERVER_COMMUNICATION_SIZE);
 
-    // Connect to the public file_yeet_server.
+    // Connect to the specified file_yeet server.
     let prepared_connection = core::prepare_server_connection(
         args.server_address.as_deref(),
         args.server_port,
         args.gateway.as_deref(),
-        if let Some(g) = args.port_override {
+        args.internal_port,
+        if let Some(g) = args.external_port_override {
             // Use the provided port override.
             core::PortMappingConfig::PortForwarding(g)
         } else if args.nat_map {
@@ -109,11 +121,17 @@ async fn main() {
     .await
     .expect("Failed to perform basic connection setup");
 
+    // Create a background task to handle incoming peer connections.
+    let mut task_master = TaskTracker::new();
+    core::IncomingManager::new_manage_task(prepared_connection.endpoint.clone(), &mut task_master);
+
     // Determine if we are going to make a publish or subscribe request.
     match cmd {
         // Try to hash and publish the file to the rendezvous server.
         FileYeetCommand::Pub { file_path } => {
-            if let Err(e) = publish_command(&prepared_connection, bb, file_path).await {
+            if let Err(e) =
+                publish_command(&prepared_connection, bb, file_path, &mut task_master).await
+            {
                 eprintln!("{} Failed to publish the file: {e}", local_now_fmt());
             }
         }
@@ -130,6 +148,12 @@ async fn main() {
     prepared_connection
         .endpoint
         .close(GOODBYE_CODE, GOODBYE_MESSAGE.as_bytes());
+
+    // Close the tracker after no more tasks should be spawned.
+    task_master.close();
+
+    // Wait for the server's tasks to finish.
+    task_master.wait().await;
 
     // Try to clean up the port mapping if one was made.
     if let Some(mapping) = prepared_connection.port_mapping {
@@ -153,6 +177,7 @@ async fn publish_command(
     prepared_connection: &PreparedConnection,
     bb: bytes::BytesMut,
     file_path: String,
+    task_master: &mut TaskTracker,
 ) -> anyhow::Result<()> {
     let file_path = std::path::Path::new(&file_path);
     let (file_size, hash) = match core::file_size_and_hash(file_path, None).await {
@@ -181,7 +206,7 @@ async fn publish_command(
             println!("{} Ctrl-C detected, cancelling the publish", local_now_fmt());
             cancellation_token.cancel();
         }
-        r = publish_loop(endpoint, server_connection, bb, hash, file_size, file_path, cancellation_token.clone()) => return r
+        r = publish_loop(endpoint, server_connection, bb, hash, file_size, file_path, cancellation_token.clone(), task_master) => return r
     }
 
     Ok(())
@@ -234,36 +259,34 @@ async fn subscribe_command(
     // Try to connect to multiple peers concurrently with a list of connection futures.
     let mut connection_attempts = FuturesUnordered::new();
     for (peer_address, file_size) in peers.drain(..) {
+        let local_endpoint = endpoint.clone();
         connection_attempts.push(async move {
-            (
-                core::udp_holepunch(
-                    FileYeetCommandType::Sub,
-                    hash,
-                    endpoint.clone(),
-                    peer_address,
-                )
-                .await,
-                file_size,
-            )
+            core::udp_holepunch(FileYeetCommandType::Sub, hash, local_endpoint, peer_address)
+                .await
+                .map(|(c, b)| (c, b, file_size))
         });
     }
 
-    // Iterate through the connection attempts as they resolve and use the first successful connection.
+    // Iterate through the connection attempts as they resolve.
+    // Allow the user to accept or reject the download from each peer until the first accepted connection.
     let peer_connection = loop {
         match connection_attempts.next().await {
-            Some((Some((c, b)), file_size)) => {
+            Some(Some((c, b, file_size))) => {
                 let consent =
                     file_consent_cli(file_size, &output).expect("Failed to read user input");
                 if consent {
                     break Some((c, b, file_size));
                 }
 
-                println!("{} Download cancelled", local_now_fmt());
-
-                // Close the connection since this command can't have multiple connections to a peer.
+                // Close the connection because we won't download from this peer.
+                println!("{} Download rejected", local_now_fmt());
                 c.close(GOODBYE_CODE, &[]);
             }
-            Some((None, _)) => continue,
+
+            // If the connection attempt failed, skip the peer.
+            Some(None) => {}
+
+            // If no more connections are available, break the loop.
             None => break None,
         }
     };
@@ -302,12 +325,13 @@ async fn publish_loop(
     file_size: u64,
     file_path: &Path,
     cancellation_token: CancellationToken,
+    task_master: &mut TaskTracker,
 ) -> anyhow::Result<()> {
     // Create a bi-directional stream to the server.
     let mut server_streams: BiStream =
         crate::core::publish(server_connection, bb, hash, file_size).await?;
 
-    // Enter a loop to listen for the server to send peer connections.
+    // Enter a loop to listen for the server to send peer addresses.
     loop {
         println!(
             "{} Waiting for the server to introduce a peer...",
@@ -324,7 +348,7 @@ async fn publish_loop(
         let cancellation_token = cancellation_token.clone();
         let endpoint = endpoint.clone();
         let file_path = file_path.to_path_buf();
-        tokio::task::spawn(async move {
+        task_master.spawn(async move {
             tokio::select! {
                 // Ensure the publish tasks are cancellable.
                 () = cancellation_token.cancelled() => {}
@@ -364,7 +388,8 @@ async fn publish_loop(
         });
     }
 
-    Ok(println!("{} Server connection closed", local_now_fmt()))
+    println!("{} Server connection closed", local_now_fmt());
+    Ok(())
 }
 
 /// Prompt the user for consent to download a file.
@@ -392,5 +417,5 @@ fn file_consent_cli(file_size: u64, output: &Path) -> Result<bool, std::io::Erro
     std::io::stdin().read_line(&mut input)?;
 
     // Return the user's consent.
-    return Ok(input.trim_start().starts_with('y') || input.trim_start().starts_with('Y'));
+    Ok(input.trim_start().starts_with('y') || input.trim_start().starts_with('Y'))
 }

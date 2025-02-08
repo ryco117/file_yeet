@@ -6,6 +6,7 @@ use std::{
 };
 
 use num_enum::TryFromPrimitive;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 /// Magic number for the default port.
 pub const DEFAULT_PORT: NonZeroU16 = unsafe { std::num::NonZeroU16::new_unchecked(7828) };
@@ -97,10 +98,23 @@ pub fn get_server_or_default(
             }
         })
         .unwrap_or_else(|| {
-            Ok(SocketAddrHelper {
-                address: (Ipv4Addr::LOCALHOST, port.get()).into(),
-                hostname: Ipv4Addr::LOCALHOST.to_string(),
-            })
+            const LOCALHOST: &str = "localhost";
+            if let Some(address) = (LOCALHOST, port.get())
+                .to_socket_addrs()
+                .map(|mut i| i.next())
+                .ok()
+                .flatten()
+            {
+                Ok(SocketAddrHelper {
+                    address,
+                    hostname: LOCALHOST.to_string(),
+                })
+            } else {
+                Ok(SocketAddrHelper {
+                    address: (Ipv4Addr::LOCALHOST, port.get()).into(),
+                    hostname: Ipv4Addr::LOCALHOST.to_string(),
+                })
+            }
         })
 }
 
@@ -142,54 +156,10 @@ pub fn server_transport_config() -> Arc<quinn::TransportConfig> {
 /// Generate a self-signed certificate for use with QUIC.
 /// # Errors
 /// Fails if `rcgen` fails to generate a certificate or if `rustls` fails to parse the resulting certificate.
-pub fn generate_self_signed_cert() -> anyhow::Result<(rustls::Certificate, rustls::PrivateKey)> {
+pub fn generate_self_signed_cert<'a>() -> anyhow::Result<(CertificateDer<'a>, PrivateKeyDer<'a>)> {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])?;
-    let key = rustls::PrivateKey(cert.serialize_private_key_der());
-    Ok((rustls::Certificate(cert.serialize_der()?), key))
+    let cert_der = CertificateDer::from(cert.cert);
+    let key = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+
+    Ok((cert_der, key.into()))
 }
-
-// // Rustls 0.22.0 version of the above
-// impl rustls::client::dangerous::ServerCertVerifier for SkipAllServerVerification {
-
-//     /// Implementation of a verifier that does not verify the server certificate.
-//     fn verify_server_cert(
-//         &self,
-//         _end_entity: &CertificateDer<'_>,
-//         _intermediates: &[CertificateDer<'_>],
-//         _server_name: &rustls::pki_types::ServerName<'_>,
-//         _ocsp_response: &[u8],
-//         _now: rustls::pki_types::UnixTime,
-//     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-//         Ok(rustls::client::danger::ServerCertVerified::assertion())
-//     }
-
-//     // Even when skipping validation, DJB reigns supreme.
-//     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-//         vec![rustls::SignatureScheme::ED25519]
-//     }
-
-//     fn verify_tls12_signature(
-//         &self,
-//         _message: &[u8],
-//         _cert: &CertificateDer<'_>,
-//         _dss: &rustls::DigitallySignedStruct,
-//     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-//         Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-//     }
-
-//     fn verify_tls13_signature(
-//         &self,
-//         _message: &[u8],
-//         _cert: &CertificateDer<'_>,
-//         _dss: &rustls::DigitallySignedStruct,
-//     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-//         Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-//     }
-// }
-
-// /// Build a QUIC client config that will skip server verification.
-// pub fn configure_peer_verification() -> rustls::ClientConfig {
-//     rustls::ClientConfig::builder().dangerous()
-//         .with_custom_certificate_verifier(Arc::new(SkipAllServerVerification {}))
-//         .with_no_client_auth()
-// }

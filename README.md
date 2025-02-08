@@ -33,6 +33,8 @@ docker build -t file_yeet_server:local .
 ![Client GUI screenshot](images/client_screenshot.png)
 ```text
 $ cargo r --bin file_yeet_client -- -h
+The command line interface for `file_yeet_client`
+
 Usage: file_yeet_client.exe [OPTIONS] [COMMAND]
 
 Commands:
@@ -45,8 +47,10 @@ Options:
           The address of the rendezvous server. Either an IP address or a hostname
   -p, --server-port <SERVER_PORT>
           The server port to connect to [default: 7828]
-  -o, --port-override <PORT_OVERRIDE>
-          Override the port seen by the server to communicate a custom port to peers. Useful when port-forwarding
+  -x, --external-port-override <EXTERNAL_PORT_OVERRIDE>
+          Override the port seen by the server to communicate a custom external port to peers. Useful when manually port forwarding
+  -i, --interal-port <INTERAL_PORT>
+          Require the client to bind to a specific local port. Useful when manually port forwarding
   -g, --gateway <GATEWAY>
           The IP address of local gateway to use when attempting the Port Control Protocol. If not specified, a default gateway will be searched for
   -n, --nat-map
