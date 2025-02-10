@@ -16,7 +16,7 @@ use iced::{
     widget::{self, horizontal_space},
     window, Element,
 };
-use tokio::io::AsyncWriteExt as _;
+use tokio::{io::AsyncWriteExt as _, sync::RwLock};
 use tokio_util::sync::CancellationToken;
 
 use crate::core::{
@@ -24,18 +24,27 @@ use crate::core::{
     MAX_PEER_COMMUNICATION_SIZE, PEER_CONNECT_TIMEOUT, SERVER_CONNECTION_TIMEOUT,
 };
 
+/// The string corresponding to a regex pattern for matching valid IPv6 addresses.
+const IPV6_REGEX_STR: &str = r"(?:(?:[0-9a-fA-F]{1,4}:){7,7}[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,7}:|(?:[0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,5}(?::[0-9a-fA-F]{1,4}){1,2}|(?:[0-9a-fA-F]{1,4}:){1,4}(?::[0-9a-fA-F]{1,4}){1,3}|(?:[0-9a-fA-F]{1,4}:){1,3}(?::[0-9a-fA-F]{1,4}){1,4}|(?:[0-9a-fA-F]{1,4}:){1,2}(?::[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:(?:(?::[0-9a-fA-F]{1,4}){1,6})|:(?:(?::[0-9a-fA-F]{1,4}){1,7}|:)|fe80:(?::[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}|::(?:ffff(?::0{1,4}){0,1}:){0,1}(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3,3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)|(?:[0-9a-fA-F]{1,4}:){1,4}:(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3,3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?))";
+
+/// The string corresponding to a regex pattern for matching valid IPv4 addresses.
+const IPV4_REGEX_STR: &str =
+    r"(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)";
+
 /// Lazily initialized regex for parsing server addresses.
 /// Produces match groups `host` and `port` for the server address and optional port.
-static SERVER_ADDRESS_REGEX: once_cell::sync::Lazy<regex::Regex> =
-    once_cell::sync::Lazy::new(|| {
-        regex::Regex::new(r"^\s*(?P<host>([^:]|::)+)(?::(?P<port>\d+))?\s*$").unwrap()
-    });
+static SERVER_ADDRESS_REGEX: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(&format!(
+        "^\\s*(?P<host>{IPV4_REGEX_STR}|\\[{IPV6_REGEX_STR}\\]|[^:]+)(?::(?P<port>\\d+))?\\s*$"
+    ))
+    .expect("Failed to compile the server address regex")
+});
 
 /// The maximum time to wait before forcing the application to exit.
 const MAX_SHUTDOWN_WAIT: Duration = Duration::from_secs(3);
 
 /// The red used to display errors to the user.
-const ERROR_RED_COLOR: iced::Color = iced::Color::from_rgb(1., 0.4, 0.5);
+const ERROR_RED_COLOR: iced::Color = iced::Color::from_rgb(1., 0.35, 0.45);
 
 /// The state of the port mapping options in the GUI.
 #[derive(
@@ -116,7 +125,7 @@ pub enum TransferResult {
 enum TransferProgress {
     Connecting,
     Consent(PeerRequestStream),
-    Transferring(PeerRequestStream, Arc<std::sync::RwLock<f32>>, f32),
+    Transferring(PeerRequestStream, Arc<RwLock<f32>>, f32),
     Done(TransferResult),
 }
 
@@ -161,7 +170,7 @@ struct Publish {
 /// The state of a file publish request.
 #[derive(Clone, Debug)]
 enum PublishState {
-    Hashing(Arc<std::sync::RwLock<f32>>),
+    Hashing(Arc<RwLock<f32>>),
     Publishing(Publish),
     Failure(Arc<anyhow::Error>),
     Cancelled,
@@ -178,13 +187,12 @@ struct PublishItem {
 impl PublishItem {
     /// Make a new publish item in the hashing state.
     pub fn new(
-        nonce: Nonce,
         path: PathBuf,
         cancellation_token: CancellationToken,
-        hash_progress: Arc<std::sync::RwLock<f32>>,
+        hash_progress: Arc<RwLock<f32>>,
     ) -> Self {
         Self {
-            nonce,
+            nonce: rand::random(),
             path,
             cancellation_token,
             state: PublishState::Hashing(hash_progress),
@@ -393,9 +401,8 @@ pub enum Message {
     /// All async actions to leave a server have completed.
     LeftServer,
 
-    /// A peer has connected to our endpoint directly.
-    PeerConnected(quinn::Connection),
-
+    // /// A peer has connected to our endpoint directly.
+    // PeerConnected(quinn::Connection),
     /// A peer has requested a new transfer from an existing connection.
     PeerRequestedTransfer((HashBytes, PeerRequestStream)),
 
@@ -417,7 +424,7 @@ pub enum Message {
     /// The result of a publish request.
     PublishRequestResulted(Nonce, PathBuf, PublishRequestResult),
 
-    /// The result of trying to receive a peer to publish to from the server.
+    /// The result of trying to receive a peer from the server.
     PublishPeerReceived(Nonce, Result<SocketAddr, Arc<anyhow::Error>>),
 
     /// The result of trying to connect to a peer to publish to.
@@ -585,7 +592,7 @@ impl AppState {
                 iced::Task::none()
             }
 
-            Message::PeerConnected(connection) => self.update_peer_connected(connection),
+            // Message::PeerConnected(connection) => self.update_peer_connected(connection),
 
             // A peer has requested a new transfer from an existing connection.
             Message::PeerRequestedTransfer((hash, peer_request)) => {
@@ -598,6 +605,7 @@ impl AppState {
                     &mut self.connection_state
                 {
                     peers.remove(&peer_addr);
+                    crate::core::IncomingManager::get().blocking_remove_peer(&peer_addr);
                 }
                 iced::Task::none()
             }
@@ -748,7 +756,7 @@ impl AppState {
                 publishes,
                 ..
             }) => {
-                // For publish we listen to the server for new peers requesting them.
+                // For each publish we listen to the server for new peers requesting the file.
                 let pubs = publishes.iter().filter_map(|publish| {
                     // If the publish is still hashing, skip for now.
                     let PublishItem {
@@ -781,8 +789,9 @@ impl AppState {
                 // Create a task to listen for incoming connections to our QUIC endpoint.
                 let incoming_connections = {
                     let endpoint = endpoint.clone();
-                    iced::stream::channel(4, move |output| {
-                        incoming_peer_connection_loop(endpoint, output)
+                    iced::stream::channel(4, move |_output| {
+                        // incoming_peer_connection_loop(endpoint, output)
+                        crate::core::IncomingManager::manage_incoming_loop(endpoint)
                     })
                 };
 
@@ -797,6 +806,9 @@ impl AppState {
                         }),
                     )
                 });
+
+                #[cfg(debug_assertions)]
+                println!("{} Subscribing to {} peers", local_now_fmt(), peers.len());
 
                 // Batch all the listeners together.
                 iced::Subscription::batch(
@@ -972,14 +984,15 @@ impl AppState {
         Element::<'a>::from(spinner)
     }
 
+    /// Draw the transfer view for the main connected page.
     fn draw_transfers<'a, I>(
         transfers: I,
         transfer_type: FileYeetCommandType,
     ) -> iced::Element<'a, Message>
     where
-        I: Iterator<Item = &'a Transfer>,
+        I: IntoIterator<Item = &'a Transfer>,
     {
-        widget::column(transfers.map(|t| {
+        widget::column(transfers.into_iter().map(|t| {
             let progress = match &t.progress {
                 TransferProgress::Connecting => Element::from(widget::text("Connecting...")),
 
@@ -1009,9 +1022,14 @@ impl AppState {
                 TransferProgress::Done(r) => {
                     let remove = widget::button(widget::text("Remove").size(12))
                         .on_press(Message::RemoveFromTransfers(t.nonce, transfer_type));
+                    let result_text = widget::text(r.to_string())
+                        .width(iced::Length::Fill)
+                        .color_maybe(match r {
+                            TransferResult::Success | TransferResult::Cancelled => None,
+                            TransferResult::Failure(_) => Some(ERROR_RED_COLOR),
+                        });
                     widget::row!(
-                        // TODO: If the transfer failed, color error text red.
-                        widget::text(r.to_string()).width(iced::Length::Fill),
+                        result_text,
                         if matches!(transfer_type, FileYeetCommandType::Sub)
                             && matches!(r, TransferResult::Success)
                         {
@@ -1058,7 +1076,7 @@ impl AppState {
                         widget::column!(
                             widget::row!(
                                 widget::text("Hashing..."),
-                                widget::progress_bar(0.0..=1., *progress.read().unwrap()),
+                                widget::progress_bar(0.0..=1., *progress.blocking_read()),
                             )
                             .spacing(6),
                             widget::text(pi.path.to_string_lossy()).size(12),
@@ -1185,19 +1203,15 @@ impl AppState {
                     (false, true) => Self::draw_pubs(&connected_state.publishes),
 
                     // Only publishes are empty, show uploads.
-                    (true, false) => Self::draw_transfers(
-                        connected_state.uploads.iter(),
-                        FileYeetCommandType::Pub,
-                    ),
+                    (true, false) => {
+                        Self::draw_transfers(&connected_state.uploads, FileYeetCommandType::Pub)
+                    }
 
                     // Show both publishes and uploads. Separate them with a line.
                     (false, false) => widget::column!(
                         Self::draw_pubs(&connected_state.publishes),
                         horizontal_line(),
-                        Self::draw_transfers(
-                            connected_state.uploads.iter(),
-                            FileYeetCommandType::Pub,
-                        ),
+                        Self::draw_transfers(&connected_state.uploads, FileYeetCommandType::Pub,),
                     )
                     .spacing(12)
                     .into(),
@@ -1206,7 +1220,7 @@ impl AppState {
 
             // Create a list of download attempts.
             TransferView::Downloads => {
-                Self::draw_transfers(connected_state.downloads.iter(), FileYeetCommandType::Sub)
+                Self::draw_transfers(&connected_state.downloads, FileYeetCommandType::Sub)
             }
         };
 
@@ -1295,19 +1309,27 @@ impl AppState {
         let regex_match = if self.options.server_address.trim().is_empty() {
             // If empty, use sane defaults.
             "localhost".clone_into(&mut self.options.server_address);
-            Some((Some(self.options.server_address.clone()), DEFAULT_PORT))
+            Some((self.options.server_address.clone(), DEFAULT_PORT))
         } else {
             // Otherwise, parse the server address and optional port.
             SERVER_ADDRESS_REGEX
                 .captures(&self.options.server_address)
                 .and_then(|captures| {
                     let host = captures.name("host").unwrap().as_str();
+                    let host = if host.starts_with('[') && host.ends_with(']') {
+                        // Strip the brackets from the host.
+                        // These are used (by IPv6) to disambiguate colons between host and port.
+                        host.get(1..host.len() - 1).unwrap()
+                    } else {
+                        host
+                    };
 
                     // If there is no port, use the default port. Otherwise, the input must be valid.
                     let port = captures.name("port").map_or(Some(DEFAULT_PORT), |p| {
                         p.as_str().parse::<NonZeroU16>().ok()
                     })?;
-                    Some((Some(host.to_owned()), port))
+
+                    Some((host.to_owned(), port))
                 })
         };
 
@@ -1329,6 +1351,12 @@ impl AppState {
                 return iced::Task::none();
             }
         };
+
+        #[cfg(debug_assertions)]
+        println!(
+            "{} Trying connection to server {server_address}:{port}",
+            local_now_fmt()
+        );
 
         // Set the state to `Stalling` before starting the connection attempt.
         self.connection_state = ConnectionState::new_stalling();
@@ -1352,7 +1380,7 @@ impl AppState {
             async move {
                 let mut bb = bytes::BytesMut::with_capacity(MAX_PEER_COMMUNICATION_SIZE);
                 crate::core::prepare_server_connection(
-                    server_address.as_deref(),
+                    Some(&server_address),
                     port,
                     gateway.as_deref(),
                     internal_port,
@@ -1375,16 +1403,8 @@ impl AppState {
             }) => {
                 for t in downloads.iter_mut().chain(uploads.iter_mut()) {
                     if let TransferProgress::Transferring(_, lock, progress) = &mut t.progress {
-                        let Ok(p) = lock.read() else {
-                            // Note that this transfer has had its lock poisoned and continue.
-                            t.progress = TransferProgress::Done(TransferResult::Failure(Arc::new(
-                                anyhow::anyhow!("Lock poisoned"),
-                            )));
-                            continue;
-                        };
-
                         // Update the progress bar with the most recent value.
-                        *progress = *p;
+                        *progress = *lock.blocking_read();
                     }
                 }
             }
@@ -1444,15 +1464,6 @@ impl AppState {
         iced::Task::none()
     }
 
-    /// Update the state after a peer connected to the endpoint.
-    fn update_peer_connected(&mut self, connection: quinn::Connection) -> iced::Task<Message> {
-        if let ConnectionState::Connected(ConnectedState { peers, .. }) = &mut self.connection_state
-        {
-            peers.insert(connection.remote_address(), (connection, HashSet::new()));
-        }
-        iced::Task::none()
-    }
-
     /// Update after an existing peer requested a new file transfer.
     fn update_peer_requested_transfer(
         &mut self,
@@ -1508,17 +1519,13 @@ impl AppState {
         *transfer_view = TransferView::Publishes;
 
         let server = server.clone();
-        let progress = Arc::new(std::sync::RwLock::new(0.));
-        let nonce = rand::random();
+        let progress = Arc::new(RwLock::new(0.));
         let cancellation_token = CancellationToken::new();
         let cancellation_path = path.clone();
+        let publish = PublishItem::new(path.clone(), cancellation_token.clone(), progress.clone());
+        let nonce = publish.nonce;
 
-        publishes.push(PublishItem::new(
-            nonce,
-            path.clone(),
-            cancellation_token.clone(),
-            progress.clone(),
-        ));
+        publishes.push(publish);
         iced::Task::perform(
             async move {
                 tokio::select! {
@@ -1611,21 +1618,19 @@ impl AppState {
             return iced::Task::none();
         };
 
-        let publish = publishes
-            .iter()
-            .find_map(|p| {
-                if let PublishState::Publishing(publishing) = &p.state {
-                    if p.nonce == nonce {
-                        Some(publishing)
-                    } else {
-                        None
-                    }
+        let publish = publishes.iter().find_map(|p| {
+            if let PublishState::Publishing(publishing) = &p.state {
+                if p.nonce == nonce {
+                    Some(publishing.clone())
                 } else {
                     None
                 }
-            })
-            .cloned();
+            } else {
+                None
+            }
+        });
         match (result, publish) {
+            // Attempt a new request stream from an existing or new peer connection.
             (Ok(peer), Some(publish)) => {
                 let data = if let Some((c, _)) = peers.get(&peer) {
                     PeerConnectionOrTarget::Connection(c.clone())
@@ -1643,11 +1648,22 @@ impl AppState {
                     },
                 )
             }
+
+            // An error occurred while receiving the peer address.
             (Err(e), _) => {
                 self.status_message = Some(format!("Error receiving peer: {e}"));
                 iced::Task::none()
             }
-            (_, None) => iced::Task::none(),
+
+            // No publish item matching the nonce was found.
+            (_, None) => {
+                eprintln!(
+                    "{} Peer received for unknown publish nonce {nonce}",
+                    local_now_fmt()
+                );
+
+                iced::Task::none()
+            }
         }
     }
 
@@ -1674,6 +1690,7 @@ impl AppState {
             // Silently fail if the peer connection was not successful when publishing.
             return iced::Task::none();
         };
+
         let Some((publishing, path)) = publishes.iter().find_map(|pi| {
             if let PublishState::Publishing(p) = &pi.state {
                 if pi.nonce == pub_nonce {
@@ -1693,7 +1710,7 @@ impl AppState {
         };
 
         let upload_nonce = rand::random();
-        let progress_lock = Arc::new(std::sync::RwLock::new(0.));
+        let progress_lock = Arc::new(RwLock::new(0.));
         let cancellation_token = CancellationToken::new();
         uploads.push(Transfer {
             nonce: upload_nonce,
@@ -1706,7 +1723,7 @@ impl AppState {
             cancellation_token: cancellation_token.clone(),
         });
 
-        insert_nonce_for_peer(&peer, peers, peer.connection.remote_address(), upload_nonce);
+        insert_nonce_for_peer(peer.connection.clone(), peers, upload_nonce);
 
         let file_size = publishing.file_size;
         iced::Task::perform(
@@ -1855,8 +1872,8 @@ impl AppState {
                     ..
                 }) = &mut self.connection_state
                 {
-                    // Let the user know why nothing else is happening.
                     if peers_with_size.is_empty() {
+                        // Let the user know why nothing else is happening.
                         self.status_message = Some("No peers available".to_owned());
                         return iced::Task::none();
                     }
@@ -1880,13 +1897,26 @@ impl AppState {
                             };
 
                             // New connection attempt for this peer with result command identified by the nonce.
-                            let command = {
+                            let task = {
                                 // Create a new connection or open a stream on an existing one.
                                 let peer = if let Some((c, _)) = peers.get(&peer) {
+                                    #[cfg(debug_assertions)]
+                                    println!(
+                                        "{} Reusing connection to peer {peer}",
+                                        local_now_fmt()
+                                    );
+
                                     PeerConnectionOrTarget::Connection(c.clone())
                                 } else {
+                                    #[cfg(debug_assertions)]
+                                    println!(
+                                        "{} Creating new connection to peer {peer}",
+                                        local_now_fmt()
+                                    );
+
                                     PeerConnectionOrTarget::Target(endpoint.clone(), peer)
                                 };
+
                                 // The future to use to create the connection.
                                 let future =
                                     try_peer_connection(peer, hash, FileYeetCommandType::Sub);
@@ -1896,7 +1926,7 @@ impl AppState {
                             };
 
                             // Return the pair to be separated later.
-                            (transfer, command)
+                            (transfer, task)
                         });
 
                     // Create a new transfer for each peer.
@@ -1954,11 +1984,9 @@ impl AppState {
         };
 
         // Update the state of the transfer with the result.
-        if let Some(connection) = result {
-            let peer_address = connection.connection.remote_address();
-            insert_nonce_for_peer(&connection, peers, peer_address, nonce);
-
-            transfer.progress = TransferProgress::Consent(connection);
+        if let Some(peer_request) = result {
+            insert_nonce_for_peer(peer_request.connection.clone(), peers, nonce);
+            transfer.progress = TransferProgress::Consent(peer_request);
         } else {
             // Remove unreachable peers from view.
             downloads.remove(index);
@@ -1990,7 +2018,7 @@ impl AppState {
         };
 
         // Begin the transfer.
-        let byte_progress = Arc::new(std::sync::RwLock::new(0.));
+        let byte_progress = Arc::new(RwLock::new(0.));
         transfer.progress =
             TransferProgress::Transferring(peer_streams.clone(), byte_progress.clone(), 0.);
         let output_path = transfer.path.clone();
@@ -2109,8 +2137,11 @@ impl AppState {
 
                         // If there are no more streams to the peer, close the connection.
                         if nonces.is_empty() {
+                            #[cfg(debug_assertions)]
+                            println!("{} Closing peer {peer_address} connection", local_now_fmt());
+
+                            // Close the connection. Peer cleanup will happen in the next update when the connection is dropped.
                             connection.close(GOODBYE_CODE, GOODBYE_MESSAGE.as_bytes());
-                            peers.remove(&peer_address);
                         }
                     }
                 }
@@ -2290,25 +2321,6 @@ async fn peers_requesting_publish_loop(
     }
 }
 
-/// An asynchronous loop to await new peer connections.
-async fn incoming_peer_connection_loop(
-    endpoint: quinn::Endpoint,
-    mut output: futures_channel::mpsc::Sender<Message>,
-) {
-    while let Some(connection) = endpoint.accept().await {
-        if let Ok(connection) = connection.await {
-            if let Err(e) = output.try_send(Message::PeerConnected(connection)) {
-                eprintln!(
-                    "{} Failed to perform internal message passing for peer connected: {e}",
-                    local_now_fmt()
-                );
-            }
-        }
-    }
-
-    // The endpoint has been closed.
-}
-
 /// An asynchronous loop to await new requests from a peer connection.
 async fn connected_peer_request_loop(
     connection: quinn::Connection,
@@ -2326,6 +2338,13 @@ async fn connected_peer_request_loop(
                     continue;
                 }
 
+                #[cfg(debug_assertions)]
+                println!(
+                    "{} Peer requested transfer: {peer_address} {}",
+                    local_now_fmt(),
+                    faster_hex::hex_string(&hash)
+                );
+
                 if let Err(e) = output.try_send(Message::PeerRequestedTransfer((
                     hash,
                     PeerRequestStream::new(connection.clone(), streams),
@@ -2338,8 +2357,9 @@ async fn connected_peer_request_loop(
             }
 
             Err(e) => {
+                #[cfg(debug_assertions)]
                 println!(
-                    "{} Peer connection closed: {peer_address} {e}",
+                    "{} Peer connection closed: {peer_address} {e:?}",
                     local_now_fmt()
                 );
 
@@ -2381,19 +2401,21 @@ async fn try_peer_connection(
 
 /// Add the nonce of a transaction to a peer's set of known transactions.
 fn insert_nonce_for_peer(
-    connection: &PeerRequestStream,
+    connection: quinn::Connection,
     peers: &mut HashMap<SocketAddr, (quinn::Connection, HashSet<Nonce>)>,
-    peer_address: SocketAddr,
     nonce: Nonce,
 ) {
-    match peers.entry(peer_address) {
+    match peers.entry(connection.remote_address()) {
         std::collections::hash_map::Entry::Vacant(e) => {
             // Add the peer into our map of known peer addresses.
-            e.insert((connection.connection.clone(), HashSet::from([nonce])));
+            e.insert((connection, HashSet::from([nonce])));
         }
         std::collections::hash_map::Entry::Occupied(mut e) => {
             // Add the transfer nonce to the peer's set of known transfer nonces.
             e.get_mut().1.insert(nonce);
+
+            // Overwrite existing connection in case of migration-like behavior.
+            e.get_mut().0 = connection;
         }
     }
 }

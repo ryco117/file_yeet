@@ -63,8 +63,7 @@ enum FileYeetCommand {
     },
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     // Parse command line arguments.
     use clap::Parser as _;
     let args = Cli::parse();
@@ -101,75 +100,83 @@ async fn main() {
     // Create a buffer for sending and receiving data within the payload size for `file_yeet`.
     let mut bb = bytes::BytesMut::with_capacity(MAX_SERVER_COMMUNICATION_SIZE);
 
-    // Connect to the specified file_yeet server.
-    let prepared_connection = core::prepare_server_connection(
-        args.server_address.as_deref(),
-        args.server_port,
-        args.gateway.as_deref(),
-        args.internal_port,
-        if let Some(g) = args.external_port_override {
-            // Use the provided port override.
-            core::PortMappingConfig::PortForwarding(g)
-        } else if args.nat_map {
-            // Try to create a new port mapping using NAT-PMP or PCP.
-            core::PortMappingConfig::PcpNatPmp(None)
-        } else {
-            core::PortMappingConfig::None
-        },
-        &mut bb,
-    )
-    .await
-    .expect("Failed to perform basic connection setup");
+    // Begin an asynchronous runtime outside of the GUI event loop to handle the command line request.
+    let async_runtime = tokio::runtime::Runtime::new().unwrap();
+    async_runtime.block_on(async move {
+        // Connect to the specified file_yeet server.
+        let prepared_connection = core::prepare_server_connection(
+            args.server_address.as_deref(),
+            args.server_port,
+            args.gateway.as_deref(),
+            args.internal_port,
+            if let Some(g) = args.external_port_override {
+                // Use the provided port override.
+                core::PortMappingConfig::PortForwarding(g)
+            } else if args.nat_map {
+                // Try to create a new port mapping using NAT-PMP or PCP.
+                core::PortMappingConfig::PcpNatPmp(None)
+            } else {
+                core::PortMappingConfig::None
+            },
+            &mut bb,
+        )
+        .await
+        .expect("Failed to perform basic connection setup");
 
-    // Create a background task to handle incoming peer connections.
-    let mut task_master = TaskTracker::new();
-    core::IncomingManager::new_manage_task(prepared_connection.endpoint.clone(), &mut task_master);
+        // Create a background task to handle incoming peer connections.
+        let mut task_master = TaskTracker::new();
+        task_master.spawn(core::IncomingManager::manage_incoming_loop(
+            prepared_connection.endpoint.clone(),
+        ));
 
-    // Determine if we are going to make a publish or subscribe request.
-    match cmd {
-        // Try to hash and publish the file to the rendezvous server.
-        FileYeetCommand::Pub { file_path } => {
-            if let Err(e) =
-                publish_command(&prepared_connection, bb, file_path, &mut task_master).await
-            {
-                eprintln!("{} Failed to publish the file: {e}", local_now_fmt());
+        // Determine if we are going to make a publish or subscribe request.
+        match cmd {
+            // Try to hash and publish the file to the rendezvous server.
+            FileYeetCommand::Pub { file_path } => {
+                if let Err(e) =
+                    publish_command(&prepared_connection, bb, file_path, &mut task_master).await
+                {
+                    eprintln!("{} Failed to publish the file: {e}", local_now_fmt());
+                }
+            }
+
+            // Try to get the file hash from the rendezvous server and peers.
+            FileYeetCommand::Sub { sha256_hex, output } => {
+                if let Err(e) =
+                    subscribe_command(&prepared_connection, bb, sha256_hex, output).await
+                {
+                    eprintln!("{} Failed to download the file: {e}", local_now_fmt());
+                }
             }
         }
 
-        // Try to get the file hash from the rendezvous server and peers.
-        FileYeetCommand::Sub { sha256_hex, output } => {
-            if let Err(e) = subscribe_command(&prepared_connection, bb, sha256_hex, output).await {
-                eprintln!("{} Failed to download the file: {e}", local_now_fmt());
+        // Close our connection to the server. Send a goodbye to be polite.
+        prepared_connection
+            .endpoint
+            .close(GOODBYE_CODE, GOODBYE_MESSAGE.as_bytes());
+
+        // Close the tracker after no more tasks should be spawned.
+        task_master.close();
+
+        // Wait for the server's tasks to finish.
+        task_master.wait().await;
+
+        // Try to clean up the port mapping if one was made.
+        if let Some(mapping) = prepared_connection.port_mapping {
+            if let Err((e, m)) = mapping.try_drop().await {
+                eprintln!(
+                    "{} Failed to delete the port mapping with expiration {:?} : {e}",
+                    local_now_fmt(),
+                    m.expiration()
+                );
+            } else {
+                println!(
+                    "{} Successfully deleted the created port mapping",
+                    local_now_fmt()
+                );
             }
         }
-    }
-
-    // Close our connection to the server. Send a goodbye to be polite.
-    prepared_connection
-        .endpoint
-        .close(GOODBYE_CODE, GOODBYE_MESSAGE.as_bytes());
-
-    // Close the tracker after no more tasks should be spawned.
-    task_master.close();
-
-    // Wait for the server's tasks to finish.
-    task_master.wait().await;
-
-    // Try to clean up the port mapping if one was made.
-    if let Some(mapping) = prepared_connection.port_mapping {
-        if let Err((e, m)) = mapping.try_drop().await {
-            eprintln!(
-                "{} Failed to delete the port mapping with expiration {:?} : {e}",
-                local_now_fmt(),
-                m.expiration()
-            );
-        } else {
-            println!(
-                "{} Successfully deleted the created port mapping",
-                local_now_fmt()
-            );
-        }
-    }
+    });
 }
 
 /// Handle the CLI command to publish a file.

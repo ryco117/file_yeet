@@ -13,14 +13,12 @@ use file_yeet_shared::{
     MAX_SERVER_COMMUNICATION_SIZE,
 };
 use futures_util::TryFutureExt;
-use once_cell::sync::OnceCell;
 use rustls::pki_types::CertificateDer;
 use sha2::Digest as _;
 use tokio::{
     io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _},
     sync::RwLock,
 };
-use tokio_util::task::TaskTracker;
 
 /// Use a sane default timeout for server connections.
 pub const SERVER_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -65,7 +63,7 @@ pub async fn prepare_server_connection(
     server_address: Option<&str>,
     server_port: NonZeroU16,
     suggested_gateway: Option<&str>,
-    interal_port: Option<NonZeroU16>,
+    internal_port: Option<NonZeroU16>,
     external_port_config: PortMappingConfig,
     bb: &mut bytes::BytesMut,
 ) -> anyhow::Result<PreparedConnection> {
@@ -91,7 +89,7 @@ pub async fn prepare_server_connection(
 
     // Create our QUIC endpoint. Use an unspecified address since we don't have any preference.
     let mut endpoint = {
-        let port = interal_port.map(NonZeroU16::get).unwrap_or_default();
+        let port = internal_port.map(NonZeroU16::get).unwrap_or_default();
         quinn::Endpoint::server(
             server_config,
             if using_ipv4 {
@@ -267,7 +265,7 @@ async fn connect_to_server(
     Ok(connection)
 }
 
-/// Perform a socket ping request to the server and sanity chech the response.
+/// Perform a socket ping request to the server and sanity check the response.
 /// Returns the server's address and the string encoding it was sent as.
 pub async fn socket_ping_request(
     server_connection: &quinn::Connection,
@@ -468,6 +466,7 @@ async fn expect_server_text(stream: &mut quinn::RecvStream, len: u16) -> anyhow:
 }
 
 /// Attempt to connect to peer using UDP hole punching.
+/// Specifically, both peers attempt outgoing connections while listening for incoming connections.
 pub async fn udp_holepunch(
     cmd: FileYeetCommandType,
     hash: HashBytes,
@@ -475,7 +474,7 @@ pub async fn udp_holepunch(
     peer_address: SocketAddr,
 ) -> Option<(quinn::Connection, BiStream)> {
     // Poll incoming connections that are handled by a background task.
-    let mut manager = IncomingManager::get();
+    let manager = IncomingManager::get();
     let listen_future = manager.await_peer(peer_address, PEER_LISTEN_TIMEOUT);
 
     // Attempt to connect to the peer's public address.
@@ -492,14 +491,20 @@ pub async fn udp_holepunch(
         //       For example, if each peer sent a random nonce over each stream, and the nonces were XOR'd per stream,
         //       the result could be used to determine which stream to use (highest/lowest resulting nonce after XOR).
         match cmd {
-            FileYeetCommandType::Pub => listen_stream.into_iter().chain(connect_stream.into_iter()),
-            FileYeetCommandType::Sub => connect_stream.into_iter().chain(listen_stream.into_iter()),
+            FileYeetCommandType::Pub => listen_stream.map(|c| (c, true)).into_iter().chain(connect_stream.map(|c| (c, false)).into_iter()),
+            FileYeetCommandType::Sub => connect_stream.map(|c: quinn::Connection| (c, false)).into_iter().chain(listen_stream.map(|c| (c, true)).into_iter()),
         };
 
-    for connection in connections {
+    for (connection, managed_connection) in connections {
         if let Some(peer_streams) = peer_connection_into_stream(&connection, hash, cmd).await {
             // Let the user know that a connection is established. A bi-directional stream is ready to use.
             println!("{} Peer connection established", local_now_fmt());
+
+            // If the connection is not managed, add it to the manager.
+            if !managed_connection {
+                manager.accept_peer(connection.clone()).await;
+            }
+
             return Some((connection, peer_streams));
         }
     }
@@ -536,10 +541,12 @@ pub async fn peer_connection_into_stream(
         FileYeetCommandType::Sub => {
             // Open a bi-directional stream to the publishing peer.
             let mut r = connection.open_bi().await;
-            if let Ok(s) = &mut r {
-                s.0.write_all(&expected_hash).await.ok()?;
-
-                println!("{} New peer stream opened", local_now_fmt());
+            match &mut r {
+                Ok(s) => {
+                    s.0.write_all(&expected_hash).await.ok()?;
+                    println!("{} New peer stream opened", local_now_fmt());
+                }
+                Err(e) => eprintln!("{} Failed to open a peer stream: {e}", local_now_fmt()),
             }
             r
         }
@@ -551,24 +558,29 @@ pub async fn peer_connection_into_stream(
     }
 }
 
-/// Try to connect to a peer at the given address.
+/// Try to make outgoing connection to a peer at the given address.
 async fn connect_to_peer(
     endpoint: quinn::Endpoint,
     peer_address: SocketAddr,
 ) -> Option<quinn::Connection> {
     // Set a sane number of connection retries.
-    let mut retries = MAX_PEER_CONNECTION_RETRIES;
+    let mut connect_attempts = MAX_PEER_CONNECTION_RETRIES + 1;
 
     // Ensure we have retries left and there isn't already a peer `Connection` to use.
-    while retries > 0 {
-        println!("{} Connecting to peer at {peer_address}", local_now_fmt());
+    while connect_attempts > 0 {
+        #[cfg(debug_assertions)]
+        println!(
+            "{} Connection attempt to peer at {peer_address}",
+            local_now_fmt()
+        );
+
         match endpoint.connect(peer_address, "peer") {
             Ok(connecting) => {
                 let connection = match connecting.await {
                     Ok(c) => c,
                     Err(e) => {
                         eprintln!("{} Failed to connect to peer: {e}", local_now_fmt());
-                        retries -= 1;
+                        connect_attempts -= 1;
                         continue;
                     }
                 };
@@ -576,9 +588,12 @@ async fn connect_to_peer(
                 println!("{} Connected to peer at {peer_address}", local_now_fmt());
                 return Some(connection);
             }
+
             Err(e) => {
-                eprintln!("{} Failed to connect to peer: {e}", local_now_fmt());
-                retries -= 1;
+                eprintln!(
+                    "{} Failed to connect to peer with unrecoverable error: {e}",
+                    local_now_fmt()
+                );
             }
         }
     }
@@ -606,9 +621,6 @@ pub enum DownloadError {
 
     #[error("The downloaded file hash does not match the expected hash")]
     HashMismatch,
-
-    #[error("Download lock was poisoned: {0}")]
-    PoisonedLock(String),
 }
 
 /// Download a file from the peer. Initiates the download by consenting to the peer to receive the file.
@@ -619,7 +631,7 @@ pub async fn download_from_peer(
     file_size: u64,
     output_path: &Path,
     bb: &mut bytes::BytesMut,
-    byte_progress: Option<&std::sync::RwLock<f32>>,
+    byte_progress: Option<&RwLock<f32>>,
 ) -> Result<(), DownloadError> {
     // Open the file for writing.
     let mut file = tokio::fs::OpenOptions::new()
@@ -643,6 +655,7 @@ pub async fn download_from_peer(
 
     // Create a scratch space for reading data from the stream.
     let mut buf = [0; MAX_PEER_COMMUNICATION_SIZE];
+
     // Read from the peer and write to the file.
     let mut bytes_written = 0;
     let file_size_f = file_size as f32;
@@ -657,29 +670,39 @@ pub async fn download_from_peer(
             .ok_or(DownloadError::UnexpectedEof)?;
 
         if size > 0 {
+            // Ensure we don't write more bytes than were requested in the handshake.
+            let size = usize::try_from(file_size - bytes_written)
+                .map(|x| x.min(size))
+                .unwrap_or(size);
+
             // Write the bytes to the file and update the hash.
             let bb = &buf[..size];
-            let f = file.write_all(bb);
-            // Update hash while future may be pending.
+
+            // Update hash.
             hasher.update(bb);
-            f.await.map_err(DownloadError::FileWrite)?;
+
+            // Write the bytes to the file.
+            file.write_all(bb).await.map_err(DownloadError::FileWrite)?;
 
             // Update the number of bytes written.
             bytes_written += size as u64;
 
             // Update the caller with the number of bytes written.
             if let Some(progress) = byte_progress.as_ref() {
-                *progress
-                    .write()
-                    .map_err(|e| DownloadError::PoisonedLock(e.to_string()))? =
-                    bytes_written as f32 / file_size_f;
+                *progress.write().await = bytes_written as f32 / file_size_f;
             }
         }
     }
 
     // No more data is required from this stream.
     // Let the peer know they can close their end of the stream.
-    let _ = peer_streams.recv.stop(GOODBYE_CODE);
+    if let Err(e) = peer_streams.recv.stop(GOODBYE_CODE) {
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "{} Failed to close the peer stream gracefully: {e}",
+            local_now_fmt()
+        );
+    }
 
     // Ensure the file hash is correct.
     let downloaded_hash = hasher.finalize();
@@ -700,7 +723,7 @@ pub async fn download_from_peer(
 #[allow(clippy::cast_precision_loss)]
 pub async fn file_size_and_hash(
     file_path: &Path,
-    progress: Option<&std::sync::RwLock<f32>>,
+    progress: Option<&RwLock<f32>>,
 ) -> anyhow::Result<(u64, HashBytes)> {
     let mut hasher = sha2::Sha256::new();
     let mut reader = tokio::io::BufReader::new(
@@ -738,10 +761,7 @@ pub async fn file_size_and_hash(
 
         // Update the caller with the number of bytes read.
         if let Some(progress) = progress.as_ref() {
-            *progress
-                .write()
-                .map_err(|e| anyhow::anyhow!("Hashing progress lock was poisoned: {e}"))? =
-                bytes_hashed as f32 / size_float;
+            *progress.write().await = bytes_hashed as f32 / size_float;
         }
     }
     let hash: HashBytes = hasher.finalize().into();
@@ -755,14 +775,11 @@ pub async fn upload_to_peer(
     peer_streams: &mut BiStream,
     file_size: u64,
     mut reader: tokio::io::BufReader<tokio::fs::File>,
-    byte_progress: Option<&std::sync::RwLock<f32>>,
+    byte_progress: Option<&RwLock<f32>>,
 ) -> anyhow::Result<()> {
     // Read the peer's desired upload range.
     let start_index = peer_streams.recv.read_u64().await?;
     let upload_length = peer_streams.recv.read_u64().await?;
-
-    // No more data is required from this stream.
-    let _ = peer_streams.recv.stop(GOODBYE_CODE);
 
     // Sanity check the upload range.
     match start_index.checked_add(upload_length) {
@@ -783,8 +800,10 @@ pub async fn upload_to_peer(
     while bytes_sent < upload_length {
         // Read a natural amount of bytes from the file.
         let mut n = reader.read(&mut buf).await?;
+
         if n == 0 {
-            break;
+            eprintln!("{} Unexpected EOF while uploading", local_now_fmt());
+            continue;
         }
 
         // Ensure we don't send more bytes than were requested in the range.
@@ -801,10 +820,7 @@ pub async fn upload_to_peer(
 
         // Update the caller with the number of bytes sent to the peer.
         if let Some(progress) = byte_progress.as_ref() {
-            *progress
-                .write()
-                .map_err(|e| anyhow::anyhow!("Upload progress lock was poisoned: {e}"))? =
-                bytes_sent as f32 / upload_length_f;
+            *progress.write().await = bytes_sent as f32 / upload_length_f;
         }
     }
 
@@ -828,45 +844,84 @@ pub fn humanize_bytes(bytes: u64) -> String {
 }
 
 /// Type for determining whether a peer connection is being requested or has already been established.
-enum IncomingPeerState {
-    Awaiting(tokio::sync::oneshot::Sender<quinn::Connection>),
+pub enum IncomingPeerState {
+    Awaiting(Vec<tokio::sync::oneshot::Sender<quinn::Connection>>),
     Connected(quinn::Connection),
 }
 
 /// A manager for incoming peer connections.
+#[derive(Clone, Default)]
 pub struct IncomingManager {
     map: Arc<RwLock<HashMap<SocketAddr, IncomingPeerState>>>,
 }
 
 impl IncomingManager {
-    /// Create a new `IncomingManager` object with a reference to the singleton mapping of incoming connections.
+    /// Create a new `IncomingManager` reference to the singleton mapping the incoming connections.
     pub fn get() -> Self {
-        static MAPPING: OnceCell<Arc<RwLock<HashMap<SocketAddr, IncomingPeerState>>>> =
-            OnceCell::new();
-        Self {
-            map: MAPPING
-                .get_or_init(|| Arc::new(RwLock::new(HashMap::new())))
-                .clone(),
-        }
+        static MANAGER: std::sync::LazyLock<IncomingManager> =
+            std::sync::LazyLock::<_>::new(IncomingManager::default);
+        MANAGER.clone()
     }
 
     /// Await the connection of a peer from a specified socket address.
     pub async fn await_peer(
-        &mut self,
+        &self,
         peer_address: SocketAddr,
         timeout: Duration,
     ) -> Option<quinn::Connection> {
         let rx = {
             let mut map = self.map.write().await;
-            if let Some(IncomingPeerState::Connected(c)) = map.remove(&peer_address) {
-                return Some(c);
-            }
+            match map.entry(peer_address) {
+                // This peer has already been mapped, determine the state.
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    match e.get_mut() {
+                        // If the peer is already connected, return the connection.
+                        IncomingPeerState::Connected(c) => {
+                            #[cfg(debug_assertions)]
+                            println!(
+                                "{} Awaited peer connection is already established: {peer_address}",
+                                local_now_fmt()
+                            );
 
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            map.insert(peer_address, IncomingPeerState::Awaiting(tx));
-            rx
+                            return Some(c.clone());
+                        }
+
+                        // Otherwise, append another receiver to the list.
+                        IncomingPeerState::Awaiting(v) => {
+                            #[cfg(debug_assertions)]
+                            println!(
+                                "{} Joining wait at index {} for peer connection: {peer_address}",
+                                local_now_fmt(),
+                                v.len()
+                            );
+
+                            let (tx, rx) = tokio::sync::oneshot::channel();
+                            v.push(tx);
+
+                            // Return the receive channel for awaiting.
+                            rx
+                        }
+                    }
+                }
+
+                // No mapping exists for this peer address, create one.
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    #[cfg(debug_assertions)]
+                    println!(
+                        "{} Creating wait for peer connection: {peer_address}",
+                        local_now_fmt()
+                    );
+
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    e.insert(IncomingPeerState::Awaiting(vec![tx]));
+
+                    // Return the receive channel for awaiting.
+                    rx
+                }
+            }
         };
 
+        // Wait for the peer to connect or timeout.
         tokio::time::timeout(timeout, rx.into_future())
             .await
             .ok()
@@ -874,56 +929,111 @@ impl IncomingManager {
     }
 
     /// Accept a peer connection and hand-off to any threads awaiting the connection.
-    pub async fn accept_peer(&mut self, connection: quinn::Connection) {
-        let peer_address = {
-            let mut map = self.map.write().await;
-            let peer_address = connection.remote_address();
-            if let Some(IncomingPeerState::Awaiting(tx)) = map.remove(&peer_address) {
-                // Fails if the receiver is no longer waiting for this message.
-                let _ = tx.send(connection);
-            } else {
-                map.insert(peer_address, IncomingPeerState::Connected(connection));
+    /// If a connection is mapped for the peer, it is replaced with the new connection.
+    pub async fn accept_peer(&self, connection: quinn::Connection) {
+        let mut map = self.map.write().await;
+        let peer_address = connection.remote_address();
+        match map.entry(peer_address) {
+            // Update the entry and handle any waiting threads.
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                let old = e.insert(IncomingPeerState::Connected(connection.clone()));
+
+                // Let all waiting threads know that the peer has connected.
+                if let IncomingPeerState::Awaiting(txs) = old {
+                    for tx in txs {
+                        // Fails if the receiver is no longer waiting for this message.
+                        if tx.send(connection.clone()).is_err() {
+                            eprintln!(
+                                "{} Waiting thread closed before peer connection was accepted",
+                                local_now_fmt()
+                            );
+                        }
+                    }
+                }
             }
-            peer_address
-        };
+
+            // Create a new entry for the peer connection.
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(IncomingPeerState::Connected(connection));
+            }
+        }
+
+        #[cfg(debug_assertions)]
         println!(
-            "{} Peer connection accepted: {peer_address}",
+            "{} Peer connection accepted by manager: {peer_address}",
             local_now_fmt()
         );
     }
 
-    /// Create a new task to manage incoming peer connections in the background.
-    pub fn new_manage_task(endpoint: quinn::Endpoint, task_master: &mut TaskTracker) {
-        task_master.spawn(async move {
-            let mut manager = Self::get();
-            while let Some(connecting) = endpoint.accept().await {
-                let connecting = match connecting.accept() {
-                    Ok(c) => c,
-                    Err(e) => {
-                        eprintln!(
-                            "{} Failed to accept an incoming peer connection: {e}",
-                            local_now_fmt()
-                        );
-                        // Skip incomplete connections.
-                        continue;
-                    }
-                };
-                let connection = match connecting.await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        eprintln!(
-                            "{} Failed to complete a peer connection: {e}",
-                            local_now_fmt()
-                        );
-                        // Skip incomplete connections.
-                        continue;
-                    }
-                };
+    // /// Remove a peer from the manager.
+    // pub async fn remove_peer(&mut self, peer_address: &SocketAddr) {
+    //     if self.map.write().await.remove(peer_address).is_none() {
+    //         #[cfg(debug_assertions)]
+    //         println!(
+    //             "{} Peer connection manager removed a non-existent peer: {peer_address}",
+    //             local_now_fmt()
+    //         );
+    //     } else {
+    //         #[cfg(debug_assertions)]
+    //         println!(
+    //             "{} Peer connection manager removed peer: {peer_address}",
+    //             local_now_fmt()
+    //         );
+    //     }
+    // }
 
-                // Notify any thread waiting for this connection if available, otherwise store it.
-                manager.accept_peer(connection).await;
-            }
-        });
+    /// Remove a peer from the manager, with synchronous lock behavior.
+    pub fn blocking_remove_peer(&mut self, peer_address: &SocketAddr) {
+        if self.map.blocking_write().remove(peer_address).is_none() {
+            #[cfg(debug_assertions)]
+            println!(
+                "{} Peer connection manager removed a non-existent peer: {peer_address}",
+                local_now_fmt()
+            );
+        } else {
+            #[cfg(debug_assertions)]
+            println!(
+                "{} Peer connection manager removed peer: {peer_address}",
+                local_now_fmt()
+            );
+        }
+    }
+
+    /// Create a new task to manage incoming peer connections in the background.
+    pub async fn manage_incoming_loop(endpoint: quinn::Endpoint) {
+        let manager = Self::get();
+        while let Some(connecting) = endpoint.accept().await {
+            let connecting = match connecting.accept() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!(
+                        "{} Failed to accept an incoming peer connection: {e}",
+                        local_now_fmt()
+                    );
+
+                    // Skip incomplete connections.
+                    continue;
+                }
+            };
+            let connection = match connecting.await {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!(
+                        "{} Failed to complete a peer connection: {e}",
+                        local_now_fmt()
+                    );
+
+                    // Skip incomplete connections.
+                    continue;
+                }
+            };
+
+            // Notify any thread waiting for this connection if available, otherwise store it.
+            manager.accept_peer(connection).await;
+        }
+
+        #[cfg(debug_assertions)]
+        println!("{} Incoming peer connection loop closed", local_now_fmt());
     }
 }
 
