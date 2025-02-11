@@ -71,11 +71,9 @@ fn main() {
     // If no subcommand was provided, run the GUI.
     let Some(cmd) = args.cmd else {
         // If Windows, ensure we aren't displaying an unwanted console window.
-        #[cfg(target_os = "windows")]
+        #[cfg(all(target_os = "windows", not(debug_assertions)))]
         {
-            #[config(debug_assertions)]
             println!("{} Freeing Windows console for GUI", local_now_fmt());
-
             win_cmd::free_allocated_console();
         }
 

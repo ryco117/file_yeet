@@ -35,7 +35,7 @@ const IPV4_REGEX_STR: &str =
 /// Produces match groups `host` and `port` for the server address and optional port.
 static SERVER_ADDRESS_REGEX: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     regex::Regex::new(&format!(
-        "^\\s*(?P<host>{IPV4_REGEX_STR}|\\[{IPV6_REGEX_STR}\\]|[^:]+)(?::(?P<port>\\d+))?\\s*$"
+        "^\\s*(?:(?P<host>{IPV4_REGEX_STR}|\\[{IPV6_REGEX_STR}\\]|[^:]+)(?::(?P<port>\\d+))?|(?P<unbraced_ipv6_host>{IPV6_REGEX_STR}))\\s*$"
     ))
     .expect("Failed to compile the server address regex")
 });
@@ -502,29 +502,40 @@ impl AppState {
             })
             .unwrap_or_default();
 
-        // The CLI arguments take final precedence on start.
-        let crate::Cli {
-            server_address,
-            external_port_override,
-            internal_port,
-            gateway,
-            nat_map,
-            ..
-        } = args;
-        if let Some(server_address) = server_address {
-            settings.server_address = server_address;
-        }
-        if let Some(gateway) = gateway {
-            settings.gateway_address = Some(gateway);
-        }
-        if let Some(port) = internal_port {
-            settings.internal_port_text = port.to_string();
-        }
-        if let Some(port) = external_port_override {
-            settings.port_forwarding_text = port.to_string();
-            settings.port_mapping = PortMappingGuiOptions::PortForwarding(Some(port));
-        } else if nat_map {
-            settings.port_mapping = PortMappingGuiOptions::TryPcpNatPmp;
+        {
+            // The CLI arguments take final precedence on start.
+            let crate::Cli {
+                server_address,
+                external_port_override,
+                internal_port,
+                gateway,
+                nat_map,
+                ..
+            } = args;
+
+            let mut used_cli = false;
+            if let Some(server_address) = server_address.filter(|s| !s.is_empty()) {
+                settings.server_address = server_address;
+                used_cli = true;
+            }
+            if let Some(gateway) = gateway.filter(|g| !g.is_empty()) {
+                settings.gateway_address = Some(gateway);
+                used_cli = true;
+            }
+            if let Some(port) = internal_port {
+                settings.internal_port_text = port.to_string();
+                used_cli = true;
+            }
+            if let Some(port) = external_port_override {
+                settings.port_forwarding_text = port.to_string();
+                settings.port_mapping = PortMappingGuiOptions::PortForwarding(Some(port));
+            } else if (!used_cli && matches!(settings.port_mapping, PortMappingGuiOptions::None))
+                || nat_map
+            {
+                // Default to enabling NAT-PMP/PCP if no port forwarding is set.
+                // Average users may not know that this is usually the best option for them.
+                settings.port_mapping = PortMappingGuiOptions::TryPcpNatPmp;
+            }
         }
 
         // Create the initial state with the settings.
@@ -706,15 +717,17 @@ impl AppState {
             // This is used to allow for custom exit handling in this instance.
             Message::UnhandledEvent(window, event) => match event {
                 iced::Event::Window(window::Event::CloseRequested) => {
-                    if self.safely_closing
-                        || self
-                            .main_window
-                            .expect("Main window not available at unhandled event")
-                            == window
+                    if self
+                        .main_window
+                        .expect("Main window not available at unhandled event")
+                        != window
+                        || self.safely_closing
                     {
                         // Allow force closing if the safe exit is taking too long for the user.
+                        // Also allows non-main windows to close immediately.
                         iced::window::close(window)
                     } else {
+                        // Start the safe exit process.
                         self.safely_close(CloseType::Application)
                     }
                 }
@@ -756,6 +769,18 @@ impl AppState {
                 publishes,
                 ..
             }) => {
+                // Create a task to listen for incoming connections to our QUIC endpoint.
+                let incoming_connections = {
+                    let endpoint = endpoint.clone();
+                    iced::Subscription::run_with_id(
+                        0,
+                        iced::stream::channel(4, move |_output| {
+                            // incoming_peer_connection_loop(endpoint, output)
+                            crate::core::IncomingManager::manage_incoming_loop(endpoint)
+                        }),
+                    )
+                };
+
                 // For each publish we listen to the server for new peers requesting the file.
                 let pubs = publishes.iter().filter_map(|publish| {
                     // If the publish is still hashing, skip for now.
@@ -786,15 +811,6 @@ impl AppState {
                     ))
                 });
 
-                // Create a task to listen for incoming connections to our QUIC endpoint.
-                let incoming_connections = {
-                    let endpoint = endpoint.clone();
-                    iced::stream::channel(4, move |_output| {
-                        // incoming_peer_connection_loop(endpoint, output)
-                        crate::core::IncomingManager::manage_incoming_loop(endpoint)
-                    })
-                };
-
                 // Create a listener for each peer that may want a new request stream.
                 let peer_requests = peers.iter().map(|(peer_addr, (connection, _))| {
                     let peer_addr = *peer_addr;
@@ -807,19 +823,12 @@ impl AppState {
                     )
                 });
 
-                #[cfg(debug_assertions)]
-                println!("{} Subscribing to {} peers", local_now_fmt(), peers.len());
-
                 // Batch all the listeners together.
                 iced::Subscription::batch(
-                    [
-                        unhandled_events(),
-                        animation(),
-                        iced::Subscription::run_with_id(0, incoming_connections),
-                    ]
-                    .into_iter()
-                    .chain(pubs)
-                    .chain(peer_requests),
+                    [unhandled_events(), animation(), incoming_connections]
+                        .into_iter()
+                        .chain(pubs)
+                        .chain(peer_requests),
                 )
             }
 
@@ -1315,16 +1324,19 @@ impl AppState {
             SERVER_ADDRESS_REGEX
                 .captures(&self.options.server_address)
                 .and_then(|captures| {
-                    let host = captures.name("host").unwrap().as_str();
-                    let host = if host.starts_with('[') && host.ends_with(']') {
-                        // Strip the brackets from the host.
-                        // These are used (by IPv6) to disambiguate colons between host and port.
-                        host.get(1..host.len() - 1).unwrap()
+                    let host = if let Some(host) = captures.name("host").map(|h| h.as_str()) {
+                         if host.starts_with('[') && host.ends_with(']') {
+                             // Strip the brackets from the host.
+                             // These are used (by IPv6) to disambiguate colons between host and port.
+                             host.get(1..host.len() - 1).unwrap()
+                         } else {
+                             host
+                         }
                     } else {
-                        host
+                        captures.name("unbraced_ipv6_host").expect("Unexpected error: One of `host` and `unbraced_ipv6_host` must be captured in a successful map").as_str()
                     };
 
-                    // If there is no port, use the default port. Otherwise, the input must be valid.
+                    // If there is no port, use the default port. Otherwise, validate the input.
                     let port = captures.name("port").map_or(Some(DEFAULT_PORT), |p| {
                         p.as_str().parse::<NonZeroU16>().ok()
                     })?;
@@ -2182,6 +2194,7 @@ impl AppState {
 
     /// Try to safely close.
     fn safely_close(&mut self, close_type: CloseType) -> iced::Task<Message> {
+        // If connected, close the connection and save the current state.
         if let ConnectionState::Connected(ConnectedState {
             endpoint,
             downloads,
@@ -2249,16 +2262,17 @@ impl AppState {
             let port_mapping_timeout = Duration::from_millis(500);
             iced::Task::perform(
                 tokio::time::timeout(port_mapping_timeout, async move {
-                    if let Err((e, _)) = port_mapping.try_drop().await {
+                    if let Err((e, mapping)) = port_mapping.try_drop().await {
                         eprintln!(
-                            "{} Could not safely remove port mapping: {e}",
-                            local_now_fmt()
+                            "{} Could not safely remove port mapping: {e}: expires at {:#?}",
+                            local_now_fmt(),
+                            mapping.expiration()
                         );
                     } else {
                         println!("{} Port mapping safely removed", local_now_fmt());
                     }
                 }),
-                // Force exit after completing the request or after a timeout.
+                // Force the close operation after completing the request or after a timeout.
                 move |_| match close_type {
                     CloseType::Application => Message::ForceExit,
                     CloseType::Connections => Message::LeftServer,
@@ -2268,11 +2282,17 @@ impl AppState {
             match close_type {
                 // Immediately exit if there isn't a port mapping to remove.
                 CloseType::Application => {
-                    iced::window::close(self.main_window.expect("Main window ID not found"))
+                    println!(
+                        "{} No work to do before exiting, closing now",
+                        local_now_fmt()
+                    );
+                    // iced::window::close(self.main_window.expect("Main window ID not found"))
+                    iced::exit()
                 }
 
                 // Close connections and return to the main screen.
                 CloseType::Connections => {
+                    println!("{} Exiting connected view to main screen", local_now_fmt());
                     self.connection_state = ConnectionState::Disconnected;
                     iced::Task::none()
                 }
@@ -2288,39 +2308,6 @@ enum PeerConnectionOrTarget {
 }
 
 /// A loop to await the server to send peers requesting the specified publish.
-async fn peers_requesting_publish_loop(
-    publish: Publish,
-    nonce: Nonce,
-    cancellation_token: CancellationToken,
-    mut output: futures_channel::mpsc::Sender<Message>,
-) {
-    loop {
-        let mut server = publish.server_streams.lock().await;
-
-        tokio::select! {
-            // Let the task be cancelled.
-            () = cancellation_token.cancelled() => {
-                if let Err(e) = server.send.write_u8(0).await {
-                    eprintln!("{} Failed to cancel publish: {e}", local_now_fmt());
-                }
-
-                return;
-            }
-
-            // Await the server to send a peer connection.
-            result = crate::core::read_subscribing_peer(&mut server.recv) => {
-                if let Err(e) = output.try_send(Message::PublishPeerReceived(
-                        nonce,
-                        result.map_err(Arc::new),
-                    ))
-                {
-                    eprintln!("{} Failed to perform internal message passing for subscription peer: {e}", local_now_fmt());
-                }
-            }
-        }
-    }
-}
-
 /// An asynchronous loop to await new requests from a peer connection.
 async fn connected_peer_request_loop(
     connection: quinn::Connection,
@@ -2371,6 +2358,39 @@ async fn connected_peer_request_loop(
                     );
                 }
                 return;
+            }
+        }
+    }
+}
+
+async fn peers_requesting_publish_loop(
+    publish: Publish,
+    nonce: Nonce,
+    cancellation_token: CancellationToken,
+    mut output: futures_channel::mpsc::Sender<Message>,
+) {
+    loop {
+        let mut server = publish.server_streams.lock().await;
+
+        tokio::select! {
+            // Let the task be cancelled.
+            () = cancellation_token.cancelled() => {
+                if let Err(e) = server.send.write_u8(0).await {
+                    eprintln!("{} Failed to tell server to cancel publish: {e}", local_now_fmt());
+                }
+
+                return;
+            }
+
+            // Await the server to send a peer connection.
+            result = crate::core::read_subscribing_peer(&mut server.recv) => {
+                if let Err(e) = output.try_send(Message::PublishPeerReceived(
+                        nonce,
+                        result.map_err(Arc::new),
+                    ))
+                {
+                    eprintln!("{} Failed to perform internal message passing for subscription peer: {e}", local_now_fmt());
+                }
             }
         }
     }

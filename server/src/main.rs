@@ -1,4 +1,10 @@
-use std::{collections::HashMap, mem::size_of, net::SocketAddr, num::NonZeroU16, sync::Arc};
+use std::{
+    collections::HashMap,
+    mem::size_of,
+    net::SocketAddr,
+    num::{NonZeroU16, NonZeroU32},
+    sync::Arc,
+};
 
 use bytes::BufMut as _;
 use clap::Parser;
@@ -55,6 +61,11 @@ struct Cli {
     /// The port the server will bind to.
     #[arg(short='p', long, default_value_t = file_yeet_shared::DEFAULT_PORT)]
     bind_port: NonZeroU16,
+
+    /// Optional limit to the number of connections the server will accept.
+    /// Must be a positive integer less than 2^32.
+    #[arg(short, long)]
+    max_connections: Option<NonZeroU32>,
 }
 
 /// A mapping between file hashes and the addresses of connected peers that are publishing the file.
@@ -103,6 +114,7 @@ async fn main() {
 
     // Create a loop to handle QUIC connections, but allow Ctrl+C to cancel the loop.
     tokio::select! {
+        // Gracefully handle Ctrl+C to shut down the server.
         r = tokio::signal::ctrl_c() => {
             if let Err(e) = r {
                 tracing::error!("Failed to handle SIGINT, aborting: {e}");
@@ -110,7 +122,15 @@ async fn main() {
                 tracing::info!("Shutting down server");
             }
         }
-        () = handle_incoming_clients_loop(local_end.clone(), publishers, global_cancellation_token.clone(), task_master.clone()) => {}
+
+        // Perform the main server loop.
+        () = handle_incoming_clients_loop(
+            local_end.clone(),
+            publishers,
+            global_cancellation_token.clone(),
+            task_master.clone(),
+            args.max_connections
+        ) => {}
     }
 
     // Cancel the server's tasks.
@@ -134,10 +154,19 @@ async fn handle_incoming_clients_loop(
     publishers: PublishersRef,
     global_cancellation_token: CancellationToken,
     task_master: TaskTracker,
+    max_connections: Option<NonZeroU32>,
 ) {
     while let Some(connecting) = local_end.accept().await {
+        // Check if the server has reached the maximum number of connections.
+        if max_connections.is_some_and(|m| {
+            m.get() <= u32::try_from(local_end.open_connections()).unwrap_or(u32::MAX)
+        }) {
+            tracing::warn!("Server has reached the maximum number of connections");
+            connecting.refuse();
+            continue;
+        }
+
         // Attempt to complete the handshake with the client, else continue.
-        // TODO: Allow configuring a max connection limit and refusing new connections when the limit is reached.
         let Ok(connecting) = connecting.accept() else {
             continue;
         };

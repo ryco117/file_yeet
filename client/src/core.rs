@@ -59,6 +59,7 @@ pub struct PreparedConnection {
 }
 
 /// Create a QUIC endpoint connected to the server and perform basic setup.
+/// Will attempt to infer optional arguments from the system if not specified.
 pub async fn prepare_server_connection(
     server_address: Option<&str>,
     server_port: NonZeroU16,
@@ -85,34 +86,32 @@ pub async fn prepare_server_connection(
         server_socket.address,
     );
 
-    let using_ipv4 = server_socket.address.is_ipv4();
-
-    // Create our QUIC endpoint. Use an unspecified address since we don't have any preference.
-    let mut endpoint = {
-        let port = internal_port.map(NonZeroU16::get).unwrap_or_default();
-        quinn::Endpoint::server(
-            server_config,
-            if using_ipv4 {
-                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port))
-            } else {
-                SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0))
-            },
-        )?
+    // Determine the local socket address to bind to. Use an unspecified address since we don't have any preference.
+    let bind_port = internal_port.map_or(0, NonZeroU16::get);
+    let bind_address = match &server_socket.address {
+        SocketAddr::V4(_) => SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, bind_port)),
+        SocketAddr::V6(_) => {
+            SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, bind_port, 0, 0))
+        }
     };
+    let mut endpoint = quinn::Endpoint::server(server_config, bind_address)?;
 
     // Use an insecure client configuration when connecting to peers.
     // TODO: Use a secure client configuration when connecting to the server.
     endpoint.set_default_client_config(configure_peer_verification());
 
     // Connect to the specified `file_yeet` server.
-    let connection = connect_to_server(server_socket, &endpoint).await?;
+    let connection = connect_to_server(&endpoint, server_socket).await?;
 
     // Share debug information about the QUIC endpoints.
     let mut local_address = endpoint
         .local_addr()
         .expect("Failed to get the local address of our QUIC endpoint");
     if local_address.ip().is_unspecified() {
-        local_address.set_ip(probe_local_address(using_ipv4)?);
+        local_address.set_ip(probe_local_address(matches!(
+            connection.remote_address(),
+            SocketAddr::V4(_)
+        ))?);
     }
     println!(
         "{} QUIC endpoint created with local address: {local_address}",
@@ -153,7 +152,7 @@ pub async fn prepare_server_connection(
                 Ok(m) => {
                     let p = m.external_port();
                     println!(
-                        "{} Success mapping external port {p} -> internal {}",
+                        "{} Success mapping external port {gateway}:{p} -> internal {}",
                         local_now_fmt(),
                         m.internal_port(),
                     );
@@ -240,8 +239,8 @@ async fn try_port_mapping(
 
 /// Connect to the server using QUIC.
 async fn connect_to_server(
-    server_socket: SocketAddrHelper,
     endpoint: &quinn::Endpoint,
+    server_socket: SocketAddrHelper,
 ) -> anyhow::Result<quinn::Connection> {
     // Reused error message string.
     const SERVER_CONNECTION_ERR: &str = "Failed to establish a QUIC connection to the server";

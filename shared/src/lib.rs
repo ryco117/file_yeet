@@ -70,7 +70,7 @@ impl std::fmt::Display for ClientApiRequest {
 }
 
 /// Helper to get either the socket address corresponding to the user's input, or the default of IPv4 localhost.
-///
+/// If `server_address` is empty, will use the `localhost` address for the server.
 /// # Errors
 /// If there is `Some(..)` non-empty server address, then it must be of the format `hostname:port`
 /// to be able to parse into a socket address using `ToSocketAddrs`. If the address cannot be parsed, it will
@@ -98,6 +98,7 @@ pub fn get_server_or_default(
             }
         })
         .unwrap_or_else(|| {
+            // If no server address was specified, use the default localhost address.
             const LOCALHOST: &str = "localhost";
             if let Some(address) = (LOCALHOST, port.get())
                 .to_socket_addrs()
@@ -110,6 +111,7 @@ pub fn get_server_or_default(
                     hostname: LOCALHOST.to_string(),
                 })
             } else {
+                // If the string "localhost" is not a valid address, use the IPv4 localhost as a fallback.
                 Ok(SocketAddrHelper {
                     address: (Ipv4Addr::LOCALHOST, port.get()).into(),
                     hostname: Ipv4Addr::LOCALHOST.to_string(),
