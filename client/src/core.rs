@@ -9,8 +9,7 @@ use std::{
 
 use bytes::BufMut as _;
 use file_yeet_shared::{
-    local_now_fmt, BiStream, HashBytes, SocketAddrHelper, GOODBYE_CODE,
-    MAX_SERVER_COMMUNICATION_SIZE,
+    BiStream, HashBytes, SocketAddrHelper, GOODBYE_CODE, MAX_SERVER_COMMUNICATION_SIZE,
 };
 use futures_util::TryFutureExt;
 use rustls::pki_types::CertificateDer;
@@ -19,6 +18,9 @@ use tokio::{
     io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _},
     sync::RwLock,
 };
+
+/// The name of the application.
+pub static APP_TITLE: &str = env!("CARGO_PKG_NAME");
 
 /// Use a sane default timeout for server connections.
 pub const SERVER_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -35,10 +37,24 @@ pub const MAX_PEER_CONNECTION_RETRIES: usize = 3;
 /// The limit is mainly meant to set reasonable memory usage for a stream.
 pub const MAX_PEER_COMMUNICATION_SIZE: usize = 16 * 1024;
 
+/// Expected error indicating that a read operation failed because we closed the connection elsewhere.
+pub const LOCALLY_CLOSED_READ: quinn::ReadError =
+    quinn::ReadError::ConnectionLost(quinn::ConnectionError::LocallyClosed);
+
+/// Expected error indicating that a write operation failed because we closed the connection elsewhere.
+pub const LOCALLY_CLOSED_WRITE: quinn::WriteError =
+    quinn::WriteError::ConnectionLost(quinn::ConnectionError::LocallyClosed);
+
 /// Specify whether any existing port forwarding can be used or if a new mapping should be attempted.
+#[derive(Debug)]
 pub enum PortMappingConfig {
+    /// No port forwarding is used, relies entirely on UDP hole punching.
     None,
+
+    /// Use a port forward configured outside of this application.
     PortForwarding(NonZeroU16),
+
+    /// Attempt to use PCP or NAT-PMP to create a port mapping.
     PcpNatPmp(Option<crab_nat::PortMapping>),
 }
 
@@ -55,11 +71,12 @@ pub struct PreparedConnection {
     pub endpoint: quinn::Endpoint,
     pub server_connection: quinn::Connection,
     pub port_mapping: Option<crab_nat::PortMapping>,
-    pub external_address: String,
+    pub external_address: (SocketAddr, String),
 }
 
 /// Create a QUIC endpoint connected to the server and perform basic setup.
 /// Will attempt to infer optional arguments from the system if not specified.
+#[tracing::instrument(skip_all)]
 pub async fn prepare_server_connection(
     server_address: Option<&str>,
     server_port: NonZeroU16,
@@ -79,12 +96,7 @@ pub async fn prepare_server_connection(
 
     // Get the server address info.
     let server_socket = file_yeet_shared::get_server_or_default(server_address, server_port)?;
-    println!(
-        "{} Connecting to server {} at socket address: {}",
-        local_now_fmt(),
-        server_socket.hostname,
-        server_socket.address,
-    );
+    tracing::info!("Connecting to server {server_socket:?}");
 
     // Determine the local socket address to bind to. Use an unspecified address since we don't have any preference.
     let bind_port = internal_port.map_or(0, NonZeroU16::get);
@@ -113,10 +125,7 @@ pub async fn prepare_server_connection(
             SocketAddr::V4(_)
         ))?);
     }
-    println!(
-        "{} QUIC endpoint created with local address: {local_address}",
-        local_now_fmt()
-    );
+    tracing::info!("QUIC endpoint created with local address: {local_address}");
 
     // Attempt to get a port forwarding, starting with user's override and then attempting NAT-PMP and PCP.
     let gateway = if let Some(g) = suggested_gateway {
@@ -151,15 +160,14 @@ pub async fn prepare_server_connection(
             match try_port_mapping(gateway, local_address).await {
                 Ok(m) => {
                     let p = m.external_port();
-                    println!(
-                        "{} Success mapping external port {gateway}:{p} -> internal {}",
-                        local_now_fmt(),
+                    tracing::info!(
+                        "Success mapping external port {gateway}:{p} -> internal {}",
                         m.internal_port(),
                     );
                     (Some(m), Some(p))
                 }
                 Err(e) => {
-                    eprintln!("{} Failed to create a port mapping: {e}", local_now_fmt());
+                    tracing::warn!("Failed to create a port mapping: {e}");
                     (None, None)
                 }
             }
@@ -175,14 +183,14 @@ pub async fn prepare_server_connection(
     };
 
     // Read the server's response to the sanity check.
-    let (mut sanity_check_addr, sanity_check) = socket_ping_request(&connection).await?;
-    println!("{} Server sees us as {sanity_check}", local_now_fmt());
+    let mut sanity_check = socket_ping_request(&connection).await?;
+    tracing::info!("Server sees us as {}", sanity_check.1);
 
     if let Some(port) = port_override {
         // Only send a port override request if the server sees us through a different port.
-        if sanity_check_addr.port() != port.get() {
+        if sanity_check.0.port() != port.get() {
             port_override_request(&connection, port, bb).await?;
-            sanity_check_addr.set_port(port.get());
+            sanity_check.0.set_port(port.get());
         }
     }
 
@@ -190,7 +198,7 @@ pub async fn prepare_server_connection(
         endpoint,
         server_connection: connection,
         port_mapping,
-        external_address: sanity_check_addr.to_string(),
+        external_address: sanity_check,
     })
 }
 
@@ -220,6 +228,7 @@ fn probe_local_address(using_ipv4: bool) -> anyhow::Result<IpAddr> {
 }
 
 /// Attempt to create a port mapping using NAT-PMP or PCP.
+#[tracing::instrument]
 async fn try_port_mapping(
     gateway: IpAddr,
     local_address: SocketAddr,
@@ -238,6 +247,7 @@ async fn try_port_mapping(
 }
 
 /// Connect to the server using QUIC.
+#[tracing::instrument(skip(endpoint))]
 async fn connect_to_server(
     endpoint: &quinn::Endpoint,
     server_socket: SocketAddrHelper,
@@ -260,12 +270,13 @@ async fn connect_to_server(
             anyhow::bail!("{SERVER_CONNECTION_ERR}: Timeout {e:#}");
         }
     };
-    println!("{} QUIC connection made to the server", local_now_fmt());
+    tracing::info!("QUIC connection made to the server");
     Ok(connection)
 }
 
 /// Perform a socket ping request to the server and sanity check the response.
 /// Returns the server's address and the string encoding it was sent as.
+#[tracing::instrument(skip(server_connection))]
 pub async fn socket_ping_request(
     server_connection: &quinn::Connection,
 ) -> anyhow::Result<(SocketAddr, String)> {
@@ -282,12 +293,13 @@ pub async fn socket_ping_request(
     // Read the server's response to the sanity check.
     let string_len = server_streams.recv.read_u16().await?;
     let sanity_check = expect_server_text(&mut server_streams.recv, string_len).await?;
-    let sanity_check_addr: SocketAddr = sanity_check.parse()?;
+    let sanity_check_addr = sanity_check.parse()?;
 
     Ok((sanity_check_addr, sanity_check))
 }
 
 /// Perform a port override request to the server.
+#[tracing::instrument(skip(server_connection, bb))]
 pub async fn port_override_request(
     server_connection: &quinn::Connection,
     port: NonZeroU16,
@@ -308,6 +320,7 @@ pub async fn port_override_request(
 }
 
 /// Perform a publish request to the server.
+#[tracing::instrument(skip(server_connection, bb))]
 pub async fn publish(
     server_connection: &quinn::Connection,
     mut bb: bytes::BytesMut,
@@ -341,47 +354,86 @@ pub async fn publish(
     Ok(server_streams)
 }
 
-/// Read a response to a publish request from the server.
+/// Errors that may occur when reading a subscriber address from the server.
+#[derive(Clone, Debug, thiserror::Error)]
+pub enum ReadSubscribingPeerError {
+    /// Failed to read response size from the server and got a `ReadError`.
+    #[error("Failed to read response size from the server: {0}")]
+    ReadSizeFailedWithError(quinn::ReadError),
+
+    /// Failed to read response size from the server and got an `ErrorKind`.
+    #[error("Failed to read response size from the server: {0}")]
+    ReadSizeFailedWithKind(std::io::ErrorKind),
+
+    /// The server sent an invalid response size.
+    #[error("The server sent an invalid response size: {0}")]
+    InvalidResponseSize(u16),
+
+    /// Failed to read peer address from the server.
+    #[error("Failed to read peer address from the server: {0}")]
+    ReadAddressFailed(quinn::ReadExactError),
+
+    /// The server did not send a valid UTF-8 response.
+    #[error("The server did not send a valid UTF-8 response: {0}")]
+    InvalidUtf8(std::str::Utf8Error),
+
+    /// The server did not send a valid socket address string.
+    #[error("The server did not send a valid socket address string: {0}")]
+    InvalidAddress(std::net::AddrParseError),
+
+    /// The server sent our address back to us.
+    #[error("The server sent our address back to us")]
+    SelfAddress,
+}
+
+/// Read a peer address from the server in response to a publish task.
+#[tracing::instrument(skip(server_recv))]
 pub async fn read_subscribing_peer(
     server_recv: &mut quinn::RecvStream,
-) -> anyhow::Result<SocketAddr> {
-    let data_len = server_recv
-        .read_u16()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to read response from the server: {e}"))?
-        as usize;
-    if data_len == 0 {
-        anyhow::bail!("Server encountered and error");
-    }
-    if data_len > MAX_SERVER_COMMUNICATION_SIZE {
-        anyhow::bail!("Server response length is invalid");
+    our_external_address: Option<SocketAddr>,
+) -> Result<SocketAddr, ReadSubscribingPeerError> {
+    let data_len = server_recv.read_u16().await.map_err(|e| {
+        let kind = e.kind();
+        if let Ok(e) = e.downcast::<quinn::ReadError>() {
+            ReadSubscribingPeerError::ReadSizeFailedWithError(e)
+        } else {
+            ReadSubscribingPeerError::ReadSizeFailedWithKind(kind)
+        }
+    })?;
+    if data_len == 0 || data_len as usize > MAX_SERVER_COMMUNICATION_SIZE {
+        return Err(ReadSubscribingPeerError::InvalidResponseSize(data_len));
     }
 
+    // Allocate scratch space for the maximum response size.
     let mut scratch_space = [0; MAX_SERVER_COMMUNICATION_SIZE];
-    let peer_string_bytes = &mut scratch_space[..data_len];
+    let peer_string_bytes = &mut scratch_space[..data_len as usize];
     if let Err(e) = server_recv.read_exact(peer_string_bytes).await {
-        anyhow::bail!("Failed to read a response from the server: {e}");
+        return Err(ReadSubscribingPeerError::ReadAddressFailed(e));
     }
 
     // Parse the response as a peer socket address or skip this message.
-    let peer_string = match std::str::from_utf8(peer_string_bytes) {
-        Ok(s) => s,
-        Err(e) => anyhow::bail!("Server did not send a valid UTF-8 response: {e}"),
-    };
-    let peer_address = match peer_string.parse() {
-        Ok(addr) => addr,
-        Err(e) => anyhow::bail!("Failed to parse peer address: {e}"),
-    };
+    let peer_string =
+        std::str::from_utf8(peer_string_bytes).map_err(ReadSubscribingPeerError::InvalidUtf8)?;
+    let peer_address = peer_string
+        .parse()
+        .map_err(ReadSubscribingPeerError::InvalidAddress)?;
+
+    // Ensure the server isn't sending us our own address.
+    if our_external_address.is_some_and(|a| a == peer_address) {
+        return Err(ReadSubscribingPeerError::SelfAddress);
+    }
 
     Ok(peer_address)
 }
 
 /// Perform a subscribe request to the server.
 /// Returns a list of peers that are sharing the file and the file size they promise to send.
+#[tracing::instrument(skip(server_connection, bb))]
 pub async fn subscribe(
     server_connection: &quinn::Connection,
     bb: &mut bytes::BytesMut,
     hash: HashBytes,
+    our_external_address: Option<SocketAddr>,
 ) -> anyhow::Result<Vec<(SocketAddr, u64)>> {
     // Create a bi-directional stream to the server.
     let mut server_streams: BiStream = server_connection
@@ -404,10 +456,7 @@ pub async fn subscribe(
         .await
         .map_err(|e| anyhow::anyhow!("Failed to send a subscribe request to the server: {e}"))?;
 
-    println!(
-        "{} Requesting file with hash from the server...",
-        local_now_fmt()
-    );
+    tracing::info!("Requesting file with hash from the server...");
 
     // Determine if the server is responding with a success or failure.
     let response_count = server_streams
@@ -435,20 +484,22 @@ pub async fn subscribe(
         let peer_address_str =
             expect_server_text(&mut server_streams.recv, u16::from(address_len)).await?;
 
+        // Read the incoming file size.
+        let file_size = server_streams.recv.read_u64().await?;
+
         // Parse the peer address into a socket address.
         let peer_address = match peer_address_str.parse() {
             Ok(p) => p,
             Err(e) => {
-                eprintln!(
-                    "{} Failed to parse peer address {peer_address_str}: {e}",
-                    local_now_fmt()
-                );
+                tracing::warn!("Failed to parse peer address {peer_address_str}: {e}");
                 continue;
             }
         };
 
-        // Read the incoming file size.
-        let file_size = server_streams.recv.read_u64().await?;
+        if our_external_address.is_some_and(|a| a == peer_address) {
+            tracing::debug!("Skipping our own address from the server response");
+            continue;
+        }
 
         peers.push((peer_address, file_size));
     }
@@ -457,6 +508,7 @@ pub async fn subscribe(
 }
 
 /// Try to read a valid UTF-8 from the server until the expected length is reached.
+#[tracing::instrument(skip(stream))]
 async fn expect_server_text(stream: &mut quinn::RecvStream, len: u16) -> anyhow::Result<String> {
     let mut raw_bytes = [0; MAX_SERVER_COMMUNICATION_SIZE];
     let expected_slice = &mut raw_bytes[..len as usize];
@@ -497,7 +549,7 @@ pub async fn udp_holepunch(
     for (connection, managed_connection) in connections {
         if let Some(peer_streams) = peer_connection_into_stream(&connection, hash, cmd).await {
             // Let the user know that a connection is established. A bi-directional stream is ready to use.
-            println!("{} Peer connection established", local_now_fmt());
+            tracing::info!("Peer connection established");
 
             // If the connection is not managed, add it to the manager.
             if !managed_connection {
@@ -526,14 +578,11 @@ pub async fn peer_connection_into_stream(
 
                 // Ensure the requested hash matches the expected file hash.
                 if requested_hash != expected_hash {
-                    eprintln!(
-                        "{} Peer requested a file with an unexpected hash",
-                        local_now_fmt(),
-                    );
+                    tracing::warn!("Peer requested a file with an unexpected hash");
                     return None;
                 }
 
-                println!("{} New peer stream accepted", local_now_fmt());
+                tracing::info!("New peer stream accepted");
             }
             r
         }
@@ -543,9 +592,9 @@ pub async fn peer_connection_into_stream(
             match &mut r {
                 Ok(s) => {
                     s.0.write_all(&expected_hash).await.ok()?;
-                    println!("{} New peer stream opened", local_now_fmt());
+                    tracing::info!("New peer stream opened");
                 }
-                Err(e) => eprintln!("{} Failed to open a peer stream: {e}", local_now_fmt()),
+                Err(e) => tracing::warn!("Failed to open a peer stream: {e}"),
             }
             r
         }
@@ -568,31 +617,25 @@ async fn connect_to_peer(
     // Ensure we have retries left and there isn't already a peer `Connection` to use.
     while connect_attempts > 0 {
         #[cfg(debug_assertions)]
-        println!(
-            "{} Connection attempt to peer at {peer_address}",
-            local_now_fmt()
-        );
+        tracing::debug!("Connection attempt to peer at {peer_address}");
 
         match endpoint.connect(peer_address, "peer") {
             Ok(connecting) => {
                 let connection = match connecting.await {
                     Ok(c) => c,
                     Err(e) => {
-                        eprintln!("{} Failed to connect to peer: {e}", local_now_fmt());
+                        tracing::warn!("Failed to connect to peer: {e}");
                         connect_attempts -= 1;
                         continue;
                     }
                 };
 
-                println!("{} Connected to peer at {peer_address}", local_now_fmt());
+                tracing::info!("Connected to peer at {peer_address}");
                 return Some(connection);
             }
 
             Err(e) => {
-                eprintln!(
-                    "{} Failed to connect to peer with unrecoverable error: {e}",
-                    local_now_fmt()
-                );
+                tracing::warn!("Failed to connect to peer with unrecoverable error: {e}");
             }
         }
     }
@@ -696,11 +739,7 @@ pub async fn download_from_peer(
     // No more data is required from this stream.
     // Let the peer know they can close their end of the stream.
     if let Err(e) = peer_streams.recv.stop(GOODBYE_CODE) {
-        #[cfg(debug_assertions)]
-        eprintln!(
-            "{} Failed to close the peer stream gracefully: {e}",
-            local_now_fmt()
-        );
+        tracing::debug!("Failed to close the peer stream gracefully: {e}");
     }
 
     // Ensure the file hash is correct.
@@ -710,11 +749,7 @@ pub async fn download_from_peer(
     }
 
     // Let the user know that the download is complete.
-    println!(
-        "{} Download complete: {}",
-        local_now_fmt(),
-        output_path.display()
-    );
+    tracing::info!("Download complete: {}", output_path.display());
     Ok(())
 }
 
@@ -801,7 +836,9 @@ pub async fn upload_to_peer(
         let mut n = reader.read(&mut buf).await?;
 
         if n == 0 {
-            eprintln!("{} Unexpected EOF while uploading", local_now_fmt());
+            // Log that the file has ended unexpectedly. Possible corruption,
+            // but continue loop because `await` call above will ensure we aren't blocking.
+            tracing::error!("Unexpected EOF while uploading");
             continue;
         }
 
@@ -825,14 +862,11 @@ pub async fn upload_to_peer(
 
     // Gracefully close our connection after all data has been sent.
     if let Err(e) = peer_streams.send.stopped().await {
-        eprintln!(
-            "{} Failed to close the peer stream gracefully: {e}",
-            local_now_fmt()
-        );
+        tracing::warn!("Failed to close the peer stream gracefully: {e}");
     }
 
     // Let the user know that the upload is complete.
-    println!("{} Upload complete!", local_now_fmt());
+    tracing::info!("Upload complete!");
     Ok(())
 }
 
@@ -863,6 +897,7 @@ impl IncomingManager {
     }
 
     /// Await the connection of a peer from a specified socket address.
+    #[tracing::instrument(skip(self))]
     pub async fn await_peer(
         &self,
         peer_address: SocketAddr,
@@ -877,9 +912,8 @@ impl IncomingManager {
                         // If the peer is already connected, return the connection.
                         IncomingPeerState::Connected(c) => {
                             #[cfg(debug_assertions)]
-                            println!(
-                                "{} Awaited peer connection is already established: {peer_address}",
-                                local_now_fmt()
+                            tracing::info!(
+                                "Awaited peer connection is already established: {peer_address}"
                             );
 
                             return Some(c.clone());
@@ -887,10 +921,8 @@ impl IncomingManager {
 
                         // Otherwise, append another receiver to the list.
                         IncomingPeerState::Awaiting(v) => {
-                            #[cfg(debug_assertions)]
-                            println!(
-                                "{} Joining wait at index {} for peer connection: {peer_address}",
-                                local_now_fmt(),
+                            tracing::debug!(
+                                "Joining wait at index {} for peer connection: {peer_address}",
                                 v.len()
                             );
 
@@ -905,11 +937,7 @@ impl IncomingManager {
 
                 // No mapping exists for this peer address, create one.
                 std::collections::hash_map::Entry::Vacant(e) => {
-                    #[cfg(debug_assertions)]
-                    println!(
-                        "{} Creating wait for peer connection: {peer_address}",
-                        local_now_fmt()
-                    );
+                    tracing::debug!("Creating wait for peer connection: {peer_address}");
 
                     let (tx, rx) = tokio::sync::oneshot::channel();
                     e.insert(IncomingPeerState::Awaiting(vec![tx]));
@@ -942,9 +970,8 @@ impl IncomingManager {
                     for tx in txs {
                         // Fails if the receiver is no longer waiting for this message.
                         if tx.send(connection.clone()).is_err() {
-                            eprintln!(
-                                "{} Waiting thread closed before peer connection was accepted",
-                                local_now_fmt()
+                            tracing::warn!(
+                                "Waiting thread closed before peer connection was accepted"
                             );
                         }
                     }
@@ -957,44 +984,15 @@ impl IncomingManager {
             }
         }
 
-        #[cfg(debug_assertions)]
-        println!(
-            "{} Peer connection accepted by manager: {peer_address}",
-            local_now_fmt()
-        );
+        tracing::debug!("Peer connection accepted by manager: {peer_address}");
     }
-
-    // /// Remove a peer from the manager.
-    // pub async fn remove_peer(&mut self, peer_address: &SocketAddr) {
-    //     if self.map.write().await.remove(peer_address).is_none() {
-    //         #[cfg(debug_assertions)]
-    //         println!(
-    //             "{} Peer connection manager removed a non-existent peer: {peer_address}",
-    //             local_now_fmt()
-    //         );
-    //     } else {
-    //         #[cfg(debug_assertions)]
-    //         println!(
-    //             "{} Peer connection manager removed peer: {peer_address}",
-    //             local_now_fmt()
-    //         );
-    //     }
-    // }
 
     /// Remove a peer from the manager, with synchronous lock behavior.
     pub fn blocking_remove_peer(&mut self, peer_address: &SocketAddr) {
         if self.map.blocking_write().remove(peer_address).is_none() {
-            #[cfg(debug_assertions)]
-            println!(
-                "{} Peer connection manager removed a non-existent peer: {peer_address}",
-                local_now_fmt()
-            );
+            tracing::debug!("Peer connection manager removed a non-existent peer: {peer_address}");
         } else {
-            #[cfg(debug_assertions)]
-            println!(
-                "{} Peer connection manager removed peer: {peer_address}",
-                local_now_fmt()
-            );
+            tracing::debug!("Peer connection manager removed peer: {peer_address}");
         }
     }
 
@@ -1005,10 +1003,7 @@ impl IncomingManager {
             let connecting = match connecting.accept() {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!(
-                        "{} Failed to accept an incoming peer connection: {e}",
-                        local_now_fmt()
-                    );
+                    tracing::warn!("Failed to accept an incoming peer connection: {e}");
 
                     // Skip incomplete connections.
                     continue;
@@ -1017,10 +1012,7 @@ impl IncomingManager {
             let connection = match connecting.await {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!(
-                        "{} Failed to complete a peer connection: {e}",
-                        local_now_fmt()
-                    );
+                    tracing::warn!("Failed to complete a peer connection: {e}");
 
                     // Skip incomplete connections.
                     continue;
@@ -1031,8 +1023,7 @@ impl IncomingManager {
             manager.accept_peer(connection).await;
         }
 
-        #[cfg(debug_assertions)]
-        println!("{} Incoming peer connection loop closed", local_now_fmt());
+        tracing::debug!("Incoming peer connection loop closed");
     }
 }
 

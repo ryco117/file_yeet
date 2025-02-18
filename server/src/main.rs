@@ -149,6 +149,7 @@ async fn main() {
 }
 
 /// Process incoming QUIC connections into their own tasks, allowing for client-task cancellation.
+#[tracing::instrument(skip_all)]
 async fn handle_incoming_clients_loop(
     local_end: quinn::Endpoint,
     publishers: PublishersRef,
@@ -411,7 +412,7 @@ fn random_nonce() -> Nonce {
 }
 
 /// Send a ping response to the client by sending the address we introduce them to peers as.
-#[tracing::instrument(skip(quic_send))]
+#[tracing::instrument(skip_all)]
 async fn socket_ping(
     mut quic_send: quinn::SendStream,
     sock_string: &RwLock<String>,
@@ -476,7 +477,7 @@ async fn port_override(
 }
 
 /// Handle QUIC connections for clients that want to publish a new file hash.
-#[tracing::instrument(skip(session, client_streams, publishers))]
+#[tracing::instrument(skip_all)]
 async fn handle_publish(
     session: &RwLock<ClientSession>,
     mut client_streams: BiStream,
@@ -484,6 +485,7 @@ async fn handle_publish(
     task_master: TaskTracker,
 ) -> Result<(), ClientRequestError> {
     /// Helper to remove a publisher from the list of peers sharing a file hash.
+    #[tracing::instrument(skip(publishers))]
     async fn try_remove_publisher(
         session_nonce: Nonce,
         hash: HashBytes,
@@ -502,6 +504,7 @@ async fn handle_publish(
         }
     }
     /// A loop to handle messages to be sent to a client publishing a file hash.
+    #[tracing::instrument(skip(quic_send, rx, sock_string))]
     async fn handle_publish_inner(
         mut quic_send: quinn::SendStream,
         mut rx: mpsc::Receiver<String>,
@@ -509,7 +512,7 @@ async fn handle_publish(
         hash_hex: &str,
     ) {
         tracing::info!(
-            "Starting publish task for client {} {hash_hex}",
+            "Starting publish task for client {}",
             sock_string.read().await
         );
         let mut bb = bytes::BytesMut::with_capacity(MAX_SERVER_COMMUNICATION_SIZE);
@@ -603,7 +606,7 @@ async fn handle_publish(
 }
 
 /// Handle a client request to subscribe to a file hash, receiving a list of peers that are publishing this hash.
-#[tracing::instrument(skip(session, client_streams, clients))]
+#[tracing::instrument(skip_all)]
 async fn handle_subscribe(
     session: &RwLock<ClientSession>,
     mut client_streams: BiStream,
@@ -667,8 +670,9 @@ async fn handle_subscribe(
         // Only include the peer if the message was successfully passed.
         if let Ok(()) = pub_client.stream.send(publisher_sock_string.clone()).await {
             // Send the publisher's socket address to the subscribing client.
-            bb.put_u8(u8::try_from(client_address.len()).unwrap());
-            bb.put(client_address.as_bytes());
+            let client_address_bytes = client_address.as_bytes();
+            bb.put_u8(u8::try_from(client_address_bytes.len()).unwrap());
+            bb.put(client_address_bytes);
 
             // Send the file size to the subscribing client.
             bb.put_u64(file_size);

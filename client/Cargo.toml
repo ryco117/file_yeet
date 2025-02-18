@@ -30,6 +30,8 @@ sha2 = "0.10"
 thiserror = "2.0"
 tokio = { version = "1.43", features = ["fs", "macros", "net", "rt-multi-thread", "signal"] }
 tokio-util = { version = "0.7", features = ["rt"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
 
 # Handle special case of windows-rs crate.
 [dependencies.windows]

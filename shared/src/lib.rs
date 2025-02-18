@@ -31,6 +31,7 @@ pub const GOODBYE_CODE: quinn::VarInt = quinn::VarInt::from_u32(0);
 pub const GOODBYE_MESSAGE: &str = "Goodbye!";
 
 /// A helper to access often used socket address info.
+#[derive(Clone, Debug)]
 pub struct SocketAddrHelper {
     pub address: SocketAddr,
     pub hostname: String,
@@ -118,13 +119,6 @@ pub fn get_server_or_default(
                 })
             }
         })
-}
-
-/// Get the current local time in a human-readable, fixed length format.
-#[must_use]
-pub fn local_now_fmt() -> chrono::format::DelayedFormat<chrono::format::StrftimeItems<'static>> {
-    // E.g., "2024-02-06 22:01:04.913"
-    chrono::Local::now().format("%F %T%.3f")
 }
 
 /// Helper type for grouping a bi-directional stream, instead of the default tuple type.

@@ -1,8 +1,7 @@
 use std::{io::Write as _, num::NonZeroU16, path::Path};
 
 use file_yeet_shared::{
-    local_now_fmt, BiStream, HashBytes, GOODBYE_CODE, GOODBYE_MESSAGE,
-    MAX_SERVER_COMMUNICATION_SIZE,
+    BiStream, HashBytes, GOODBYE_CODE, GOODBYE_MESSAGE, MAX_SERVER_COMMUNICATION_SIZE,
 };
 use futures_util::{stream::FuturesUnordered, StreamExt};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
@@ -11,7 +10,7 @@ use crate::core::{humanize_bytes, FileYeetCommandType, PreparedConnection};
 
 mod core;
 mod gui;
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", not(debug_assertions)))]
 mod win_cmd;
 
 /// The command line interface for `file_yeet_client`.
@@ -46,6 +45,10 @@ pub struct Cli {
     #[arg(short, long)]
     nat_map: bool,
 
+    /// Enable verbose debug logging.
+    #[arg(short, long)]
+    verbose: bool,
+
     #[command(subcommand)]
     cmd: Option<FileYeetCommand>,
 }
@@ -68,12 +71,37 @@ fn main() {
     use clap::Parser as _;
     let args = Cli::parse();
 
+    // Initialize logging.
+    {
+        use tracing_subscriber::prelude::*;
+
+        let filter = if cfg!(debug_assertions) || args.verbose {
+            tracing_subscriber::filter::Targets::new()
+                .with_target(core::APP_TITLE, tracing::Level::DEBUG)
+        } else {
+            tracing_subscriber::filter::Targets::new()
+                .with_target(core::APP_TITLE, tracing::Level::INFO)
+        };
+        let subscriber = tracing_subscriber::registry();
+        if args.verbose {
+            subscriber
+                .with(tracing_subscriber::fmt::layer())
+                .with(filter)
+                .init();
+        } else {
+            subscriber
+                .with(tracing_subscriber::fmt::layer().compact())
+                .with(filter)
+                .init();
+        }
+    }
+
     // If no subcommand was provided, run the GUI.
     let Some(cmd) = args.cmd else {
         // If Windows, ensure we aren't displaying an unwanted console window.
         #[cfg(all(target_os = "windows", not(debug_assertions)))]
         {
-            println!("{} Freeing Windows console for GUI", local_now_fmt());
+            tracing::info!("Freeing Windows console for GUI");
             win_cmd::free_allocated_console();
         }
 
@@ -88,10 +116,10 @@ fn main() {
         .theme(gui::AppState::theme)
         .run_with(|| gui::AppState::new(args))
         {
-            eprintln!("{} GUI failed to run: {e}", local_now_fmt());
+            tracing::error!("GUI failed to run: {e}");
         }
 
-        println!("{} Closing GUI...", local_now_fmt());
+        tracing::info!("Closing GUI...");
         return;
     };
 
@@ -134,7 +162,7 @@ fn main() {
                 if let Err(e) =
                     publish_command(&prepared_connection, bb, file_path, &mut task_master).await
                 {
-                    eprintln!("{} Failed to publish the file: {e}", local_now_fmt());
+                    tracing::error!("Failed to publish the file: {e}");
                 }
             }
 
@@ -143,7 +171,7 @@ fn main() {
                 if let Err(e) =
                     subscribe_command(&prepared_connection, bb, sha256_hex, output).await
                 {
-                    eprintln!("{} Failed to download the file: {e}", local_now_fmt());
+                    tracing::error!("Failed to download the file: {e}");
                 }
             }
         }
@@ -162,16 +190,12 @@ fn main() {
         // Try to clean up the port mapping if one was made.
         if let Some(mapping) = prepared_connection.port_mapping {
             if let Err((e, m)) = mapping.try_drop().await {
-                eprintln!(
-                    "{} Failed to delete the port mapping with expiration {:?} : {e}",
-                    local_now_fmt(),
+                tracing::warn!(
+                    "Failed to delete the port mapping with expiration {:?} : {e}",
                     m.expiration()
                 );
             } else {
-                println!(
-                    "{} Successfully deleted the created port mapping",
-                    local_now_fmt()
-                );
+                tracing::info!("Successfully deleted the created port mapping");
             }
         }
     });
@@ -190,9 +214,8 @@ async fn publish_command(
         Err(e) => anyhow::bail!("Failed to hash file: {e}"),
     };
     let mut hex_bytes = [0; 2 * file_yeet_shared::HASH_BYTE_COUNT];
-    println!(
-        "{} File {} has SHA-256 hash {} and size {} bytes",
-        local_now_fmt(),
+    tracing::info!(
+        "File {} has SHA-256 hash {} and size {} bytes",
         file_path.display(),
         faster_hex::hex_encode(&hash, &mut hex_bytes).expect("Failed to use a valid hex buffer"),
         humanize_bytes(file_size),
@@ -208,7 +231,7 @@ async fn publish_command(
     let cancellation_token = CancellationToken::new();
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
-            println!("{} Ctrl-C detected, cancelling the publish", local_now_fmt());
+            tracing::info!("Ctrl-C detected, cancelling the publish");
             cancellation_token.cancel();
         }
         r = publish_loop(endpoint, server_connection, bb, hash, file_size, file_path, cancellation_token.clone(), task_master) => return r
@@ -250,7 +273,7 @@ async fn subscribe_command(
     } = prepared_connection;
 
     // Request all available peers from the server.
-    let mut peers = match core::subscribe(server_connection, &mut bb, hash).await {
+    let mut peers = match core::subscribe(server_connection, &mut bb, hash, None).await {
         Err(e) => anyhow::bail!("Failed to subscribe to the file: {e}"),
         Ok(c) => c,
     };
@@ -284,7 +307,7 @@ async fn subscribe_command(
                 }
 
                 // Close the connection because we won't download from this peer.
-                println!("{} Download rejected", local_now_fmt());
+                tracing::info!("Download rejected");
                 c.close(GOODBYE_CODE, &[]);
             }
 
@@ -338,17 +361,17 @@ async fn publish_loop(
 
     // Enter a loop to listen for the server to send peer addresses.
     loop {
-        println!(
-            "{} Waiting for the server to introduce a peer...",
-            local_now_fmt()
-        );
+        tracing::info!("Waiting for the server to introduce a peer...");
 
         // Await the server to send a peer connection.
-        let Ok(peer_address) = crate::core::read_subscribing_peer(&mut server_streams.recv).await
-        else {
-            eprintln!("{} Failed to read the server's response", local_now_fmt());
-            break;
-        };
+        let peer_address =
+            match crate::core::read_subscribing_peer(&mut server_streams.recv, None).await {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!("Failed to read the server's response: {e}");
+                    break;
+                }
+            };
 
         let cancellation_token = cancellation_token.clone();
         let endpoint = endpoint.clone();
@@ -369,14 +392,14 @@ async fn publish_loop(
                     )
                     .await
                     else {
-                        eprintln!("{} Failed to connect to peer", local_now_fmt());
+                        tracing::warn!("Failed to connect to peer");
                         return;
                     };
 
                     let file = match tokio::fs::File::open(file_path).await {
                         Ok(f) => f,
                         Err(e) => {
-                            eprintln!("{} Failed to open the file: {e}", local_now_fmt());
+                            tracing::error!("Failed to open the file to publish: {e}");
                             return;
                         }
                     };
@@ -386,14 +409,14 @@ async fn publish_loop(
 
                     // Try to upload the file to the peer connection.
                     if let Err(e) = Box::pin(core::upload_to_peer(&mut peer_streams, file_size, reader, None)).await {
-                        eprintln!("{} Failed to upload to peer: {e}", local_now_fmt());
+                        tracing::warn!("Failed to upload to peer: {e}");
                     }
                 } => {}
             }
         });
     }
 
-    println!("{} Server connection closed", local_now_fmt());
+    tracing::info!("Server connection closed");
     Ok(())
 }
 
@@ -404,14 +427,12 @@ fn file_consent_cli(file_size: u64, output: &Path) -> Result<bool, std::io::Erro
     // Ensure the user consents to downloading the file.
     if output.exists() {
         print!(
-            "{} Download file of size {file_size} and overwrite {}? <y/N>: ",
-            local_now_fmt(),
+            "!! Download file of size {file_size} and overwrite {}? <y/N>: ",
             output.display()
         );
     } else {
         print!(
-            "{} Download file of size {file_size} to {}? <y/N>: ",
-            local_now_fmt(),
+            "!! Download file of size {file_size} to {}? <y/N>: ",
             output.display()
         );
     }

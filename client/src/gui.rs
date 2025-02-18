@@ -9,8 +9,7 @@ use std::{
 };
 
 use file_yeet_shared::{
-    local_now_fmt, BiStream, HashBytes, DEFAULT_PORT, GOODBYE_CODE, GOODBYE_MESSAGE,
-    MAX_SERVER_COMMUNICATION_SIZE,
+    BiStream, HashBytes, DEFAULT_PORT, GOODBYE_CODE, GOODBYE_MESSAGE, MAX_SERVER_COMMUNICATION_SIZE,
 };
 use iced::{
     widget::{self, horizontal_space},
@@ -278,7 +277,7 @@ struct ConnectedState {
     server: quinn::Connection,
 
     /// The external address of the client, as seen from the server.
-    external_address: String,
+    external_address: (SocketAddr, String),
 
     /// The hash input field for creating new subscribe requests.
     hash_input: String,
@@ -299,7 +298,11 @@ struct ConnectedState {
     transfer_view: TransferView,
 }
 impl ConnectedState {
-    fn new(endpoint: quinn::Endpoint, server: quinn::Connection, external_address: String) -> Self {
+    fn new(
+        endpoint: quinn::Endpoint,
+        server: quinn::Connection,
+        external_address: (SocketAddr, String),
+    ) -> Self {
         Self {
             endpoint,
             server,
@@ -425,7 +428,10 @@ pub enum Message {
     PublishRequestResulted(Nonce, PathBuf, PublishRequestResult),
 
     /// The result of trying to receive a peer from the server.
-    PublishPeerReceived(Nonce, Result<SocketAddr, Arc<anyhow::Error>>),
+    PublishPeerReceived(
+        Nonce,
+        Result<SocketAddr, crate::core::ReadSubscribingPeerError>,
+    ),
 
     /// The result of trying to connect to a peer to publish to.
     PublishPeerConnectResulted(Nonce, Option<PeerRequestStream>),
@@ -560,7 +566,7 @@ impl AppState {
 
     /// Get the application title text.
     pub const fn title() -> &'static str {
-        "file_yeet_client"
+        crate::core::APP_TITLE
     }
 
     /// Update the application state based on a message.
@@ -704,7 +710,9 @@ impl AppState {
             // Handle a file being opened.
             Message::OpenFile(path) => {
                 open::that(path).unwrap_or_else(|e| {
-                    eprintln!("{} Failed to open file: {e}", local_now_fmt());
+                    let e = format!("Failed to open file: {e}");
+                    tracing::error!("{e}");
+                    self.status_message = Some(e);
                 });
                 iced::Task::none()
             }
@@ -765,10 +773,13 @@ impl AppState {
 
             ConnectionState::Connected(ConnectedState {
                 endpoint,
+                external_address,
                 peers,
                 publishes,
                 ..
             }) => {
+                let external_address = external_address.0;
+
                 // Create a task to listen for incoming connections to our QUIC endpoint.
                 let incoming_connections = {
                     let endpoint = endpoint.clone();
@@ -805,6 +816,7 @@ impl AppState {
                                 publish,
                                 nonce,
                                 cancellation_token,
+                                external_address,
                                 output,
                             )
                         }),
@@ -1173,7 +1185,7 @@ impl AppState {
             leave_server_button,
             widget::horizontal_space(),
             widget::text("Our External Address:"),
-            widget::text(&connected_state.external_address),
+            widget::text(&connected_state.external_address.1),
         )
         .align_y(iced::alignment::Alignment::Center)
         .spacing(6);
@@ -1364,11 +1376,7 @@ impl AppState {
             }
         };
 
-        #[cfg(debug_assertions)]
-        println!(
-            "{} Trying connection to server {server_address}:{port}",
-            local_now_fmt()
-        );
+        tracing::info!("Trying connection to server {server_address}:{port}");
 
         // Set the state to `Stalling` before starting the connection attempt.
         self.connection_state = ConnectionState::new_stalling();
@@ -1485,10 +1493,7 @@ impl AppState {
         let ConnectionState::Connected(ConnectedState { publishes, .. }) =
             &mut self.connection_state
         else {
-            eprintln!(
-                "{} Peer requested transfer while not connected",
-                local_now_fmt()
-            );
+            tracing::warn!("Peer requested transfer while not connected");
             return iced::Task::none();
         };
 
@@ -1497,10 +1502,7 @@ impl AppState {
             PublishState::Publishing(p) if p.hash == hash => Some(pi.nonce),
             _ => None,
         }) else {
-            eprintln!(
-                "{} Peer requested transfer for unknown hash",
-                local_now_fmt()
-            );
+            tracing::warn!("Peer requested transfer for unknown hash");
             return iced::Task::none();
         };
 
@@ -1617,7 +1619,7 @@ impl AppState {
     fn update_publish_peer_received(
         &mut self,
         nonce: Nonce,
-        result: Result<SocketAddr, Arc<anyhow::Error>>,
+        result: Result<SocketAddr, crate::core::ReadSubscribingPeerError>,
     ) -> iced::Task<Message> {
         let ConnectionState::Connected(ConnectedState {
             endpoint,
@@ -1626,7 +1628,7 @@ impl AppState {
             ..
         }) = &mut self.connection_state
         else {
-            eprintln!("{} Peer received while not connected", local_now_fmt());
+            tracing::warn!("Peer received while not connected");
             return iced::Task::none();
         };
 
@@ -1669,11 +1671,7 @@ impl AppState {
 
             // No publish item matching the nonce was found.
             (_, None) => {
-                eprintln!(
-                    "{} Peer received for unknown publish nonce {nonce}",
-                    local_now_fmt()
-                );
-
+                tracing::warn!("Peer received for unknown publish nonce {nonce}");
                 iced::Task::none()
             }
         }
@@ -1692,10 +1690,7 @@ impl AppState {
             ..
         }) = &mut self.connection_state
         else {
-            eprintln!(
-                "{} Publish peer connect resulted while not connected",
-                local_now_fmt()
-            );
+            tracing::warn!("Publish peer connect resulted while not connected");
             return iced::Task::none();
         };
         let Some(peer) = peer else {
@@ -1714,10 +1709,7 @@ impl AppState {
                 None
             }
         }) else {
-            eprintln!(
-                "{} Peer connected for unknown publish nonce {pub_nonce}",
-                local_now_fmt()
-            );
+            tracing::warn!("Peer connected for unknown publish nonce {pub_nonce}");
             return iced::Task::none();
         };
 
@@ -1784,15 +1776,13 @@ impl AppState {
         // Ensure the client is connected to a server.
         let ConnectionState::Connected(ConnectedState {
             server,
+            external_address,
             hash_input,
             transfer_view,
             ..
         }) = &mut self.connection_state
         else {
-            eprintln!(
-                "{} Subscribe path chosen while not connected",
-                local_now_fmt()
-            );
+            tracing::warn!("Subscribe path chosen while not connected");
             return iced::Task::none();
         };
 
@@ -1800,7 +1790,7 @@ impl AppState {
         let mut hash = HashBytes::default();
         if let Err(e) = faster_hex::hex_decode(hash_input.as_bytes(), &mut hash) {
             let error = format!("Invalid hash: {e}");
-            eprintln!("{} {error}", local_now_fmt());
+            tracing::warn!("{error}");
             self.status_message = Some(error);
             return iced::Task::none();
         }
@@ -1809,10 +1799,11 @@ impl AppState {
         *transfer_view = TransferView::Downloads;
 
         let server = server.clone();
+        let external_address = external_address.0;
         iced::Task::perform(
             async move {
                 let mut bb = bytes::BytesMut::with_capacity(MAX_PEER_COMMUNICATION_SIZE);
-                crate::core::subscribe(&server, &mut bb, hash)
+                crate::core::subscribe(&server, &mut bb, hash, Some(external_address))
                     .await
                     .map(|peers| IncomingSubscribePeers::new(peers, path, hash))
                     .map_err(Arc::new)
@@ -1830,10 +1821,7 @@ impl AppState {
             ..
         }) = &mut self.connection_state
         else {
-            eprintln!(
-                "{} Subscribe recreated while not connected",
-                local_now_fmt()
-            );
+            tracing::warn!("Subscribe recreated while not connected");
             return iced::Task::none();
         };
 
@@ -1912,20 +1900,10 @@ impl AppState {
                             let task = {
                                 // Create a new connection or open a stream on an existing one.
                                 let peer = if let Some((c, _)) = peers.get(&peer) {
-                                    #[cfg(debug_assertions)]
-                                    println!(
-                                        "{} Reusing connection to peer {peer}",
-                                        local_now_fmt()
-                                    );
-
+                                    tracing::debug!("Reusing connection to peer {peer}");
                                     PeerConnectionOrTarget::Connection(c.clone())
                                 } else {
-                                    #[cfg(debug_assertions)]
-                                    println!(
-                                        "{} Creating new connection to peer {peer}",
-                                        local_now_fmt()
-                                    );
-
+                                    tracing::debug!("Creating new connection to peer {peer}");
                                     PeerConnectionOrTarget::Target(endpoint.clone(), peer)
                                 };
 
@@ -1951,10 +1929,7 @@ impl AppState {
                     downloads.append(&mut new_transfers);
                     iced::Task::batch(connect_commands)
                 } else {
-                    eprintln!(
-                        "{} Subscribe peers result while not connected",
-                        local_now_fmt()
-                    );
+                    tracing::warn!("Subscribe peers result while not connected");
                     iced::Task::none()
                 }
             }
@@ -1975,10 +1950,7 @@ impl AppState {
             peers, downloads, ..
         }) = &mut self.connection_state
         else {
-            eprintln!(
-                "{} Subscribe connect resulted while not connected",
-                local_now_fmt()
-            );
+            tracing::warn!("Subscribe connect resulted while not connected");
             return iced::Task::none();
         };
 
@@ -1988,10 +1960,7 @@ impl AppState {
             .enumerate()
             .find(|(_, t)| t.nonce == nonce)
         else {
-            eprintln!(
-                "{} Subscribe connect resulted for unknown nonce",
-                local_now_fmt()
-            );
+            tracing::warn!("Subscribe connect resulted for unknown nonce");
             return iced::Task::none();
         };
 
@@ -2011,13 +1980,13 @@ impl AppState {
         let ConnectionState::Connected(ConnectedState { downloads, .. }) =
             &mut self.connection_state
         else {
-            eprintln!("{} No connected state to accept download", local_now_fmt());
+            tracing::warn!("No connected state to accept download");
             return iced::Task::none();
         };
 
         // Get the current transfer status.
         let Some(transfer) = downloads.iter_mut().find(|t| t.nonce == nonce) else {
-            eprintln!("{} No transfer found to accept download", local_now_fmt());
+            tracing::warn!("No transfer found to accept download");
             return iced::Task::none();
         };
         let hash = transfer.hash;
@@ -2025,7 +1994,7 @@ impl AppState {
         let peer_streams = if let TransferProgress::Consent(p) = &mut transfer.progress {
             p.clone()
         } else {
-            eprintln!("{} Transfer is not in consent state", local_now_fmt());
+            tracing::warn!("Transfer is not in consent state");
             return iced::Task::none();
         };
 
@@ -2081,7 +2050,7 @@ impl AppState {
                 }
             }
         } else {
-            eprintln!("{} No connected state to cancel publish", local_now_fmt());
+            tracing::warn!("No connected state to cancel publish");
         }
         iced::Task::none()
     }
@@ -2110,7 +2079,7 @@ impl AppState {
                 }
             }
         } else {
-            eprintln!("{} No connected state to cancel transfer", local_now_fmt());
+            tracing::warn!("No connected state to cancel transfer");
         }
         iced::Task::none()
     }
@@ -2149,8 +2118,7 @@ impl AppState {
 
                         // If there are no more streams to the peer, close the connection.
                         if nonces.is_empty() {
-                            #[cfg(debug_assertions)]
-                            println!("{} Closing peer {peer_address} connection", local_now_fmt());
+                            tracing::debug!("Closing peer {peer_address} connection");
 
                             // Close the connection. Peer cleanup will happen in the next update when the connection is dropped.
                             connection.close(GOODBYE_CODE, GOODBYE_MESSAGE.as_bytes());
@@ -2161,10 +2129,7 @@ impl AppState {
                 t.progress = TransferProgress::Done(result);
             }
         } else {
-            eprintln!(
-                "{} No connected state to update transfer result",
-                local_now_fmt()
-            );
+            tracing::warn!("No connected state to update transfer result");
         }
         iced::Task::none()
     }
@@ -2187,7 +2152,7 @@ impl AppState {
                 transfers.remove(i);
             }
         } else {
-            eprintln!("{} No connected state to remove transfer", local_now_fmt());
+            tracing::warn!("No connected state to remove transfer");
         }
         iced::Task::none()
     }
@@ -2250,7 +2215,7 @@ impl AppState {
                 .and_then(|p| Ok(std::fs::File::create(p)?))
                 .and_then(|f| Ok(serde_json::to_writer_pretty(f, &self.options)?))
             {
-                eprintln!("{} Could not save settings: {e}", local_now_fmt());
+                tracing::warn!("Could not save settings: {e}");
             }
         };
 
@@ -2263,13 +2228,12 @@ impl AppState {
             iced::Task::perform(
                 tokio::time::timeout(port_mapping_timeout, async move {
                     if let Err((e, mapping)) = port_mapping.try_drop().await {
-                        eprintln!(
-                            "{} Could not safely remove port mapping: {e}: expires at {:#?}",
-                            local_now_fmt(),
+                        tracing::warn!(
+                            "Could not safely remove port mapping: {e}: expires at {:#?}",
                             mapping.expiration()
                         );
                     } else {
-                        println!("{} Port mapping safely removed", local_now_fmt());
+                        tracing::info!("Port mapping safely removed");
                     }
                 }),
                 // Force the close operation after completing the request or after a timeout.
@@ -2282,17 +2246,13 @@ impl AppState {
             match close_type {
                 // Immediately exit if there isn't a port mapping to remove.
                 CloseType::Application => {
-                    println!(
-                        "{} No work to do before exiting, closing now",
-                        local_now_fmt()
-                    );
-                    // iced::window::close(self.main_window.expect("Main window ID not found"))
+                    tracing::warn!("No work to do before exiting, closing now");
                     iced::exit()
                 }
 
                 // Close connections and return to the main screen.
                 CloseType::Connections => {
-                    println!("{} Exiting connected view to main screen", local_now_fmt());
+                    tracing::debug!("Exiting connected view to main screen");
                     self.connection_state = ConnectionState::Disconnected;
                     iced::Task::none()
                 }
@@ -2321,14 +2281,12 @@ async fn connected_peer_request_loop(
                 // Get the file hash desired by the peer.
                 let mut hash = HashBytes::default();
                 if let Err(e) = streams.recv.read_exact(&mut hash).await {
-                    eprintln!("{} Failed to read hash from peer: {e}", local_now_fmt());
+                    tracing::warn!("Failed to read hash from peer: {e}");
                     continue;
                 }
 
-                #[cfg(debug_assertions)]
-                println!(
-                    "{} Peer requested transfer: {peer_address} {}",
-                    local_now_fmt(),
+                tracing::debug!(
+                    "Peer requested transfer: {peer_address} {}",
                     faster_hex::hex_string(&hash)
                 );
 
@@ -2336,25 +2294,19 @@ async fn connected_peer_request_loop(
                     hash,
                     PeerRequestStream::new(connection.clone(), streams),
                 ))) {
-                    eprintln!(
-                        "{} Failed to perform internal message passing for peer requested stream: {e}",
-                        local_now_fmt()
+                    tracing::error!(
+                        "Failed to perform internal message passing for peer requested stream: {e}"
                     );
                 }
             }
 
             Err(e) => {
-                #[cfg(debug_assertions)]
-                println!(
-                    "{} Peer connection closed: {peer_address} {e:?}",
-                    local_now_fmt()
-                );
+                tracing::debug!("Peer connection closed: {peer_address} {e:?}");
 
                 // The peer has disconnected or the connection deteriorated.
                 if let Err(e) = output.try_send(Message::PeerDisconnected(peer_address)) {
-                    eprintln!(
-                        "{} Failed to perform internal message passing for failed peer stream: {e}",
-                        local_now_fmt()
+                    tracing::error!(
+                        "Failed to perform internal message passing for failed peer stream: {e}"
                     );
                 }
                 return;
@@ -2363,10 +2315,13 @@ async fn connected_peer_request_loop(
     }
 }
 
+/// For the given publish, await peers desiring to receive the file.
+#[tracing::instrument(skip(publish, cancellation_token, output))]
 async fn peers_requesting_publish_loop(
     publish: Publish,
     nonce: Nonce,
     cancellation_token: CancellationToken,
+    our_external_address: SocketAddr,
     mut output: futures_channel::mpsc::Sender<Message>,
 ) {
     loop {
@@ -2375,21 +2330,49 @@ async fn peers_requesting_publish_loop(
         tokio::select! {
             // Let the task be cancelled.
             () = cancellation_token.cancelled() => {
+                // Send data back to the server to tell them we are done with this task.
                 if let Err(e) = server.send.write_u8(0).await {
-                    eprintln!("{} Failed to tell server to cancel publish: {e}", local_now_fmt());
+                    let kind = e.kind();
+                    if let Ok(e) = e.downcast() {
+                        if matches!(e, crate::core::LOCALLY_CLOSED_WRITE) {
+                            // This error is expected in quick closes, don't warn.
+                            tracing::debug!("Closed endpoint before explicit publish cancel");
+                        } else {
+                            tracing::warn!("Failed to tell server to cancel publish: {e:?}");
+                        }
+                    } else {
+                        tracing::warn!("Failed to tell server to cancel publish of IO kind: {kind:?}");
+                    }
                 }
 
                 return;
             }
 
             // Await the server to send a peer connection.
-            result = crate::core::read_subscribing_peer(&mut server.recv) => {
+            result = crate::core::read_subscribing_peer(
+                &mut server.recv,
+                Some(our_external_address),
+            ) => {
+                if let Err(e) = &result {
+                    if matches!(
+                        e,
+                        crate::core::ReadSubscribingPeerError::ReadAddressFailed(
+                            quinn::ReadExactError::ReadError(crate::core::LOCALLY_CLOSED_READ))
+                        | crate::core::ReadSubscribingPeerError::ReadSizeFailedWithError(
+                            crate::core::LOCALLY_CLOSED_READ)
+                        | crate::core::ReadSubscribingPeerError::SelfAddress
+                    ) {
+                        tracing::debug!("Expected failure to read peer request for publish: {e:?}");
+                        return;
+                    }
+                    tracing::warn!("Failed to read peer request for publish: {e:?}");
+                }
                 if let Err(e) = output.try_send(Message::PublishPeerReceived(
                         nonce,
-                        result.map_err(Arc::new),
+                        result,
                     ))
                 {
-                    eprintln!("{} Failed to perform internal message passing for subscription peer: {e}", local_now_fmt());
+                    tracing::error!("Failed to perform internal message passing for subscription peer: {e}");
                 }
             }
         }
