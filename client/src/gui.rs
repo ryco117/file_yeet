@@ -19,7 +19,7 @@ use tokio::{io::AsyncWriteExt as _, sync::RwLock};
 use tokio_util::sync::CancellationToken;
 
 use crate::core::{
-    humanize_bytes, FileYeetCommandType, PortMappingConfig, PreparedConnection,
+    humanize_bytes, ConnectionsManager, FileYeetCommandType, PortMappingConfig, PreparedConnection,
     MAX_PEER_COMMUNICATION_SIZE, PEER_CONNECT_TIMEOUT, SERVER_CONNECTION_TIMEOUT,
 };
 
@@ -44,6 +44,9 @@ const MAX_SHUTDOWN_WAIT: Duration = Duration::from_secs(3);
 
 /// The red used to display errors to the user.
 const ERROR_RED_COLOR: iced::Color = iced::Color::from_rgb(1., 0.35, 0.45);
+
+/// Font capable of rendering emojis.
+pub static EMOJI_FONT: &[u8] = include_bytes!("../NotoEmoji-Regular.ttf");
 
 /// The state of the port mapping options in the GUI.
 #[derive(
@@ -124,7 +127,7 @@ pub enum TransferResult {
 enum TransferProgress {
     Connecting,
     Consent(PeerRequestStream),
-    Transferring(PeerRequestStream, Arc<RwLock<f32>>, f32),
+    Transferring(PeerRequestStream, Arc<RwLock<u64>>, f32),
     Done(TransferResult),
 }
 
@@ -208,7 +211,7 @@ impl PublishItem {
         self.state = PublishState::Publishing(Publish {
             server_streams,
             hash,
-            hash_hex: faster_hex::hex_string(&hash),
+            hash_hex: hash.to_string(),
             file_size,
         });
     }
@@ -283,7 +286,7 @@ struct ConnectedState {
     hash_input: String,
 
     /// Map of peer socket addresses to QUIC connections.
-    peers: HashMap<SocketAddr, (quinn::Connection, HashSet<Nonce>)>,
+    peers: HashMap<SocketAddr, HashSet<Nonce>>,
 
     /// List of download requests to peers.
     downloads: Vec<Transfer>,
@@ -394,6 +397,9 @@ pub enum Message {
 
     /// The result of a server connection attempt.
     ConnectResulted(Result<crate::core::PreparedConnection, Arc<anyhow::Error>>),
+
+    /// The port mapping has been updated.
+    PortMappingUpdated(Option<crab_nat::PortMapping>),
 
     /// Copy the server address to the clipboard.
     CopyServer,
@@ -596,6 +602,7 @@ impl AppState {
             Message::ConnectClicked => self.update_connect_clicked(),
             Message::AnimationTick => self.update_animation_tick(),
             Message::ConnectResulted(r) => self.update_connect_resulted(r),
+            Message::PortMappingUpdated(mapping) => self.update_port_mapping(mapping),
 
             // Copy the connected server address to the clipboard.
             Message::CopyServer => iced::clipboard::write(self.options.server_address.clone()),
@@ -622,7 +629,7 @@ impl AppState {
                     &mut self.connection_state
                 {
                     peers.remove(&peer_addr);
-                    crate::core::IncomingManager::get().blocking_remove_peer(&peer_addr);
+                    ConnectionsManager::instance().blocking_remove_peer(&peer_addr);
                 }
                 iced::Task::none()
             }
@@ -774,7 +781,6 @@ impl AppState {
             ConnectionState::Connected(ConnectedState {
                 endpoint,
                 external_address,
-                peers,
                 publishes,
                 ..
             }) => {
@@ -786,11 +792,47 @@ impl AppState {
                     iced::Subscription::run_with_id(
                         0,
                         iced::stream::channel(4, move |_output| {
-                            // incoming_peer_connection_loop(endpoint, output)
-                            crate::core::IncomingManager::manage_incoming_loop(endpoint)
+                            ConnectionsManager::manage_incoming_loop(endpoint)
                         }),
                     )
                 };
+
+                // Create a task to renew the port mapping in a loop.
+                let port_mapping = self.port_mapping.clone().into_iter().map(|mut mapping| {
+                    iced::Subscription::run_with_id(
+                        1,
+                        iced::stream::channel(2, move |mut output| async move {
+                            let mut last_lifetime = mapping.lifetime() as u64;
+                            let mut interval =
+                                crate::core::new_renewal_interval(last_lifetime).await;
+                            loop {
+                                interval.tick().await;
+                                match crate::core::renew_port_mapping(&mut mapping).await {
+                                    Ok(changed) if changed => {
+                                        if let Err(e) = output.try_send(
+                                            Message::PortMappingUpdated(Some(mapping.clone())),
+                                        ) {
+                                            let e = e.into_send_error();
+                                            tracing::error!(
+                                                "Failed to send port mapping update: {e}"
+                                            );
+                                        }
+                                        let lifetime = mapping.lifetime() as u64;
+                                        if lifetime != last_lifetime {
+                                            last_lifetime = lifetime;
+                                            interval =
+                                                crate::core::new_renewal_interval(lifetime).await;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("Failed to renew port mapping: {e}");
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }),
+                    )
+                });
 
                 // For each publish we listen to the server for new peers requesting the file.
                 let pubs = publishes.iter().filter_map(|publish| {
@@ -824,21 +866,28 @@ impl AppState {
                 });
 
                 // Create a listener for each peer that may want a new request stream.
-                let peer_requests = peers.iter().map(|(peer_addr, (connection, _))| {
-                    let peer_addr = *peer_addr;
-                    let connection = connection.clone();
-                    iced::Subscription::run_with_id(
-                        peer_addr,
-                        iced::stream::channel(8, move |output| {
-                            connected_peer_request_loop(connection, peer_addr, output)
-                        }),
-                    )
-                });
+                let peer_requests =
+                    ConnectionsManager::instance().filter_map(|(peer_addr, connection)| {
+                        let crate::core::IncomingPeerState::Connected(connection) = connection
+                        else {
+                            return None;
+                        };
+
+                        let peer_addr = *peer_addr;
+                        let connection = connection.clone();
+                        Some(iced::Subscription::run_with_id(
+                            peer_addr,
+                            iced::stream::channel(8, move |output| {
+                                connected_peer_request_loop(connection, peer_addr, output)
+                            }),
+                        ))
+                    });
 
                 // Batch all the listeners together.
                 iced::Subscription::batch(
                     [unhandled_events(), animation(), incoming_connections]
                         .into_iter()
+                        .chain(port_mapping)
                         .chain(pubs)
                         .chain(peer_requests),
                 )
@@ -1111,8 +1160,17 @@ impl AppState {
                             widget::text(pi.path.to_string_lossy()).size(12)
                         ),
                         widget::horizontal_space(),
-                        widget::button(widget::text("Copy Hash").size(12))
+                        widget::tooltip(
+                            widget::button(
+                                widget::text("📋")
+                                    .size(12)
+                                    .font(iced::Font::with_name("Noto Emoji"))
+                            )
                             .on_press(Message::CopyHash(p.hash_hex.clone())),
+                            "Copy hash to clipboard",
+                            widget::tooltip::Position::Bottom,
+                        )
+                        .style(widget::container::rounded_box),
                         widget::button(widget::text("Cancel").size(12))
                             .on_press(Message::CancelPublish(pi.nonce))
                     ),
@@ -1177,11 +1235,22 @@ impl AppState {
             }
         }
 
-        // Define a header exposing the server address and how the server sees us (our IP address).
+        // Define a header exposing the server address we are connected to
+        // and how the server sees us (our external IP address).
         let header = widget::row!(
             widget::text("Server address:"),
             widget::text(&self.options.server_address),
-            widget::button(widget::text("Copy").size(12)).on_press(Message::CopyServer),
+            widget::tooltip(
+                widget::button(
+                    widget::text("📋")
+                        .size(12)
+                        .font(iced::Font::with_name("Noto Emoji"))
+                )
+                .on_press(Message::CopyServer),
+                "Copy server address to clipboard",
+                widget::tooltip::Position::Bottom,
+            )
+            .style(widget::container::rounded_box),
             leave_server_button,
             widget::horizontal_space(),
             widget::text("Our External Address:"),
@@ -1249,7 +1318,16 @@ impl AppState {
             widget::column!(
                 header,
                 horizontal_line(),
-                widget::row!(publish_button, download_input).spacing(6),
+                widget::row!(
+                    widget::tooltip(
+                        publish_button,
+                        "Choose a file to share with peers",
+                        widget::tooltip::Position::Bottom,
+                    )
+                    .style(widget::container::rounded_box),
+                    download_input,
+                )
+                .spacing(6),
                 transfer_view_choice,
                 widget::scrollable(transfer_content),
             )
@@ -1417,17 +1495,24 @@ impl AppState {
     /// Update the state after a tick when animations are occurring.
     fn update_animation_tick(&mut self) -> iced::Task<Message> {
         match &mut self.connection_state {
+            // Update the spinner when connecting/stalling.
             ConnectionState::Stalling { tick, .. } => *tick = Instant::now(),
+
+            // Update the progress of transfers when connected.
             ConnectionState::Connected(ConnectedState {
                 downloads, uploads, ..
             }) => {
                 for t in downloads.iter_mut().chain(uploads.iter_mut()) {
                     if let TransferProgress::Transferring(_, lock, progress) = &mut t.progress {
                         // Update the progress bar with the most recent value.
-                        *progress = *lock.blocking_read();
+                        *progress = *lock.blocking_read() as f32 / t.file_size as f32;
+
+                        // TODO: Update the transfer speed in human readable units.
                     }
                 }
             }
+
+            // Do nothing in other states.
             ConnectionState::Disconnected => {}
         }
         iced::Task::none()
@@ -1480,6 +1565,19 @@ impl AppState {
                 self.status_message = Some(format!("Error connecting: {e}"));
                 self.connection_state = ConnectionState::Disconnected;
             }
+        }
+        iced::Task::none()
+    }
+
+    /// Update the state after a port mapping renewal led to a state change.
+    fn update_port_mapping(
+        &mut self,
+        port_mapping: Option<crab_nat::PortMapping>,
+    ) -> iced::Task<Message> {
+        if let Some(port_mapping) = port_mapping {
+            self.port_mapping = Some(port_mapping);
+        } else {
+            tracing::warn!("Port mapping renewal failed");
         }
         iced::Task::none()
     }
@@ -1623,7 +1721,6 @@ impl AppState {
     ) -> iced::Task<Message> {
         let ConnectionState::Connected(ConnectedState {
             endpoint,
-            peers,
             publishes,
             ..
         }) = &mut self.connection_state
@@ -1646,7 +1743,8 @@ impl AppState {
         match (result, publish) {
             // Attempt a new request stream from an existing or new peer connection.
             (Ok(peer), Some(publish)) => {
-                let data = if let Some((c, _)) = peers.get(&peer) {
+                tracing::debug!("Received peer {peer} for publish {}", &publish.hash,);
+                let data = if let Some(c) = ConnectionsManager::instance().get_connection(&peer) {
                     PeerConnectionOrTarget::Connection(c.clone())
                 } else {
                     PeerConnectionOrTarget::Target(endpoint.clone(), peer)
@@ -1714,12 +1812,12 @@ impl AppState {
         };
 
         let upload_nonce = rand::random();
-        let progress_lock = Arc::new(RwLock::new(0.));
+        let progress_lock = Arc::new(RwLock::new(0));
         let cancellation_token = CancellationToken::new();
         uploads.push(Transfer {
             nonce: upload_nonce,
             hash: publishing.hash,
-            hash_hex: faster_hex::hex_string(&publishing.hash),
+            hash_hex: publishing.hash.to_string(),
             file_size: publishing.file_size,
             peer_string: peer.connection.remote_address().to_string(),
             path: path.clone(),
@@ -1727,7 +1825,7 @@ impl AppState {
             cancellation_token: cancellation_token.clone(),
         });
 
-        insert_nonce_for_peer(peer.connection.clone(), peers, upload_nonce);
+        insert_nonce_for_peer(peer.connection.remote_address(), peers, upload_nonce);
 
         let file_size = publishing.file_size;
         iced::Task::perform(
@@ -1788,7 +1886,7 @@ impl AppState {
 
         // Ensure the hash is valid.
         let mut hash = HashBytes::default();
-        if let Err(e) = faster_hex::hex_decode(hash_input.as_bytes(), &mut hash) {
+        if let Err(e) = faster_hex::hex_decode(hash_input.as_bytes(), &mut hash.bytes) {
             let error = format!("Invalid hash: {e}");
             tracing::warn!("{error}");
             self.status_message = Some(error);
@@ -1835,7 +1933,7 @@ impl AppState {
         downloads.push(Transfer {
             nonce,
             hash,
-            hash_hex: faster_hex::hex_string(&transfer_base.hash),
+            hash_hex: transfer_base.hash.to_string(),
             file_size,
             peer_string: peer_socket.to_string(),
             path,
@@ -1867,7 +1965,6 @@ impl AppState {
                 if let ConnectionState::Connected(ConnectedState {
                     endpoint,
                     hash_input,
-                    peers,
                     downloads,
                     ..
                 }) = &mut self.connection_state
@@ -1899,7 +1996,9 @@ impl AppState {
                             // New connection attempt for this peer with result command identified by the nonce.
                             let task = {
                                 // Create a new connection or open a stream on an existing one.
-                                let peer = if let Some((c, _)) = peers.get(&peer) {
+                                let peer = if let Some(c) =
+                                    ConnectionsManager::instance().get_connection(&peer)
+                                {
                                     tracing::debug!("Reusing connection to peer {peer}");
                                     PeerConnectionOrTarget::Connection(c.clone())
                                 } else {
@@ -1966,7 +2065,7 @@ impl AppState {
 
         // Update the state of the transfer with the result.
         if let Some(peer_request) = result {
-            insert_nonce_for_peer(peer_request.connection.clone(), peers, nonce);
+            insert_nonce_for_peer(peer_request.connection.remote_address(), peers, nonce);
             transfer.progress = TransferProgress::Consent(peer_request);
         } else {
             // Remove unreachable peers from view.
@@ -1999,7 +2098,7 @@ impl AppState {
         };
 
         // Begin the transfer.
-        let byte_progress = Arc::new(RwLock::new(0.));
+        let byte_progress = Arc::new(RwLock::new(0));
         transfer.progress =
             TransferProgress::Transferring(peer_streams.clone(), byte_progress.clone(), 0.);
         let output_path = transfer.path.clone();
@@ -2113,7 +2212,7 @@ impl AppState {
                     if let std::collections::hash_map::Entry::Occupied(mut e) =
                         peers.entry(peer_address)
                     {
-                        let nonces = &mut e.get_mut().1;
+                        let nonces = e.get_mut();
                         nonces.remove(&nonce);
 
                         // If there are no more streams to the peer, close the connection.
@@ -2229,8 +2328,8 @@ impl AppState {
                 tokio::time::timeout(port_mapping_timeout, async move {
                     if let Err((e, mapping)) = port_mapping.try_drop().await {
                         tracing::warn!(
-                            "Could not safely remove port mapping: {e}: expires at {:#?}",
-                            mapping.expiration()
+                            "Could not safely remove port mapping: {e}: expires at {}",
+                            crate::core::instant_to_datetime_string(mapping.expiration()),
                         );
                     } else {
                         tracing::info!("Port mapping safely removed");
@@ -2246,7 +2345,7 @@ impl AppState {
             match close_type {
                 // Immediately exit if there isn't a port mapping to remove.
                 CloseType::Application => {
-                    tracing::warn!("No work to do before exiting, closing now");
+                    tracing::debug!("No work to do before exiting, closing now");
                     iced::exit()
                 }
 
@@ -2263,12 +2362,16 @@ impl AppState {
 
 /// Either an existing peer connection or a local endpoint and peer address to connect to.
 enum PeerConnectionOrTarget {
+    /// An existing peer connection.
     Connection(quinn::Connection),
+
+    /// A local endpoint and peer address to connect to.
     Target(quinn::Endpoint, SocketAddr),
 }
 
 /// A loop to await the server to send peers requesting the specified publish.
 /// An asynchronous loop to await new requests from a peer connection.
+#[tracing::instrument(skip(connection, output))]
 async fn connected_peer_request_loop(
     connection: quinn::Connection,
     peer_address: SocketAddr,
@@ -2280,15 +2383,12 @@ async fn connected_peer_request_loop(
             Ok(mut streams) => {
                 // Get the file hash desired by the peer.
                 let mut hash = HashBytes::default();
-                if let Err(e) = streams.recv.read_exact(&mut hash).await {
+                if let Err(e) = streams.recv.read_exact(&mut hash.bytes).await {
                     tracing::warn!("Failed to read hash from peer: {e}");
                     continue;
                 }
 
-                tracing::debug!(
-                    "Peer requested transfer: {peer_address} {}",
-                    faster_hex::hex_string(&hash)
-                );
+                tracing::debug!("Peer requested transfer: {hash}");
 
                 if let Err(e) = output.try_send(Message::PeerRequestedTransfer((
                     hash,
@@ -2404,21 +2504,18 @@ async fn try_peer_connection(
 
 /// Add the nonce of a transaction to a peer's set of known transactions.
 fn insert_nonce_for_peer(
-    connection: quinn::Connection,
-    peers: &mut HashMap<SocketAddr, (quinn::Connection, HashSet<Nonce>)>,
+    peer_address: SocketAddr,
+    peers: &mut HashMap<SocketAddr, HashSet<Nonce>>,
     nonce: Nonce,
 ) {
-    match peers.entry(connection.remote_address()) {
+    match peers.entry(peer_address) {
         std::collections::hash_map::Entry::Vacant(e) => {
             // Add the peer into our map of known peer addresses.
-            e.insert((connection, HashSet::from([nonce])));
+            e.insert(HashSet::from([nonce]));
         }
         std::collections::hash_map::Entry::Occupied(mut e) => {
             // Add the transfer nonce to the peer's set of known transfer nonces.
-            e.get_mut().1.insert(nonce);
-
-            // Overwrite existing connection in case of migration-like behavior.
-            e.get_mut().0 = connection;
+            e.get_mut().insert(nonce);
         }
     }
 }

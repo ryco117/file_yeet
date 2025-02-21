@@ -159,12 +159,11 @@ pub async fn prepare_server_connection(
         PortMappingConfig::PcpNatPmp(None) => {
             match try_port_mapping(gateway, local_address).await {
                 Ok(m) => {
-                    let p = m.external_port();
-                    tracing::info!(
-                        "Success mapping external port {gateway}:{p} -> internal {}",
-                        m.internal_port(),
-                    );
-                    (Some(m), Some(p))
+                    let external_port = m.external_port();
+                    let internal_port = m.internal_port();
+                    let expiration_time = instant_to_datetime_string(m.expiration());
+                    tracing::info!("Mapped external port {gateway}:{external_port} -> internal {internal_port}, expiration at {expiration_time}");
+                    (Some(m), Some(external_port))
                 }
                 Err(e) => {
                     tracing::warn!("Failed to create a port mapping: {e}");
@@ -246,6 +245,54 @@ async fn try_port_mapping(
     .await
 }
 
+/// Helper to convert an `Instant` into a `DateTime` string.
+pub fn instant_to_datetime_string(i: std::time::Instant) -> String {
+    chrono::TimeDelta::from_std(i.duration_since(std::time::Instant::now()))
+        .ok()
+        .and_then(|d| chrono::Local::now().checked_add_signed(d))
+        .map_or_else(
+            || String::from("UNKNOWN"),
+            |t| t.format("%Y-%m-%d %H:%M:%S").to_string(),
+        )
+}
+
+/// Helper to configure a waiting period based on a port mapping lifetime.
+pub async fn new_renewal_interval(lifetime: u64) -> tokio::time::Interval {
+    let mut interval = tokio::time::interval(Duration::from_secs(lifetime).div_f64(3.));
+    interval.tick().await; // Skip the first tick.
+    interval
+}
+
+/// Try to renew the port mapping.
+/// On success, returns whether any mapping parameters changed.
+#[tracing::instrument(skip_all)]
+pub async fn renew_port_mapping(
+    port_mapping: &mut crab_nat::PortMapping,
+) -> Result<bool, crab_nat::MappingFailure> {
+    tracing::debug!("Attempting port mapping renewal...");
+    let last_lifetime = port_mapping.lifetime();
+    let last_port = port_mapping.external_port();
+
+    port_mapping.renew().await?;
+    let mut mapping_changed = false;
+
+    let lifetime = port_mapping.lifetime();
+    if lifetime != last_lifetime {
+        tracing::debug!(
+            "Port mapping renewal changed lifetime from {last_lifetime} to {lifetime} seconds"
+        );
+        mapping_changed = true;
+    }
+
+    let port = port_mapping.external_port();
+    if port != last_port {
+        tracing::debug!("Port mapping renewal changed port from {last_port} to {port}");
+        mapping_changed = true;
+    }
+
+    Ok(mapping_changed)
+}
+
 /// Connect to the server using QUIC.
 #[tracing::instrument(skip(endpoint))]
 async fn connect_to_server(
@@ -276,7 +323,7 @@ async fn connect_to_server(
 
 /// Perform a socket ping request to the server and sanity check the response.
 /// Returns the server's address and the string encoding it was sent as.
-#[tracing::instrument(skip(server_connection))]
+#[tracing::instrument(skip_all)]
 pub async fn socket_ping_request(
     server_connection: &quinn::Connection,
 ) -> anyhow::Result<(SocketAddr, String)> {
@@ -341,7 +388,7 @@ pub async fn publish(
     // Format a publish request.
     bb.clear();
     bb.put_u16(file_yeet_shared::ClientApiRequest::Publish as u16);
-    bb.put(&hash[..]);
+    bb.put(&hash.bytes[..]);
     bb.put_u64(file_size);
 
     // Send the server a publish request.
@@ -449,7 +496,7 @@ pub async fn subscribe(
     // Send the server a subscribe request.
     bb.clear();
     bb.put_u16(file_yeet_shared::ClientApiRequest::Subscribe as u16);
-    bb.put(&hash[..]);
+    bb.put(&hash.bytes[..]);
     server_streams
         .send
         .write_all(bb)
@@ -518,6 +565,7 @@ async fn expect_server_text(stream: &mut quinn::RecvStream, len: u16) -> anyhow:
 
 /// Attempt to connect to peer using UDP hole punching.
 /// Specifically, both peers attempt outgoing connections while listening for incoming connections.
+#[tracing::instrument(skip(endpoint, hash))]
 pub async fn udp_holepunch(
     cmd: FileYeetCommandType,
     hash: HashBytes,
@@ -525,7 +573,7 @@ pub async fn udp_holepunch(
     peer_address: SocketAddr,
 ) -> Option<(quinn::Connection, BiStream)> {
     // Poll incoming connections that are handled by a background task.
-    let manager = IncomingManager::get();
+    let manager = ConnectionsManager::instance();
     let listen_future = manager.await_peer(peer_address, PEER_LISTEN_TIMEOUT);
 
     // Attempt to connect to the peer's public address.
@@ -543,7 +591,7 @@ pub async fn udp_holepunch(
         //       the result could be used to determine which stream to use (highest/lowest resulting nonce after XOR).
         match cmd {
             FileYeetCommandType::Pub => listen_stream.map(|c| (c, true)).into_iter().chain(connect_stream.map(|c| (c, false)).into_iter()),
-            FileYeetCommandType::Sub => connect_stream.map(|c: quinn::Connection| (c, false)).into_iter().chain(listen_stream.map(|c| (c, true)).into_iter()),
+            FileYeetCommandType::Sub => connect_stream.map(|c| (c, false)).into_iter().chain(listen_stream.map(|c| (c, true)).into_iter()),
         };
 
     for (connection, managed_connection) in connections {
@@ -563,6 +611,7 @@ pub async fn udp_holepunch(
 }
 
 /// Try to finalize a peer connection attempt by turning it into a bi-directional stream.
+#[tracing::instrument(skip(connection, expected_hash))]
 pub async fn peer_connection_into_stream(
     connection: &quinn::Connection,
     expected_hash: HashBytes,
@@ -574,7 +623,7 @@ pub async fn peer_connection_into_stream(
             let mut r = connection.accept_bi().await;
             if let Ok(s) = &mut r {
                 let mut requested_hash = HashBytes::default();
-                s.1.read_exact(&mut requested_hash).await.ok()?;
+                s.1.read_exact(&mut requested_hash.bytes).await.ok()?;
 
                 // Ensure the requested hash matches the expected file hash.
                 if requested_hash != expected_hash {
@@ -591,7 +640,7 @@ pub async fn peer_connection_into_stream(
             let mut r = connection.open_bi().await;
             match &mut r {
                 Ok(s) => {
-                    s.0.write_all(&expected_hash).await.ok()?;
+                    s.0.write_all(&expected_hash.bytes).await.ok()?;
                     tracing::info!("New peer stream opened");
                 }
                 Err(e) => tracing::warn!("Failed to open a peer stream: {e}"),
@@ -606,7 +655,8 @@ pub async fn peer_connection_into_stream(
     }
 }
 
-/// Try to make outgoing connection to a peer at the given address.
+/// Make an outgoing connection attempt to a peer at the given address.
+#[tracing::instrument(skip(endpoint))]
 async fn connect_to_peer(
     endpoint: quinn::Endpoint,
     peer_address: SocketAddr,
@@ -667,13 +717,14 @@ pub enum DownloadError {
 
 /// Download a file from the peer. Initiates the download by consenting to the peer to receive the file.
 #[allow(clippy::cast_precision_loss)]
+#[tracing::instrument(skip(hash, peer_streams, bb, byte_progress))]
 pub async fn download_from_peer(
     hash: HashBytes,
     peer_streams: &mut BiStream,
     file_size: u64,
     output_path: &Path,
     bb: &mut bytes::BytesMut,
-    byte_progress: Option<&RwLock<f32>>,
+    byte_progress: Option<&RwLock<u64>>,
 ) -> Result<(), DownloadError> {
     // Open the file for writing.
     let mut file = tokio::fs::OpenOptions::new()
@@ -700,7 +751,6 @@ pub async fn download_from_peer(
 
     // Read from the peer and write to the file.
     let mut bytes_written = 0;
-    let file_size_f = file_size as f32;
     let mut hasher = sha2::Sha256::new();
     while bytes_written < file_size {
         // Read a natural amount of bytes from the peer.
@@ -731,7 +781,7 @@ pub async fn download_from_peer(
 
             // Update the caller with the number of bytes written.
             if let Some(progress) = byte_progress.as_ref() {
-                *progress.write().await = bytes_written as f32 / file_size_f;
+                *progress.write().await = bytes_written;
             }
         }
     }
@@ -743,8 +793,8 @@ pub async fn download_from_peer(
     }
 
     // Ensure the file hash is correct.
-    let downloaded_hash = hasher.finalize();
-    if hash != Into::<HashBytes>::into(downloaded_hash) {
+    let downloaded_hash = HashBytes::new(hasher.finalize().into());
+    if hash != downloaded_hash {
         return Err(DownloadError::HashMismatch);
     }
 
@@ -755,6 +805,7 @@ pub async fn download_from_peer(
 
 /// Get a file's size and its SHA-256 hash.
 #[allow(clippy::cast_precision_loss)]
+#[tracing::instrument(skip(progress))]
 pub async fn file_size_and_hash(
     file_path: &Path,
     progress: Option<&RwLock<f32>>,
@@ -798,18 +849,19 @@ pub async fn file_size_and_hash(
             *progress.write().await = bytes_hashed as f32 / size_float;
         }
     }
-    let hash: HashBytes = hasher.finalize().into();
+    let hash = HashBytes::new(hasher.finalize().into());
 
     Ok((file_size, hash))
 }
 
 /// Upload the file to the peer. Ensure they consent to the file size before sending the file.
 #[allow(clippy::cast_precision_loss)]
+#[tracing::instrument(skip(peer_streams, reader, byte_progress))]
 pub async fn upload_to_peer(
     peer_streams: &mut BiStream,
     file_size: u64,
     mut reader: tokio::io::BufReader<tokio::fs::File>,
-    byte_progress: Option<&RwLock<f32>>,
+    byte_progress: Option<&RwLock<u64>>,
 ) -> anyhow::Result<()> {
     // Read the peer's desired upload range.
     let start_index = peer_streams.recv.read_u64().await?;
@@ -828,7 +880,6 @@ pub async fn upload_to_peer(
     // Create a scratch space for reading data from the stream.
     let mut buf = [0; MAX_PEER_COMMUNICATION_SIZE];
     let mut bytes_sent = 0;
-    let upload_length_f = upload_length as f32;
 
     // Read from the file and write to the peer.
     while bytes_sent < upload_length {
@@ -856,7 +907,7 @@ pub async fn upload_to_peer(
 
         // Update the caller with the number of bytes sent to the peer.
         if let Some(progress) = byte_progress.as_ref() {
-            *progress.write().await = bytes_sent as f32 / upload_length_f;
+            *progress.write().await = bytes_sent;
         }
     }
 
@@ -882,17 +933,17 @@ pub enum IncomingPeerState {
     Connected(quinn::Connection),
 }
 
-/// A manager for incoming peer connections.
+/// A manager for incoming and connected peers.
 #[derive(Clone, Default)]
-pub struct IncomingManager {
+pub struct ConnectionsManager {
     map: Arc<RwLock<HashMap<SocketAddr, IncomingPeerState>>>,
 }
 
-impl IncomingManager {
-    /// Create a new `IncomingManager` reference to the singleton mapping the incoming connections.
-    pub fn get() -> Self {
-        static MANAGER: std::sync::LazyLock<IncomingManager> =
-            std::sync::LazyLock::<_>::new(IncomingManager::default);
+impl ConnectionsManager {
+    /// Get a smart pointer to the `IncomingManager` singleton that maps incoming and connected peers.
+    pub fn instance() -> Self {
+        static MANAGER: std::sync::LazyLock<ConnectionsManager> =
+            std::sync::LazyLock::<_>::new(ConnectionsManager::default);
         MANAGER.clone()
     }
 
@@ -911,10 +962,7 @@ impl IncomingManager {
                     match e.get_mut() {
                         // If the peer is already connected, return the connection.
                         IncomingPeerState::Connected(c) => {
-                            #[cfg(debug_assertions)]
-                            tracing::info!(
-                                "Awaited peer connection is already established: {peer_address}"
-                            );
+                            tracing::debug!("Awaited peer connection is already established");
 
                             return Some(c.clone());
                         }
@@ -922,7 +970,7 @@ impl IncomingManager {
                         // Otherwise, append another receiver to the list.
                         IncomingPeerState::Awaiting(v) => {
                             tracing::debug!(
-                                "Joining wait at index {} for peer connection: {peer_address}",
+                                "Joining wait at index {} for peer connection",
                                 v.len()
                             );
 
@@ -937,7 +985,7 @@ impl IncomingManager {
 
                 // No mapping exists for this peer address, create one.
                 std::collections::hash_map::Entry::Vacant(e) => {
-                    tracing::debug!("Creating wait for peer connection: {peer_address}");
+                    tracing::debug!("Creating wait for peer connection");
 
                     let (tx, rx) = tokio::sync::oneshot::channel();
                     e.insert(IncomingPeerState::Awaiting(vec![tx]));
@@ -957,6 +1005,7 @@ impl IncomingManager {
 
     /// Accept a peer connection and hand-off to any threads awaiting the connection.
     /// If a connection is mapped for the peer, it is replaced with the new connection.
+    #[tracing::instrument(skip_all)]
     pub async fn accept_peer(&self, connection: quinn::Connection) {
         let mut map = self.map.write().await;
         let peer_address = connection.remote_address();
@@ -988,17 +1037,19 @@ impl IncomingManager {
     }
 
     /// Remove a peer from the manager, with synchronous lock behavior.
+    #[tracing::instrument(skip(self))]
     pub fn blocking_remove_peer(&mut self, peer_address: &SocketAddr) {
         if self.map.blocking_write().remove(peer_address).is_none() {
-            tracing::debug!("Peer connection manager removed a non-existent peer: {peer_address}");
+            tracing::warn!("Connection manager removed a non-existent peer");
         } else {
-            tracing::debug!("Peer connection manager removed peer: {peer_address}");
+            tracing::debug!("Connection manager removed peer");
         }
     }
 
     /// Create a new task to manage incoming peer connections in the background.
+    #[tracing::instrument(skip_all)]
     pub async fn manage_incoming_loop(endpoint: quinn::Endpoint) {
-        let manager = Self::get();
+        let manager = Self::instance();
         while let Some(connecting) = endpoint.accept().await {
             let connecting = match connecting.accept() {
                 Ok(c) => c,
@@ -1024,6 +1075,23 @@ impl IncomingManager {
         }
 
         tracing::debug!("Incoming peer connection loop closed");
+    }
+
+    /// Iterate over all peers and collect the result.
+    pub fn filter_map<F, T>(&self, map: F) -> Vec<T>
+    where
+        F: Fn((&SocketAddr, &IncomingPeerState)) -> Option<T>,
+    {
+        self.map.blocking_read().iter().filter_map(map).collect()
+    }
+
+    /// Get the connection state of a peer.
+    pub fn get_connection(&self, peer_address: &SocketAddr) -> Option<quinn::Connection> {
+        if let Some(IncomingPeerState::Connected(c)) = self.map.blocking_read().get(peer_address) {
+            Some(c.clone())
+        } else {
+            None
+        }
     }
 }
 

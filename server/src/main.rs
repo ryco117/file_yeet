@@ -537,7 +537,7 @@ async fn handle_publish(
     let mut hash = HashBytes::default();
     client_streams
         .recv
-        .read_exact(&mut hash)
+        .read_exact(&mut hash.bytes)
         .await
         .map_err(|_| {
             ClientRequestError::IoError(std::io::Error::from(std::io::ErrorKind::UnexpectedEof))
@@ -580,7 +580,7 @@ async fn handle_publish(
     let cancellation_token = session.read().await.cancellation_token.clone();
 
     task_master.spawn(async move {
-        let hash_hex = faster_hex::hex_string(&hash);
+        let hash_hex = hash.to_string();
 
         tokio::select! {
             // Allow the server to cancel the task.
@@ -616,7 +616,7 @@ async fn handle_subscribe(
     let mut hash = HashBytes::default();
     client_streams
         .recv
-        .read_exact(&mut hash)
+        .read_exact(&mut hash.bytes)
         .await
         .map_err(|_| {
             ClientRequestError::IoError(std::io::Error::from(std::io::ErrorKind::UnexpectedEof))
@@ -625,15 +625,7 @@ async fn handle_subscribe(
     // Attempt to get the client from the map.
     let read_lock = clients.read().await;
     let Some(client_list) = read_lock.get(&hash).filter(|v| !v.is_empty()) else {
-        #[cfg(debug_assertions)]
-        {
-            let mut hex_hash_bytes = [0; 2 * file_yeet_shared::HASH_BYTE_COUNT];
-            tracing::debug!(
-                "Failed to find client for hash {}",
-                faster_hex::hex_encode(&hash, &mut hex_hash_bytes)
-                    .expect("Failed to encode hash in hexadecimal"),
-            );
-        }
+        tracing::debug!("Failed to find client for hash {hash}");
 
         // Send the subscriber a message that no publishers are available.
         client_streams
@@ -709,7 +701,7 @@ async fn handle_introduction(
     let mut hash = HashBytes::default();
     client_streams
         .recv
-        .read_exact(&mut hash)
+        .read_exact(&mut hash.bytes)
         .await
         .map_err(|_| {
             ClientRequestError::IoError(std::io::Error::from(std::io::ErrorKind::UnexpectedEof))
@@ -731,15 +723,7 @@ async fn handle_introduction(
     // Attempt to get the clients from the file-hash map.
     let read_lock = clients.read().await;
     let Some(client_list) = read_lock.get(&hash).filter(|v| !v.is_empty()) else {
-        #[cfg(debug_assertions)]
-        {
-            let mut hex_hash_bytes = [0; 2 * file_yeet_shared::HASH_BYTE_COUNT];
-            tracing::debug!(
-                "Failed to find client for hash {}",
-                faster_hex::hex_encode(&hash, &mut hex_hash_bytes)
-                    .expect("Failed to encode hash in hexadecimal"),
-            );
-        }
+        tracing::debug!("Failed to find client for hash {hash}");
 
         // Send the subscriber a message that no publishers are available.
         client_streams
@@ -768,7 +752,6 @@ async fn handle_introduction(
                     .await
                     .map_err(ClientRequestError::IoError)?;
 
-                #[cfg(debug_assertions)]
                 tracing::debug!("Introduced publisher {peer_address} to {sock_string}");
             }
 

@@ -15,10 +15,7 @@ pub const DEFAULT_PORT: NonZeroU16 = unsafe { std::num::NonZeroU16::new_unchecke
 pub const MAX_SERVER_COMMUNICATION_SIZE: usize = 1024;
 
 /// Using SHA-256 for the hash; i.e., a 256 bit / 8 byte hash.
-pub const HASH_BYTE_COUNT: usize = 32;
-
-/// A block of raw SHA-256 bytes.
-pub type HashBytes = [u8; HASH_BYTE_COUNT];
+pub const HASH_BYTE_COUNT: usize = 256 / 8;
 
 /// The maximum number of seconds of inactivity before a QUIC connection is closed.
 /// Same for both the server and the client.
@@ -29,6 +26,37 @@ pub const GOODBYE_CODE: quinn::VarInt = quinn::VarInt::from_u32(0);
 
 /// Optional polite message on a graceful disconnect.
 pub const GOODBYE_MESSAGE: &str = "Goodbye!";
+
+/// A block of raw SHA-256 bytes.
+#[derive(Clone, Copy, Default, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct HashBytes {
+    pub bytes: [u8; HASH_BYTE_COUNT],
+}
+impl HashBytes {
+    #[must_use]
+    pub fn new(bytes: [u8; HASH_BYTE_COUNT]) -> Self {
+        Self { bytes }
+    }
+}
+
+/// Implement a reasonable `Debug` for the `HashBytes` type.
+impl std::fmt::Debug for HashBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Hexadecimal requires 2 characters per byte.
+        let mut hex_str_bytes = [0u8; HASH_BYTE_COUNT << 1];
+
+        // Encode the hash bytes into a hexadecimal string.
+        let hex = faster_hex::hex_encode(&self.bytes, &mut hex_str_bytes)
+            .expect("Hex encoding of hash failed");
+        write!(f, "{hex}")
+    }
+}
+/// Implement a reasonable `Display` for the `HashBytes` type.
+impl std::fmt::Display for HashBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self, f)
+    }
+}
 
 /// A helper to access often used socket address info.
 #[derive(Clone, Debug)]

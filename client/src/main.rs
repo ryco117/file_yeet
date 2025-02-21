@@ -85,7 +85,7 @@ fn main() {
         let subscriber = tracing_subscriber::registry();
         if args.verbose {
             subscriber
-                .with(tracing_subscriber::fmt::layer())
+                .with(tracing_subscriber::fmt::layer().pretty())
                 .with(filter)
                 .init();
         } else {
@@ -114,6 +114,7 @@ fn main() {
         .exit_on_close_request(false)
         .subscription(gui::AppState::subscription)
         .theme(gui::AppState::theme)
+        .font(gui::EMOJI_FONT)
         .run_with(|| gui::AppState::new(args))
         {
             tracing::error!("GUI failed to run: {e}");
@@ -149,9 +150,43 @@ fn main() {
         .await
         .expect("Failed to perform basic connection setup");
 
-        // Create a background task to handle incoming peer connections.
         let mut task_master = TaskTracker::new();
-        task_master.spawn(core::IncomingManager::manage_incoming_loop(
+        let cancellation_token = CancellationToken::new();
+
+        if let Some(port_mapping) = &prepared_connection.port_mapping {
+            let mut port_mapping = port_mapping.clone();
+            let cancellation_token = cancellation_token.clone();
+
+            // Spawn a task to routinely renew the port mapping.
+            task_master.spawn(async move {
+                let mut last_lifetime = port_mapping.lifetime() as u64;
+                let mut interval = core::new_renewal_interval(last_lifetime).await;
+
+                loop {
+                    // Ensure the waiting period is cancellable.
+                    tokio::select! {
+                        () = cancellation_token.cancelled() => break,
+                        _ = interval.tick() => {}
+                    }
+
+                    // Attempt a port mapping renewal.
+                    match core::renew_port_mapping(&mut port_mapping).await {
+                        Err(e) => tracing::warn!("Failed to renew port mapping: {e}"),
+                        Ok(changed) if changed => {
+                            let lifetime = port_mapping.lifetime() as u64;
+                            if lifetime != last_lifetime {
+                                last_lifetime = lifetime;
+                                interval = core::new_renewal_interval(lifetime).await;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            });
+        }
+
+        // Create a background task to handle incoming peer connections.
+        task_master.spawn(core::ConnectionsManager::manage_incoming_loop(
             prepared_connection.endpoint.clone(),
         ));
 
@@ -159,8 +194,14 @@ fn main() {
         match cmd {
             // Try to hash and publish the file to the rendezvous server.
             FileYeetCommand::Pub { file_path } => {
-                if let Err(e) =
-                    publish_command(&prepared_connection, bb, file_path, &mut task_master).await
+                if let Err(e) = publish_command(
+                    &prepared_connection,
+                    bb,
+                    file_path,
+                    &mut task_master,
+                    cancellation_token,
+                )
+                .await
                 {
                     tracing::error!("Failed to publish the file: {e}");
                 }
@@ -173,6 +214,9 @@ fn main() {
                 {
                     tracing::error!("Failed to download the file: {e}");
                 }
+
+                // Download has completed, cancel any background tasks.
+                cancellation_token.cancel();
             }
         }
 
@@ -191,33 +235,34 @@ fn main() {
         if let Some(mapping) = prepared_connection.port_mapping {
             if let Err((e, m)) = mapping.try_drop().await {
                 tracing::warn!(
-                    "Failed to delete the port mapping with expiration {:?} : {e}",
-                    m.expiration()
+                    "Failed to delete the port mapping with expiration {} : {e}",
+                    core::instant_to_datetime_string(m.expiration()),
                 );
             } else {
-                tracing::info!("Successfully deleted the created port mapping");
+                tracing::info!("Successfully deleted the port mapping");
             }
         }
     });
 }
 
 /// Handle the CLI command to publish a file.
+#[tracing::instrument(skip_all)]
 async fn publish_command(
     prepared_connection: &PreparedConnection,
     bb: bytes::BytesMut,
     file_path: String,
     task_master: &mut TaskTracker,
+    cancellation_token: CancellationToken,
 ) -> anyhow::Result<()> {
     let file_path = std::path::Path::new(&file_path);
     let (file_size, hash) = match core::file_size_and_hash(file_path, None).await {
         Ok(t) => t,
         Err(e) => anyhow::bail!("Failed to hash file: {e}"),
     };
-    let mut hex_bytes = [0; 2 * file_yeet_shared::HASH_BYTE_COUNT];
     tracing::info!(
         "File {} has SHA-256 hash {} and size {} bytes",
         file_path.display(),
-        faster_hex::hex_encode(&hash, &mut hex_bytes).expect("Failed to use a valid hex buffer"),
+        &hash,
         humanize_bytes(file_size),
     );
 
@@ -228,7 +273,6 @@ async fn publish_command(
     } = prepared_connection;
 
     // Allow the publish loop to be cancelled by a Ctrl-C signal.
-    let cancellation_token = CancellationToken::new();
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("Ctrl-C detected, cancelling the publish");
@@ -241,6 +285,7 @@ async fn publish_command(
 }
 
 /// Handle the CLI command to subscribe to a file.
+#[tracing::instrument(skip_all)]
 async fn subscribe_command(
     prepared_connection: &PreparedConnection,
     mut bb: bytes::BytesMut,
@@ -248,7 +293,7 @@ async fn subscribe_command(
     output_path: Option<String>,
 ) -> anyhow::Result<()> {
     let mut hash = HashBytes::default();
-    if let Err(e) = faster_hex::hex_decode(sha256_hex.as_bytes(), &mut hash) {
+    if let Err(e) = faster_hex::hex_decode(sha256_hex.as_bytes(), &mut hash.bytes) {
         anyhow::bail!("Failed to parse hex hash: {e}");
     };
 
@@ -258,7 +303,7 @@ async fn subscribe_command(
             let mut output = std::env::temp_dir();
             let mut hex_bytes = [0; 2 * file_yeet_shared::HASH_BYTE_COUNT];
             output.push(
-                faster_hex::hex_encode(&hash, &mut hex_bytes)
+                faster_hex::hex_encode(&hash.bytes, &mut hex_bytes)
                     .expect("Failed to use a valid hex buffer"),
             );
             output
@@ -345,6 +390,7 @@ async fn subscribe_command(
 }
 
 /// Enter a loop to listen for the server to send peer socket addresses requesting our publish.
+#[tracing::instrument(skip_all)]
 async fn publish_loop(
     endpoint: &quinn::Endpoint,
     server_connection: &quinn::Connection,
