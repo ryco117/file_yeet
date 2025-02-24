@@ -100,7 +100,7 @@ fn main() {
     let Some(cmd) = args.cmd else {
         // If Windows, ensure we aren't displaying an unwanted console window.
         #[cfg(all(target_os = "windows", not(debug_assertions)))]
-        {
+        if !args.verbose {
             tracing::info!("Freeing Windows console for GUI");
             win_cmd::free_allocated_console();
         }
@@ -111,10 +111,14 @@ fn main() {
             gui::AppState::update,
             gui::AppState::view,
         )
-        .exit_on_close_request(false)
         .subscription(gui::AppState::subscription)
         .theme(gui::AppState::theme)
         .font(gui::EMOJI_FONT)
+        .window(iced::window::Settings {
+            min_size: Some(iced::Size::new(850., 300.)),
+            exit_on_close_request: false,
+            ..Default::default()
+        })
         .run_with(|| gui::AppState::new(args))
         {
             tracing::error!("GUI failed to run: {e}");

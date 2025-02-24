@@ -74,6 +74,34 @@ pub struct PreparedConnection {
     pub external_address: (SocketAddr, String),
 }
 
+/// Errors that may occur when preparing a server connection and endpoint to communicate with.
+#[derive(Debug, thiserror::Error)]
+pub enum PrepareConnectionError {
+    #[error("Invalid server address: {0}")]
+    ServerAddress(std::io::Error),
+
+    #[error("Failed to create local endpoint: {0}")]
+    EndpointCreation(std::io::Error),
+
+    #[error("Failed to connect to server: {0}")]
+    ConnectToServer(#[from] ConnectToServerError),
+
+    #[error("Failed to determine our local address: {0}")]
+    LocalAddress(#[from] ProbeLocalAddressError),
+
+    #[error("Invalid gateway address: {0}")]
+    InvalidGatewayAddress(std::net::AddrParseError),
+
+    #[error("Unknown gateway address: {0}")]
+    UnknownGatewayAddress(String),
+
+    #[error("Socket ping request failed: {0}")]
+    SocketPing(#[from] SocketPingError),
+
+    #[error("Port override request failed: {0}")]
+    PortOverride(#[from] PortOverrideError),
+}
+
 /// Create a QUIC endpoint connected to the server and perform basic setup.
 /// Will attempt to infer optional arguments from the system if not specified.
 #[tracing::instrument(skip_all)]
@@ -84,7 +112,7 @@ pub async fn prepare_server_connection(
     internal_port: Option<NonZeroU16>,
     external_port_config: PortMappingConfig,
     bb: &mut bytes::BytesMut,
-) -> anyhow::Result<PreparedConnection> {
+) -> Result<PreparedConnection, PrepareConnectionError> {
     // Create a self-signed certificate for the peer communications.
     let (server_cert, server_key) = file_yeet_shared::generate_self_signed_cert()
         .expect("Failed to generate self-signed certificate");
@@ -95,7 +123,8 @@ pub async fn prepare_server_connection(
     server_config.transport_config(file_yeet_shared::server_transport_config());
 
     // Get the server address info.
-    let server_socket = file_yeet_shared::get_server_or_default(server_address, server_port)?;
+    let server_socket = file_yeet_shared::get_server_or_default(server_address, server_port)
+        .map_err(PrepareConnectionError::ServerAddress)?;
     tracing::info!("Connecting to server {server_socket:?}");
 
     // Determine the local socket address to bind to. Use an unspecified address since we don't have any preference.
@@ -106,7 +135,8 @@ pub async fn prepare_server_connection(
             SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, bind_port, 0, 0))
         }
     };
-    let mut endpoint = quinn::Endpoint::server(server_config, bind_address)?;
+    let mut endpoint = quinn::Endpoint::server(server_config, bind_address)
+        .map_err(PrepareConnectionError::EndpointCreation)?;
 
     // Use an insecure client configuration when connecting to peers.
     // TODO: Use a secure client configuration when connecting to the server.
@@ -130,10 +160,12 @@ pub async fn prepare_server_connection(
     // Attempt to get a port forwarding, starting with user's override and then attempting NAT-PMP and PCP.
     let gateway = if let Some(g) = suggested_gateway {
         // Parse the string to an IP address.
-        g.parse()?
+        g.parse()
+            .map_err(PrepareConnectionError::InvalidGatewayAddress)?
     } else {
         // Determine the default gateway.
-        let gateway = netdev::get_default_gateway().map_err(|s| anyhow::anyhow!(s))?;
+        let gateway =
+            netdev::get_default_gateway().map_err(PrepareConnectionError::UnknownGatewayAddress)?;
 
         // Use the local address as preference for which IP version to use.
         if local_address.is_ipv4() {
@@ -201,16 +233,32 @@ pub async fn prepare_server_connection(
     })
 }
 
+/// Errors that may occur when attempting to get the default interface's IP address.
+#[derive(Debug, thiserror::Error)]
+pub enum ProbeLocalAddressError {
+    /// Failed to get the default interface.
+    #[error("Failed to get a default interface: {0}")]
+    DefaultInterface(String),
+
+    /// Failed to get a default IPv4 address.
+    #[error("Failed to get a default IPv4 address")]
+    NoDefaultIpv4,
+
+    /// Failed to get a default IPv6 address.
+    #[error("Failed to get a default IPv6 address")]
+    NoDefaultIpv6,
+}
+
 /// Helper to determine the default interface's IP address.
-fn probe_local_address(using_ipv4: bool) -> anyhow::Result<IpAddr> {
-    let interface = netdev::get_default_interface()
-        .map_err(|e| anyhow::anyhow!("Failed to get a default interface: {e}"))?;
+fn probe_local_address(using_ipv4: bool) -> Result<IpAddr, ProbeLocalAddressError> {
+    let interface =
+        netdev::get_default_interface().map_err(ProbeLocalAddressError::DefaultInterface)?;
     let ip = if using_ipv4 {
         IpAddr::V4(
             interface
                 .ipv4
                 .first()
-                .ok_or_else(|| anyhow::anyhow!("Failed to get a default IPv4 address"))?
+                .ok_or(ProbeLocalAddressError::NoDefaultIpv4)?
                 .addr(),
         )
     } else {
@@ -218,7 +266,7 @@ fn probe_local_address(using_ipv4: bool) -> anyhow::Result<IpAddr> {
             interface
                 .ipv6
                 .first()
-                .ok_or_else(|| anyhow::anyhow!("Failed to get a default IPv6 address"))?
+                .ok_or(ProbeLocalAddressError::NoDefaultIpv6)?
                 .addr(),
         )
     };
@@ -293,32 +341,60 @@ pub async fn renew_port_mapping(
     Ok(mapping_changed)
 }
 
+/// Error that may occur when attempting to connect to the server.
+#[derive(Debug, thiserror::Error)]
+pub enum ConnectToServerError {
+    /// Failed to begin a QUIC connection to the server.
+    #[error("Failed to begin a QUIC connection to the server: {0}")]
+    Connect(#[from] quinn::ConnectError),
+
+    /// Failed to complete the QUIC connection to the server.
+    #[error("Failed to complete a QUIC connection to the server: {0}")]
+    Connection(#[from] quinn::ConnectionError),
+
+    /// The connection attempt timed out without a specific error.
+    #[error("Failed to establish a QUIC connection to the server: Timeout {0:#}")]
+    Timeout(#[from] tokio::time::error::Elapsed),
+}
+
 /// Connect to the server using QUIC.
 #[tracing::instrument(skip(endpoint))]
 async fn connect_to_server(
     endpoint: &quinn::Endpoint,
     server_socket: SocketAddrHelper,
-) -> anyhow::Result<quinn::Connection> {
-    // Reused error message string.
-    const SERVER_CONNECTION_ERR: &str = "Failed to establish a QUIC connection to the server";
-
+) -> Result<quinn::Connection, ConnectToServerError> {
     // Attempt to connect to the server using QUIC.
-    let connection = match tokio::time::timeout(
+    let connection = tokio::time::timeout(
         SERVER_CONNECTION_TIMEOUT,
         endpoint.connect(server_socket.address, server_socket.hostname.as_str())?,
     )
-    .await
-    {
-        Ok(Ok(c)) => c,
-        Ok(Err(e)) => {
-            anyhow::bail!("{SERVER_CONNECTION_ERR}: {e}");
-        }
-        Err(e) => {
-            anyhow::bail!("{SERVER_CONNECTION_ERR}: Timeout {e:#}");
-        }
-    };
+    .await??;
     tracing::info!("QUIC connection made to the server");
     Ok(connection)
+}
+
+/// Errors that may occur when sending a ping request.
+#[derive(Debug, thiserror::Error)]
+pub enum SocketPingError {
+    /// Failed to establish a new QUIC stream for the ping request.
+    #[error("Failed to establish ping connection: {0}")]
+    Connection(#[from] quinn::ConnectionError),
+
+    /// Failed to send the ping request.
+    #[error("Failed to send ping: {0}")]
+    SendRequest(std::io::Error),
+
+    /// Failed to read ping response size.
+    #[error("Failed to read ping response size: {0}")]
+    ReadSize(std::io::Error),
+
+    /// Failed to read response text.
+    #[error("Failed to read ping response text: {0}")]
+    ResponseText(#[from] ExpectedTextError),
+
+    /// Failed to parse the response socket address.
+    #[error("Failed to parse the response address: {0}")]
+    ParseAddress(#[from] std::net::AddrParseError),
 }
 
 /// Perform a socket ping request to the server and sanity check the response.
@@ -326,7 +402,7 @@ async fn connect_to_server(
 #[tracing::instrument(skip_all)]
 pub async fn socket_ping_request(
     server_connection: &quinn::Connection,
-) -> anyhow::Result<(SocketAddr, String)> {
+) -> Result<(SocketAddr, String), SocketPingError> {
     // Create a bi-directional stream to the server.
     let mut server_streams: BiStream = server_connection.open_bi().await?.into();
 
@@ -335,14 +411,31 @@ pub async fn socket_ping_request(
     server_streams
         .send
         .write_u16(file_yeet_shared::ClientApiRequest::SocketPing as u16)
+        .map_err(SocketPingError::SendRequest)
         .await?;
 
     // Read the server's response to the sanity check.
-    let string_len = server_streams.recv.read_u16().await?;
+    let string_len = server_streams
+        .recv
+        .read_u16()
+        .await
+        .map_err(SocketPingError::ReadSize)?;
     let sanity_check = expect_server_text(&mut server_streams.recv, string_len).await?;
     let sanity_check_addr = sanity_check.parse()?;
 
     Ok((sanity_check_addr, sanity_check))
+}
+
+/// Errors that may occur when sending a port override request.
+#[derive(Debug, thiserror::Error)]
+pub enum PortOverrideError {
+    /// Failed to establish a new QUIC stream for the port override request.
+    #[error("{0}")]
+    Connection(#[from] quinn::ConnectionError),
+
+    /// Failed to send the port override request.
+    #[error("{0}")]
+    SendRequest(#[from] quinn::WriteError),
 }
 
 /// Perform a port override request to the server.
@@ -351,7 +444,7 @@ pub async fn port_override_request(
     server_connection: &quinn::Connection,
     port: NonZeroU16,
     bb: &mut bytes::BytesMut,
-) -> anyhow::Result<()> {
+) -> Result<(), PortOverrideError> {
     // Create a bi-directional stream to the server.
     let mut server_streams: BiStream = server_connection.open_bi().await?.into();
 
@@ -366,6 +459,18 @@ pub async fn port_override_request(
     Ok(())
 }
 
+/// Errors that may occur when sending a publish request to the server.
+#[derive(Debug, thiserror::Error)]
+pub enum PublishError {
+    /// Failed to establish a new QUIC stream for the publish request.
+    #[error("Failed to open request stream: {0}")]
+    Connection(#[from] quinn::ConnectionError),
+
+    /// Failed to send the publish request.
+    #[error("Failed to send publish request: {0}")]
+    SendRequest(#[from] quinn::WriteError),
+}
+
 /// Perform a publish request to the server.
 #[tracing::instrument(skip(server_connection, bb))]
 pub async fn publish(
@@ -373,17 +478,9 @@ pub async fn publish(
     mut bb: bytes::BytesMut,
     hash: HashBytes,
     file_size: u64,
-) -> anyhow::Result<BiStream> {
+) -> Result<BiStream, PublishError> {
     // Create a bi-directional stream to the server.
-    let mut server_streams: BiStream = server_connection
-        .open_bi()
-        .await
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to open a bi-directional QUIC stream for a socket ping request {e}"
-            )
-        })?
-        .into();
+    let mut server_streams: BiStream = server_connection.open_bi().await?.into();
 
     // Format a publish request.
     bb.clear();
@@ -392,11 +489,7 @@ pub async fn publish(
     bb.put_u64(file_size);
 
     // Send the server a publish request.
-    server_streams
-        .send
-        .write_all(&bb)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to send a publish request to the server {e}"))?;
+    server_streams.send.write_all(&bb).await?;
 
     Ok(server_streams)
 }
@@ -406,7 +499,7 @@ pub async fn publish(
 pub enum ReadSubscribingPeerError {
     /// Failed to read response size from the server and got a `ReadError`.
     #[error("Failed to read response size from the server: {0}")]
-    ReadSizeFailedWithError(quinn::ReadError),
+    ReadSizeFailedWithError(#[from] quinn::ReadError),
 
     /// Failed to read response size from the server and got an `ErrorKind`.
     #[error("Failed to read response size from the server: {0}")]
@@ -418,15 +511,15 @@ pub enum ReadSubscribingPeerError {
 
     /// Failed to read peer address from the server.
     #[error("Failed to read peer address from the server: {0}")]
-    ReadAddressFailed(quinn::ReadExactError),
+    ReadAddressFailed(#[from] quinn::ReadExactError),
 
     /// The server did not send a valid UTF-8 response.
     #[error("The server did not send a valid UTF-8 response: {0}")]
-    InvalidUtf8(std::str::Utf8Error),
+    InvalidUtf8(#[from] std::str::Utf8Error),
 
     /// The server did not send a valid socket address string.
     #[error("The server did not send a valid socket address string: {0}")]
-    InvalidAddress(std::net::AddrParseError),
+    InvalidAddress(#[from] std::net::AddrParseError),
 
     /// The server sent our address back to us.
     #[error("The server sent our address back to us")]
@@ -454,16 +547,11 @@ pub async fn read_subscribing_peer(
     // Allocate scratch space for the maximum response size.
     let mut scratch_space = [0; MAX_SERVER_COMMUNICATION_SIZE];
     let peer_string_bytes = &mut scratch_space[..data_len as usize];
-    if let Err(e) = server_recv.read_exact(peer_string_bytes).await {
-        return Err(ReadSubscribingPeerError::ReadAddressFailed(e));
-    }
+    server_recv.read_exact(peer_string_bytes).await?;
 
     // Parse the response as a peer socket address or skip this message.
-    let peer_string =
-        std::str::from_utf8(peer_string_bytes).map_err(ReadSubscribingPeerError::InvalidUtf8)?;
-    let peer_address = peer_string
-        .parse()
-        .map_err(ReadSubscribingPeerError::InvalidAddress)?;
+    let peer_string = std::str::from_utf8(peer_string_bytes)?;
+    let peer_address = peer_string.parse()?;
 
     // Ensure the server isn't sending us our own address.
     if our_external_address.is_some_and(|a| a == peer_address) {
@@ -471,6 +559,34 @@ pub async fn read_subscribing_peer(
     }
 
     Ok(peer_address)
+}
+
+/// Errors that may occur when attempting to subscribe to a file.
+#[derive(Debug, thiserror::Error)]
+pub enum SubscribeError {
+    /// Failed to open a bi-directional QUIC stream for the subscribe request.
+    #[error("Failed to open a stream for the subscribe request: {0}")]
+    Connection(#[from] quinn::ConnectionError),
+
+    /// Failed to send a subscribe request to the server.
+    #[error("Failed to send a subscribe request to the server: {0}")]
+    SendRequest(#[from] quinn::WriteError),
+
+    /// Failed to read response size from the server and got a `ReadError`.
+    #[error("Failed to read response size from the server: {0}")]
+    ReadSizeFailedWithError(#[from] quinn::ReadError),
+
+    /// Failed to read response size from the server and got an `ErrorKind`.
+    #[error("Failed to read response size from the server: {0}")]
+    ReadSizeFailedWithKind(std::io::ErrorKind),
+
+    /// Failed to read response from the server.
+    #[error("Failed to read response from the server: {0}")]
+    ReadResponse(#[from] ExpectedTextError),
+
+    /// Failed to parse a peer address from the server response.
+    #[error("Failed to parse a peer address from the server response: {0}")]
+    ParseAddress(#[from] std::net::AddrParseError),
 }
 
 /// Perform a subscribe request to the server.
@@ -481,38 +597,30 @@ pub async fn subscribe(
     bb: &mut bytes::BytesMut,
     hash: HashBytes,
     our_external_address: Option<SocketAddr>,
-) -> anyhow::Result<Vec<(SocketAddr, u64)>> {
+) -> Result<Vec<(SocketAddr, u64)>, SubscribeError> {
     // Create a bi-directional stream to the server.
-    let mut server_streams: BiStream = server_connection
-        .open_bi()
-        .await
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to open a bi-directional QUIC stream for a socket ping request: {e}"
-            )
-        })?
-        .into();
+    let mut server_streams: BiStream = server_connection.open_bi().await?.into();
 
     // Send the server a subscribe request.
     bb.clear();
     bb.put_u16(file_yeet_shared::ClientApiRequest::Subscribe as u16);
     bb.put(&hash.bytes[..]);
-    server_streams
-        .send
-        .write_all(bb)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to send a subscribe request to the server: {e}"))?;
+    server_streams.send.write_all(bb).await?;
 
     tracing::info!("Requesting file with hash from the server...");
 
     // Determine if the server is responding with a success or failure.
-    let response_count = server_streams
-        .recv
-        .read_u16()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to read a u16 response from the server: {e}"))?;
+    let response_count = server_streams.recv.read_u16().await.map_err(|e| {
+        let kind = e.kind();
+        if let Ok(e) = e.downcast::<quinn::ReadError>() {
+            SubscribeError::ReadSizeFailedWithError(e)
+        } else {
+            SubscribeError::ReadSizeFailedWithKind(kind)
+        }
+    })?;
 
     if response_count == 0 {
+        // No peers are sharing the file.
         return Ok(Vec::with_capacity(0));
     }
 
@@ -521,18 +629,28 @@ pub async fn subscribe(
     // Parse each peer socket address and file size.
     for _ in 0..response_count {
         // Read the incoming peer address length.
-        let address_len = server_streams
-            .recv
-            .read_u8()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to read response from server: {e}"))?;
+        let address_len = server_streams.recv.read_u8().await.map_err(|e| {
+            let kind = e.kind();
+            if let Ok(e) = e.downcast::<quinn::ReadError>() {
+                SubscribeError::ReadSizeFailedWithError(e)
+            } else {
+                SubscribeError::ReadSizeFailedWithKind(kind)
+            }
+        })?;
 
         // Read the incoming peer address to memory.
         let peer_address_str =
             expect_server_text(&mut server_streams.recv, u16::from(address_len)).await?;
 
         // Read the incoming file size.
-        let file_size = server_streams.recv.read_u64().await?;
+        let file_size = server_streams.recv.read_u64().await.map_err(|e| {
+            let kind = e.kind();
+            if let Ok(e) = e.downcast::<quinn::ReadError>() {
+                SubscribeError::ReadSizeFailedWithError(e)
+            } else {
+                SubscribeError::ReadSizeFailedWithKind(kind)
+            }
+        })?;
 
         // Parse the peer address into a socket address.
         let peer_address = match peer_address_str.parse() {
@@ -554,9 +672,33 @@ pub async fn subscribe(
     Ok(peers)
 }
 
+/// Errors that may occur when attempting to read a UTF-8 string from a connection.
+#[derive(Debug, thiserror::Error)]
+pub enum ExpectedTextError {
+    /// Specified size was larger than the allowed maximum.
+    #[error("Specified size was larger than the allowed maximum")]
+    SizeExceeded,
+
+    /// Failed to read the expected number of bytes from the server.
+    #[error("{0}")]
+    ReadError(#[from] quinn::ReadExactError),
+
+    /// The bytes read were not valid UTF-8.
+    #[error("{0}")]
+    Utf8Error(#[from] std::str::Utf8Error),
+}
+
 /// Try to read a valid UTF-8 from the server until the expected length is reached.
 #[tracing::instrument(skip(stream))]
-async fn expect_server_text(stream: &mut quinn::RecvStream, len: u16) -> anyhow::Result<String> {
+async fn expect_server_text(
+    stream: &mut quinn::RecvStream,
+    len: u16,
+) -> Result<String, ExpectedTextError> {
+    // Ensure the expected max size is respected.
+    if len as usize > MAX_SERVER_COMMUNICATION_SIZE {
+        return Err(ExpectedTextError::SizeExceeded);
+    }
+
     let mut raw_bytes = [0; MAX_SERVER_COMMUNICATION_SIZE];
     let expected_slice = &mut raw_bytes[..len as usize];
     stream.read_exact(expected_slice).await?;
@@ -699,11 +841,11 @@ pub enum DownloadError {
     #[error("A file access error occurred: {0}")]
     FileAccess(std::io::Error),
 
-    #[error("An error occurred performing a QUIC read: {0}")]
-    QuicRead(quinn::ReadError),
+    #[error("An error occurred reading from peer: {0}")]
+    QuicRead(#[from] quinn::ReadError),
 
-    #[error("An error occurred performing a QUIC write: {0}")]
-    QuicWrite(quinn::WriteError),
+    #[error("An error occurred sending to peer: {0}")]
+    QuicWrite(#[from] quinn::WriteError),
 
     #[error("A file write error occurred: {0}")]
     FileWrite(std::io::Error),
@@ -717,7 +859,7 @@ pub enum DownloadError {
 
 /// Download a file from the peer. Initiates the download by consenting to the peer to receive the file.
 #[allow(clippy::cast_precision_loss)]
-#[tracing::instrument(skip(hash, peer_streams, bb, byte_progress))]
+#[tracing::instrument(skip(peer_streams, bb, byte_progress))]
 pub async fn download_from_peer(
     hash: HashBytes,
     peer_streams: &mut BiStream,
@@ -740,11 +882,7 @@ pub async fn download_from_peer(
     bb.clear();
     bb.put_u64(0); // Start at the beginning of the file.
     bb.put_u64(file_size); // Request the file's entire size.
-    peer_streams
-        .send
-        .write_all(bb)
-        .await
-        .map_err(DownloadError::QuicWrite)?;
+    peer_streams.send.write_all(bb).await?;
 
     // Create a scratch space for reading data from the stream.
     let mut buf = [0; MAX_PEER_COMMUNICATION_SIZE];
@@ -757,8 +895,7 @@ pub async fn download_from_peer(
         let size = peer_streams
             .recv
             .read(&mut buf)
-            .await
-            .map_err(DownloadError::QuicRead)?
+            .await?
             .ok_or(DownloadError::UnexpectedEof)?;
 
         if size > 0 {
@@ -799,8 +936,24 @@ pub async fn download_from_peer(
     }
 
     // Let the user know that the download is complete.
-    tracing::info!("Download complete: {}", output_path.display());
+    tracing::info!("Download complete");
     Ok(())
+}
+
+/// Errors that may occur when attempting to get a file's size and hash.
+#[derive(Debug, thiserror::Error)]
+pub enum FileAccessError {
+    /// Failed to open the file.
+    #[error("Failed to open the file: {0}")]
+    Open(std::io::Error),
+
+    /// Failed to seek in the file.
+    #[error("Failed to seek in the file: {0}")]
+    Seek(std::io::Error),
+
+    /// Failed to read from the file.
+    #[error("Failed to read from the file: {0}")]
+    Read(std::io::Error),
 }
 
 /// Get a file's size and its SHA-256 hash.
@@ -809,25 +962,25 @@ pub async fn download_from_peer(
 pub async fn file_size_and_hash(
     file_path: &Path,
     progress: Option<&RwLock<f32>>,
-) -> anyhow::Result<(u64, HashBytes)> {
+) -> Result<(u64, HashBytes), FileAccessError> {
     let mut hasher = sha2::Sha256::new();
     let mut reader = tokio::io::BufReader::new(
         tokio::fs::File::open(file_path)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to open the file: {e}"))?,
+            .map_err(FileAccessError::Open)?,
     );
 
     // Get the file size so we can report progress.
     let file_size = reader
         .seek(std::io::SeekFrom::End(0))
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to seek in file: {e}"))?;
+        .map_err(FileAccessError::Seek)?;
 
     // Reset the reader to the start of the file.
     reader
         .seek(std::io::SeekFrom::Start(0))
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to seek in file: {e}"))?;
+        .map_err(FileAccessError::Seek)?;
 
     let size_float = file_size as f32;
     let mut hash_byte_buffer = [0; 8192];
@@ -836,7 +989,7 @@ pub async fn file_size_and_hash(
         let n = reader
             .read(&mut hash_byte_buffer)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to read from the file: {e}"))?;
+            .map_err(FileAccessError::Read)?;
         if n == 0 {
             break;
         }
@@ -854,6 +1007,34 @@ pub async fn file_size_and_hash(
     Ok((file_size, hash))
 }
 
+/// Errors that may occur when uploading a file to a peer.
+#[derive(Debug, thiserror::Error)]
+pub enum UploadError {
+    /// Failed to read file index data and got a `ReadError`.
+    #[error("Failed to read file index data: {0}")]
+    ReadFileIndexFailedWithError(quinn::ReadError),
+
+    /// Failed to read file index data and got an `ErrorKind`.
+    #[error("Failed to read file index data: {0}")]
+    ReadFileIndexFailedWithKind(std::io::ErrorKind),
+
+    /// The peer requested an invalid range.
+    #[error("Peer requested an invalid range, exceeds file size")]
+    InvalidRange,
+
+    /// The peer requested an invalid range.
+    #[error("Peer requested an invalid range, 64-bit overflow 🫠")]
+    RangeOverflow,
+
+    /// File access encountered an error.
+    #[error("File access encountered an error: {0}")]
+    FileAccess(#[from] FileAccessError),
+
+    /// Failed to write to the peer.
+    #[error("Failed to write to the peer: {0}")]
+    Write(#[from] quinn::WriteError),
+}
+
 /// Upload the file to the peer. Ensure they consent to the file size before sending the file.
 #[allow(clippy::cast_precision_loss)]
 #[tracing::instrument(skip(peer_streams, reader, byte_progress))]
@@ -862,20 +1043,37 @@ pub async fn upload_to_peer(
     file_size: u64,
     mut reader: tokio::io::BufReader<tokio::fs::File>,
     byte_progress: Option<&RwLock<u64>>,
-) -> anyhow::Result<()> {
+) -> Result<(), UploadError> {
     // Read the peer's desired upload range.
-    let start_index = peer_streams.recv.read_u64().await?;
-    let upload_length = peer_streams.recv.read_u64().await?;
+    let start_index = peer_streams.recv.read_u64().await.map_err(|e| {
+        let kind = e.kind();
+        if let Ok(e) = e.downcast::<quinn::ReadError>() {
+            UploadError::ReadFileIndexFailedWithError(e)
+        } else {
+            UploadError::ReadFileIndexFailedWithKind(kind)
+        }
+    })?;
+    let upload_length = peer_streams.recv.read_u64().await.map_err(|e| {
+        let kind = e.kind();
+        if let Ok(e) = e.downcast::<quinn::ReadError>() {
+            UploadError::ReadFileIndexFailedWithError(e)
+        } else {
+            UploadError::ReadFileIndexFailedWithKind(kind)
+        }
+    })?;
 
     // Sanity check the upload range.
     match start_index.checked_add(upload_length) {
-        Some(end) if end > file_size => anyhow::bail!("Invalid range requested, exceeds file size"),
-        None => anyhow::bail!("Invalid range requested, 64-bit overflow 🫠"),
-        Some(_) => {}
-    }
+        Some(end) if end > file_size => Err(UploadError::InvalidRange),
+        None => Err(UploadError::RangeOverflow),
+        Some(_) => Ok(()),
+    }?;
 
     // Ensure that the file reader is at the starting index for the upload.
-    reader.seek(std::io::SeekFrom::Start(start_index)).await?;
+    reader
+        .seek(std::io::SeekFrom::Start(start_index))
+        .await
+        .map_err(FileAccessError::Seek)?;
 
     // Create a scratch space for reading data from the stream.
     let mut buf = [0; MAX_PEER_COMMUNICATION_SIZE];
@@ -884,7 +1082,7 @@ pub async fn upload_to_peer(
     // Read from the file and write to the peer.
     while bytes_sent < upload_length {
         // Read a natural amount of bytes from the file.
-        let mut n = reader.read(&mut buf).await?;
+        let mut n = reader.read(&mut buf).await.map_err(FileAccessError::Read)?;
 
         if n == 0 {
             // Log that the file has ended unexpectedly. Possible corruption,
@@ -895,8 +1093,9 @@ pub async fn upload_to_peer(
 
         // Ensure we don't send more bytes than were requested in the range.
         let remaining = upload_length - bytes_sent;
-        if (n as u64) > remaining {
-            n = usize::try_from(remaining)?;
+        if n as u64 > remaining {
+            // `remaining` must be able to fit in `usize` since it is less than `n: usize`.
+            n = usize::try_from(remaining).unwrap();
         }
 
         // Write the bytes to the peer.

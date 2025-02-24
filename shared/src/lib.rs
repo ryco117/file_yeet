@@ -180,7 +180,8 @@ pub fn server_transport_config() -> Arc<quinn::TransportConfig> {
 /// Generate a self-signed certificate for use with QUIC.
 /// # Errors
 /// Fails if `rcgen` fails to generate a certificate or if `rustls` fails to parse the resulting certificate.
-pub fn generate_self_signed_cert<'a>() -> anyhow::Result<(CertificateDer<'a>, PrivateKeyDer<'a>)> {
+pub fn generate_self_signed_cert<'a>(
+) -> Result<(CertificateDer<'a>, PrivateKeyDer<'a>), rcgen::Error> {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])?;
     let cert_der = CertificateDer::from(cert.cert);
     let key = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
