@@ -9,7 +9,7 @@ anyhow = "1.0"
 bytes = "1.10"
 chrono = "0.4"
 clap = { version = "4.5", features = ["derive"] }
-crab_nat = "0.7"
+crab_nat = { version = "0.7", features = ["tracing"] }
 dirs = "6.0"
 displaydoc = "0.2"
 faster-hex = "0.10"
@@ -18,7 +18,7 @@ futures-channel = "0.3"
 futures-util = "0.3"
 human_bytes = { version = "0.4", features = ["fast"] }
 iced = { version = "0.13", features = ["tokio"] }
-netdev = "0.32"
+netdev = "0.33"
 open = "5.3"
 quinn = "0.11"
 rand = "0.9"

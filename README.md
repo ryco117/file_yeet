@@ -2,7 +2,7 @@
 
 A minimal client/server model to allow peers to share files directly by using a rendezvous server for peer discovery to establish a peer-to-peer connection.
 
-Uses UDP hole punching and [port mapping techniques](https://crates.io/crates/crab_nat) to allow peers to transfer data directly. Special thanks to [TheOnlyArtz](https://github.com/TheOnlyArtz) for [this repo](https://github.com/TheOnlyArtz/rust-tcp-holepunch) because it served as a reference for hole punching techniques.
+Uses UDP hole punching and [port mapping techniques](https://crates.io/crates/crab_nat) to allow peers to transfer data directly.
 
 ## Usage
 

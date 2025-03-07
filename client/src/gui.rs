@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    ffi::OsStr,
     net::SocketAddr,
     num::NonZeroU16,
     ops::Div as _,
@@ -17,9 +18,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::core::{
     humanize_bytes, peer_connection_into_stream, udp_holepunch, ConnectionsManager,
-    FileYeetCommandType, PortMappingConfig, PrepareConnectionError, PreparedConnection,
-    ReadSubscribingPeerError, SubscribeError, MAX_PEER_COMMUNICATION_SIZE, PEER_CONNECT_TIMEOUT,
-    SERVER_CONNECTION_TIMEOUT,
+    FileAccessError, FileYeetCommandType, PortMappingConfig, PrepareConnectionError,
+    PreparedConnection, ReadSubscribingPeerError, SubscribeError, HASH_EXT_REGEX,
+    MAX_PEER_COMMUNICATION_SIZE, PEER_CONNECT_TIMEOUT, SERVER_CONNECTION_TIMEOUT,
 };
 
 /// The string corresponding to a regex pattern for matching valid IPv6 addresses.
@@ -158,8 +159,8 @@ impl TransferSnapshot {
         self.instant = now;
 
         if let (Some(byte_difference), true) = (byte_difference, duration > 0.) {
-            let bytes_per_second = byte_difference as f64 / duration;
-            self.human_readable = format!("{}/s", human_bytes::human_bytes(bytes_per_second));
+            let bytes_per_second = human_bytes::human_bytes(byte_difference as f64 / duration);
+            self.human_readable = format!("{bytes_per_second}/s");
         } else {
             tracing::warn!(
                 "Transfer snapshot given invalid parameters: {duration}, {byte_difference:?}"
@@ -169,17 +170,48 @@ impl TransferSnapshot {
 }
 
 /// The state of a file transfer with a peer.
+//  TODO: Separate progress enum for uploads and downloads. Consider using a trait if there is a
+//        usecase for sharing certain aspects.
 #[derive(Debug)]
-enum TransferProgress {
+enum TransferState {
+    /// The transfer is awaiting a connection attempt. Only used for downloads.
     Connecting,
+
+    /// The transfer is awaiting user confirmation. Only used for downloads.
     Consent(PeerRequestStream),
+
+    /// The transfer is in progress.
     Transferring {
-        request: PeerRequestStream,
+        peer: quinn::Connection,
         progress_lock: Arc<RwLock<u64>>,
         progress_animation: f32,
         snapshot: TransferSnapshot,
     },
+
+    /// The transfer has been paused. Only used for downloads.
+    Paused,
+
+    /// Resuming a download by hashing the partial file. Only used for downloads.
+    ResumingHash(Arc<RwLock<f32>>),
+
+    /// The transfer has completed.
     Done(TransferResult),
+}
+impl TransferState {
+    /// If the progress state contains a peer connection, return it.
+    /// Otherwise, return `None`.
+    pub fn connection(&self) -> Option<&quinn::Connection> {
+        match self {
+            // Connection in these states.
+            TransferState::Consent(PeerRequestStream { connection, .. })
+            | TransferState::Transferring {
+                peer: connection, ..
+            } => Some(connection),
+
+            // No connection in remaining states.
+            _ => None,
+        }
+    }
 }
 
 /// A file transfer with a peer in any state.
@@ -191,16 +223,16 @@ struct Transfer {
     pub file_size: u64,
     pub peer_string: String,
     pub path: PathBuf,
-    pub progress: TransferProgress,
+    pub progress: TransferState,
     pub cancellation_token: CancellationToken,
 }
 
-/// The fundamental elements of a file transfer.
+/// The elements of a saved download transfer with partial or no progress.
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
-pub struct TransferBase {
+pub struct SavedDownload {
     pub hash: HashBytes,
     pub file_size: u64,
-    pub peer_socket: SocketAddr,
+    pub peer_socket: Option<SocketAddr>,
     pub path: PathBuf,
 }
 
@@ -208,7 +240,7 @@ pub struct TransferBase {
 #[derive(Debug, thiserror::Error)]
 pub enum PublishFileFailure {
     #[error("{0}")]
-    FileAccess(#[from] crate::core::FileAccessError),
+    FileAccess(#[from] FileAccessError),
 
     #[error("{0}")]
     Publish(#[from] crate::core::PublishError),
@@ -391,6 +423,12 @@ impl ConnectedState {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum CancelOrPause {
+    Cancel,
+    Pause,
+}
+
 /// The state of the connection to a `file_yeet` server.
 #[derive(Debug, Default)]
 enum ConnectionState {
@@ -431,7 +469,7 @@ struct AppSettings {
     pub internal_port_text: String,
     pub port_mapping: PortMappingGuiOptions,
     pub last_publishes: Vec<SavedPublish>,
-    pub last_downloads: Vec<TransferBase>,
+    pub last_downloads: Vec<SavedDownload>,
 }
 
 /// The state of the application for interacting with the GUI.
@@ -489,8 +527,6 @@ pub enum Message {
     /// All async actions to leave a server have completed.
     LeftServer,
 
-    // /// A peer has connected to our endpoint directly.
-    // PeerConnected(quinn::Connection),
     /// A peer has requested a new transfer from an existing connection.
     PeerRequestedTransfer((HashBytes, PeerRequestStream)),
 
@@ -524,13 +560,13 @@ pub enum Message {
     /// The subscribe button was clicked or the hash field was submitted.
     SubscribeStarted,
 
-    /// The path to save a file to was chosen or cancelled.
-    SubscribePathChosen(Option<PathBuf>),
+    /// The file path to save to, if chosen, and the hash text of the file.
+    SubscribePathChosen(Option<PathBuf>, String),
 
     /// A download is being recreated from the open transfers at last close.
-    SubscribeRecreated(TransferBase),
+    SubscribeRecreated(SavedDownload),
 
-    /// A subscribe request was completed.
+    /// A subscribe request to the server has resulted.
     SubscribePeersResult(Result<IncomingSubscribePeers, Arc<SubscribeError>>),
 
     /// A subscribe connection attempt was completed.
@@ -539,8 +575,11 @@ pub enum Message {
     // A download was accepted, initiate the download.
     AcceptDownload(Nonce),
 
+    // A download was rejected, remove the download.
+    RejectDownload(Nonce),
+
     /// Copy a hash to the clipboard.
-    CopyHash(String),
+    CopyHash(Nonce),
 
     /// Rehash a file that was previously published.
     RehashPublish(Nonce),
@@ -548,8 +587,17 @@ pub enum Message {
     /// Cancel publishing a file.
     CancelPublish(Nonce),
 
-    /// Cancel a transfer that is in-progress.
-    CancelTransfer(Nonce, FileYeetCommandType),
+    /// Cancel or pause a transfer that is in-progress.
+    CancelOrPauseTransfer(Nonce, FileYeetCommandType, CancelOrPause),
+
+    /// The resume button was pressed for a paused download.
+    ResumePausedDownload(Nonce),
+
+    /// A resume attempt to get a partial file hash completed.
+    ResumeFromPartialHashFile(
+        Nonce,
+        Result<(sha2::Sha256, u64, PeerRequestStream), Option<Arc<anyhow::Error>>>,
+    ),
 
     /// The result of a download attempt.
     TransferResulted(Nonce, TransferResult, FileYeetCommandType),
@@ -698,8 +746,6 @@ impl AppState {
                 iced::Task::none()
             }
 
-            // Message::PeerConnected(connection) => self.update_peer_connected(connection),
-
             // A peer has requested a new transfer from an existing connection.
             Message::PeerRequestedTransfer((hash, peer_request)) => {
                 self.update_peer_requested_transfer(hash, peer_request)
@@ -761,24 +807,10 @@ impl AppState {
             Message::PublishPeerConnectResulted(pub_nonce, peer) => {
                 self.update_publish_peer_connect_resulted(pub_nonce, peer)
             }
-
-            // Handle the subscribe button being clicked by choosing a save location.
-            Message::SubscribeStarted => {
-                // Clear the status message before starting the subscribe attempt.
-                self.status_message = None;
-
-                // Let state know that a modal dialog is open.
-                self.modal = true;
-
-                iced::Task::perform(
-                    rfd::AsyncFileDialog::new()
-                        .set_title("Choose a file path to save to")
-                        .save_file(),
-                    |f| Message::SubscribePathChosen(f.map(PathBuf::from)),
-                )
+            Message::SubscribeStarted => self.update_subscribe_started(),
+            Message::SubscribePathChosen(path, hash_hex) => {
+                self.update_subscribe_path_chosen(path, hash_hex)
             }
-
-            Message::SubscribePathChosen(path) => self.update_subscribe_path_chosen(path),
             Message::SubscribeRecreated(transfer_base) => {
                 self.update_subscribe_recreated(transfer_base)
             }
@@ -787,14 +819,16 @@ impl AppState {
                 self.update_subscribe_connect_resulted(nonce, r)
             }
             Message::AcceptDownload(nonce) => self.update_accept_download(nonce),
-
-            // Copy a hash to the clipboard.
-            Message::CopyHash(hash) => iced::clipboard::write(hash),
-
+            Message::RejectDownload(nonce) => self.update_reject_download(nonce),
+            Message::CopyHash(nonce) => self.update_copy_hash(nonce),
             Message::RehashPublish(nonce) => self.update_rehash_publish(nonce),
             Message::CancelPublish(nonce) => self.update_cancel_publish(nonce),
-            Message::CancelTransfer(nonce, transfer_type) => {
-                self.update_cancel_transfer(nonce, transfer_type)
+            Message::CancelOrPauseTransfer(nonce, transfer_type, cancel_or_pause) => {
+                self.update_cancel_or_pause(nonce, transfer_type, cancel_or_pause)
+            }
+            Message::ResumePausedDownload(nonce) => self.update_resume_paused(nonce),
+            Message::ResumeFromPartialHashFile(nonce, result) => {
+                self.update_resume_partial_hash(nonce, result)
             }
             Message::TransferResulted(nonce, r, transfer_type) => {
                 self.update_transfer_resulted(nonce, r, transfer_type)
@@ -855,6 +889,7 @@ impl AppState {
     }
 
     /// Listen for events that should be translated into messages.
+    #[tracing::instrument(skip(self))]
     pub fn subscription(&self) -> iced::Subscription<Message> {
         // Listen for runtime events that iced did not handle internally. Used for safe exit handling.
         fn unhandled_events() -> iced::Subscription<Message> {
@@ -1145,6 +1180,8 @@ impl AppState {
         tick: Instant,
         max_duration: Duration,
     ) -> iced::Element<'a, Message> {
+        // TODO: Update progress value on a timer. This is necessary because of how `iced` does
+        // differencing on the state for redraws.
         let fraction_waited = (tick - start)
             .as_secs_f32()
             .div(max_duration.as_secs_f32())
@@ -1170,16 +1207,16 @@ impl AppState {
         widget::column(transfers.into_iter().map(|t| {
             // Try to get a transfer rate string or None.
             let rate = match &t.progress {
-                TransferProgress::Transferring { snapshot, .. } => {
+                TransferState::Transferring { snapshot, .. } => {
                     Some(snapshot.human_readable.clone())
                 }
                 _ => None,
             };
 
             let progress = match &t.progress {
-                TransferProgress::Connecting => Element::from(widget::text("Connecting...")),
+                TransferState::Connecting => Element::from(widget::text("Connecting...")),
 
-                TransferProgress::Consent(_) => widget::row!(
+                TransferState::Consent(_) => widget::row!(
                     widget::text(format!(
                         "Accept download of size {}",
                         humanize_bytes(t.file_size)
@@ -1187,27 +1224,77 @@ impl AppState {
                     .width(iced::Length::Fill),
                     widget::button(widget::text("Accept").size(12))
                         .on_press(Message::AcceptDownload(t.nonce)),
-                    widget::button(widget::text("Cancel").size(12))
-                        .on_press(Message::CancelTransfer(t.nonce, transfer_type))
+                    widget::button(widget::text("Reject").size(12))
+                        .on_press(Message::RejectDownload(t.nonce)),
                 )
                 .spacing(12)
                 .into(),
 
-                TransferProgress::Transferring {
+                TransferState::Transferring {
                     progress_animation: p,
                     ..
-                } => widget::row!(
-                    widget::text("Transferring..."),
-                    widget::progress_bar(0.0..=1., *p).height(24),
-                    widget::button(widget::text("Cancel").size(12))
-                        .on_press(Message::CancelTransfer(t.nonce, transfer_type))
-                        .width(iced::Length::Shrink)
+                } => {
+                    let widgets = [
+                        widget::text("Transferring...").into(),
+                        widget::progress_bar(0.0..=1., *p).height(24).into(),
+                    ]
+                    .into_iter()
+                    .chain((transfer_type == FileYeetCommandType::Sub).then(|| {
+                        widget::button(widget::text("Pause").size(12))
+                            .on_press(Message::CancelOrPauseTransfer(
+                                t.nonce,
+                                transfer_type,
+                                CancelOrPause::Pause,
+                            ))
+                            .into()
+                    }))
+                    .chain([widget::button(widget::text("Cancel").size(12))
+                        .on_press(Message::CancelOrPauseTransfer(
+                            t.nonce,
+                            transfer_type,
+                            CancelOrPause::Cancel,
+                        ))
+                        .into()]);
+                    widget::row(widgets)
+                        .spacing(6)
+                        .align_y(iced::Alignment::Center)
+                        .into()
+                }
+
+                TransferState::Paused => {
+                    let cancel = widget::button(widget::text("Cancel").size(12)).on_press(
+                        Message::CancelOrPauseTransfer(
+                            t.nonce,
+                            transfer_type,
+                            CancelOrPause::Cancel,
+                        ),
+                    );
+                    widget::row!(
+                        "Transfer is paused",
+                        widget::horizontal_space(),
+                        widget::button(widget::text("Resume").size(12))
+                            .on_press(Message::ResumePausedDownload(t.nonce)),
+                        cancel,
+                    )
+                    .spacing(6)
+                    .into()
+                }
+
+                TransferState::ResumingHash(progress_lock) => widget::row!(
+                    widget::text("Resuming with partial hash..."),
+                    widget::progress_bar(0.0..=1., *progress_lock.blocking_read()).height(24),
+                    widget::button(widget::text("Cancel").size(12)).on_press(
+                        Message::CancelOrPauseTransfer(
+                            t.nonce,
+                            transfer_type,
+                            CancelOrPause::Cancel,
+                        )
+                    ),
                 )
                 .spacing(6)
-                .align_y(iced::Alignment::Center)
                 .into(),
 
-                TransferProgress::Done(r) => {
+                TransferState::Done(r) => {
                     let remove = timed_tooltip(
                         widget::button(widget::text("Remove").size(12))
                             .on_press(Message::RemoveFromTransfers(t.nonce, transfer_type)),
@@ -1222,7 +1309,7 @@ impl AppState {
                         });
                     widget::row!(
                         result_text,
-                        if matches!(transfer_type, FileYeetCommandType::Sub)
+                        if transfer_type == FileYeetCommandType::Sub
                             && matches!(r, TransferResult::Success)
                         {
                             Element::<Message>::from(
@@ -1253,8 +1340,14 @@ impl AppState {
                 ),
                 widget::row!(
                     widget::text(&t.peer_string).size(12),
-                    widget::horizontal_space(),
-                    widget::text(t.path.to_string_lossy()).size(12),
+                    widget::scrollable(
+                        widget::text(t.path.to_string_lossy())
+                            .size(12)
+                            .align_x(iced::Alignment::End),
+                    )
+                    .direction(text_horizontal_scrollbar())
+                    .width(iced::Length::Fill)
+                    .height(26),
                 )
                 .spacing(6),
             ))
@@ -1273,6 +1366,11 @@ impl AppState {
         mouse_move_elapsed: &Duration,
     ) -> iced::Element<'a, Message> {
         let publish_views = publishes.iter().map(|pi| {
+            let file_path_scrollable =
+                widget::scrollable(widget::text(pi.path.to_string_lossy()).size(12))
+                    .direction(text_horizontal_scrollbar())
+                    .width(iced::Length::Fill)
+                    .height(26);
             widget::container(
                 match &pi.state {
                     // Display a publish in the hashing state.
@@ -1284,7 +1382,7 @@ impl AppState {
                                     .height(12),
                             )
                             .spacing(6),
-                            widget::text(pi.path.to_string_lossy()).size(12),
+                            file_path_scrollable,
                         ),
                         widget::button(widget::text("Cancel").size(14))
                             .on_press(Message::CancelPublish(pi.nonce)),
@@ -1292,18 +1390,14 @@ impl AppState {
 
                     // Display a publish in the publishing state.
                     PublishState::Publishing(p) => widget::row!(
-                        widget::column!(
-                            widget::text(&p.hash_hex).size(12),
-                            widget::text(pi.path.to_string_lossy()).size(12)
-                        ),
-                        widget::horizontal_space(),
+                        widget::column!(widget::text(&p.hash_hex).size(12), file_path_scrollable,),
                         timed_tooltip(
                             widget::button(
                                 widget::text("📋")
                                     .size(14)
                                     .font(iced::Font::with_name("Noto Emoji"))
                             )
-                            .on_press(Message::CopyHash(p.hash_hex.clone())),
+                            .on_press(Message::CopyHash(pi.nonce)),
                             "Copy hash to clipboard",
                             mouse_move_elapsed,
                         ),
@@ -1325,7 +1419,7 @@ impl AppState {
                     PublishState::Failure(e) => widget::row!(
                         widget::column!(
                             widget::text(format!("Failed to publish: {e}")).color(ERROR_RED_COLOR),
-                            widget::text(pi.path.to_string_lossy()).size(12),
+                            file_path_scrollable,
                         )
                         .width(iced::Length::Fill),
                         widget::button(widget::text("Remove").size(12))
@@ -1334,11 +1428,8 @@ impl AppState {
 
                     // Display a publish that was intentionally cancelled.
                     PublishState::Cancelled => widget::row!(
-                        widget::column!(
-                            widget::text("Cancelled"),
-                            widget::text(pi.path.to_string_lossy()).size(12),
-                        )
-                        .width(iced::Length::Fill),
+                        widget::column!(widget::text("Cancelled"), file_path_scrollable,)
+                            .width(iced::Length::Fill),
                         widget::button(widget::text("Remove").size(12))
                             .on_press(Message::CancelPublish(pi.nonce))
                     ),
@@ -1379,9 +1470,7 @@ impl AppState {
             leave_server_button = leave_server_button.on_press(Message::SafelyLeaveServer);
 
             // Enable the download button if the hash is valid.
-            if connected_state.hash_input.len() == file_yeet_shared::HASH_BYTE_COUNT << 1
-                && faster_hex::hex_check(connected_state.hash_input.as_bytes())
-            {
+            if HASH_EXT_REGEX.is_match(&connected_state.hash_input) {
                 download_button = download_button.on_press(Message::SubscribeStarted);
                 hash_text_input = hash_text_input.on_submit(Message::SubscribeStarted);
             }
@@ -1503,7 +1592,7 @@ impl AppState {
                 )
                 .spacing(6),
                 transfer_view_choice,
-                widget::scrollable(transfer_content),
+                widget::scrollable(transfer_content).spacing(0),
             )
             .spacing(12),
         )
@@ -1597,7 +1686,10 @@ impl AppState {
                              host
                          }
                     } else {
-                        captures.name("unbraced_ipv6_host").expect("Unexpected error: One of `host` and `unbraced_ipv6_host` must be captured in a successful map").as_str()
+                        captures
+                            .name("unbraced_ipv6_host")
+                            .expect("Unexpected error: One of `host` and `unbraced_ipv6_host` must be captured in a successful map")
+                            .as_str()
                     };
 
                     // If there is no port, use the default port. Otherwise, validate the input.
@@ -1677,7 +1769,7 @@ impl AppState {
                 downloads, uploads, ..
             }) => {
                 for t in downloads.iter_mut().chain(uploads.iter_mut()) {
-                    if let TransferProgress::Transferring {
+                    if let TransferState::Transferring {
                         progress_lock,
                         progress_animation,
                         snapshot,
@@ -1730,29 +1822,29 @@ impl AppState {
                 if !self.options.last_publishes.is_empty()
                     || !self.options.last_downloads.is_empty()
                 {
-                    return iced::Task::batch(
-                        self.options
-                            .last_publishes
-                            .drain(..)
-                            .map(|mut p| {
-                                let message = if let Some(hfs) = p.hash_and_file_size.take() {
-                                    Message::PublishFileHashed(
-                                        NewOrExistingPublish::New(p.path),
-                                        hfs.0,
-                                        hfs.1,
-                                    )
-                                } else {
-                                    Message::PublishPathChosen(Some(p.path))
-                                };
-                                iced::Task::done(message)
-                            })
-                            .chain(
-                                self.options
-                                    .last_downloads
-                                    .drain(..)
-                                    .map(|d| iced::Task::done(Message::SubscribeRecreated(d))),
-                            ),
-                    );
+                    let tasks = self
+                        .options
+                        .last_publishes
+                        .drain(..)
+                        .map(|mut p| {
+                            let message = if let Some(hfs) = p.hash_and_file_size.take() {
+                                Message::PublishFileHashed(
+                                    NewOrExistingPublish::New(p.path),
+                                    hfs.0,
+                                    hfs.1,
+                                )
+                            } else {
+                                Message::PublishPathChosen(Some(p.path))
+                            };
+                            iced::Task::done(message)
+                        })
+                        .chain(
+                            self.options
+                                .last_downloads
+                                .drain(..)
+                                .map(|d| iced::Task::done(Message::SubscribeRecreated(d))),
+                        );
+                    return iced::Task::batch(tasks);
                 }
             }
             Err(e) => {
@@ -1764,6 +1856,7 @@ impl AppState {
     }
 
     /// Update the state after a port mapping renewal led to a state change.
+    #[tracing::instrument(skip_all)]
     fn update_port_mapping(
         &mut self,
         port_mapping: Option<crab_nat::PortMapping>,
@@ -1777,6 +1870,7 @@ impl AppState {
     }
 
     /// Update after an existing peer requested a new file transfer.
+    #[tracing::instrument(skip(self, peer_request))]
     fn update_peer_requested_transfer(
         &mut self,
         hash: HashBytes,
@@ -1803,6 +1897,7 @@ impl AppState {
 
     /// Update the state after the publish button was clicked.
     /// Begins a publish request if a file was chosen.
+    #[tracing::instrument(skip(self))]
     fn update_publish_path_chosen(&mut self, path: Option<PathBuf>) -> iced::Task<Message> {
         self.modal = false;
 
@@ -1957,6 +2052,7 @@ impl AppState {
     }
 
     /// Update after the server has sent a peer to publish to, or there was an error.
+    #[tracing::instrument(skip(self))]
     fn update_publish_peer_received(
         &mut self,
         nonce: Nonce,
@@ -1987,12 +2083,13 @@ impl AppState {
             // Attempt a new request stream from an existing or new peer connection.
             (Ok(peer), Some(publish)) => {
                 tracing::debug!("Received peer {peer} for publish {}", &publish.hash,);
-                let data = if let Some(c) = ConnectionsManager::instance().get_connection(&peer) {
-                    tracing::debug!("Reusing connection to peer {peer}");
-                    PeerConnectionOrTarget::Connection(c)
-                } else {
-                    PeerConnectionOrTarget::Target(endpoint.clone(), peer)
-                };
+                let data =
+                    if let Some(c) = ConnectionsManager::instance().get_connection_sync(&peer) {
+                        tracing::debug!("Reusing connection to peer {peer}");
+                        PeerConnectionOrTarget::Connection(c)
+                    } else {
+                        PeerConnectionOrTarget::Target(endpoint.clone(), peer)
+                    };
                 let hash = publish.hash;
                 iced::Task::perform(
                     try_peer_connection(data, hash, FileYeetCommandType::Pub),
@@ -2015,6 +2112,7 @@ impl AppState {
     }
 
     /// Update after a connection attempt to a peer for publishing has completed.
+    #[tracing::instrument(skip(self))]
     fn update_publish_peer_connect_resulted(
         &mut self,
         pub_nonce: Nonce,
@@ -2060,8 +2158,8 @@ impl AppState {
             file_size: publishing.file_size,
             peer_string: peer.connection.remote_address().to_string(),
             path: path.clone(),
-            progress: TransferProgress::Transferring {
-                request: peer.clone(),
+            progress: TransferState::Transferring {
+                peer: peer.connection.clone(),
                 progress_lock: progress_lock.clone(),
                 progress_animation: 0.,
                 snapshot: TransferSnapshot::new(),
@@ -2106,8 +2204,56 @@ impl AppState {
         )
     }
 
+    /// Handle the subscribe button being clicked by prompting to choose a save location.
+    #[tracing::instrument(skip(self))]
+    fn update_subscribe_started(&mut self) -> iced::Task<Message> {
+        // Clear the status message before starting the subscribe attempt.
+        self.status_message = None;
+
+        // Let state know that a modal dialog is open.
+        self.modal = true;
+
+        let (hash_hex, extension) =
+            if let ConnectionState::Connected(ConnectedState { hash_input, .. }) =
+                &self.connection_state
+            {
+                let Some(p) = HASH_EXT_REGEX.captures(hash_input).and_then(|captures| {
+                    let Some(hash) = captures.name("hash").map(|h| h.as_str().to_string()) else {
+                        tracing::error!(
+                            "Subscribe started but unable to match `hash` capture group"
+                        );
+                        return None;
+                    };
+                    let extension = captures.name("ext").map(|e| e.as_str().to_string());
+                    Some((hash, extension))
+                }) else {
+                    tracing::warn!("Subscribe started with invalid hash input");
+                    return iced::Task::none();
+                };
+                p
+            } else {
+                tracing::warn!("Subscribe started while not in the connected state");
+                return iced::Task::none();
+            };
+
+        let mut builder = rfd::AsyncFileDialog::new().set_title("Choose a file path to save to");
+        if let Some(extension) = extension {
+            builder = builder.add_filter(extension.clone(), &[extension]);
+        }
+
+        iced::Task::perform(builder.save_file(), move |f| {
+            // TODO: https://github.com/iced-rs/iced/pull/2827 resolves need for `.clone()` here.
+            Message::SubscribePathChosen(f.map(PathBuf::from), hash_hex.clone())
+        })
+    }
+
     /// Update the state after the publish button was clicked. Begins a subscribe request.
-    fn update_subscribe_path_chosen(&mut self, path: Option<PathBuf>) -> iced::Task<Message> {
+    #[tracing::instrument(skip(self))]
+    fn update_subscribe_path_chosen(
+        &mut self,
+        path: Option<PathBuf>,
+        hash_hex: String,
+    ) -> iced::Task<Message> {
         self.modal = false;
 
         // Ensure a path was chosen, otherwise safely cancel.
@@ -2119,7 +2265,9 @@ impl AppState {
         let ConnectionState::Connected(ConnectedState {
             server,
             external_address,
-            hash_input,
+            downloads,
+            uploads,
+            publishes,
             transfer_view,
             ..
         }) = &mut self.connection_state
@@ -2128,11 +2276,28 @@ impl AppState {
             return iced::Task::none();
         };
 
+        // Ensure there are no active transfers using this path.
+        // TODO: Use a `HashSet` to more efficiently track active file paths.
+        if downloads
+            .iter()
+            .chain(uploads.iter())
+            .any(|t| t.path == path && !matches!(t.progress, TransferState::Done(_)))
+        {
+            self.status_message = Some("Active transfer using this path already exists".to_owned());
+            return iced::Task::none();
+        }
+        if publishes.iter().any(|p| {
+            p.path == path && !matches!(p.state, PublishState::Failure(_) | PublishState::Cancelled)
+        }) {
+            self.status_message = Some("Active publish using this path already exists".to_owned());
+            return iced::Task::none();
+        }
+
         // Ensure the hash is valid.
         let mut hash = HashBytes::default();
-        if let Err(e) = faster_hex::hex_decode(hash_input.as_bytes(), &mut hash.bytes) {
-            let error = format!("Invalid hash: {e}");
-            tracing::warn!("{error}");
+        if let Err(e) = faster_hex::hex_decode(hash_hex.as_bytes(), &mut hash.bytes) {
+            let error = format!("Failed to decode matched hash: {e}");
+            tracing::error!("{error}");
             self.status_message = Some(error);
             return iced::Task::none();
         }
@@ -2155,48 +2320,40 @@ impl AppState {
     }
 
     /// Update the state after loading a download from the last session.
-    fn update_subscribe_recreated(&mut self, transfer_base: TransferBase) -> iced::Task<Message> {
+    #[tracing::instrument(skip(self))]
+    fn update_subscribe_recreated(&mut self, saved_download: SavedDownload) -> iced::Task<Message> {
         // Ensure the client is connected to a server.
-        let ConnectionState::Connected(ConnectedState {
-            endpoint,
-            downloads,
-            ..
-        }) = &mut self.connection_state
+        let ConnectionState::Connected(ConnectedState { downloads, .. }) =
+            &mut self.connection_state
         else {
             tracing::warn!("Subscribe recreated while not connected");
             return iced::Task::none();
         };
 
-        let TransferBase {
+        // TODO: If the peer socket is non-empty, attempt to reconnect to the original peer first.
+        let SavedDownload {
             hash,
             file_size,
-            peer_socket,
             path,
-        } = transfer_base;
+            ..
+        } = saved_download;
         let nonce = rand::random();
         downloads.push(Transfer {
             nonce,
             hash,
-            hash_hex: transfer_base.hash.to_string(),
+            hash_hex: saved_download.hash.to_string(),
             file_size,
-            peer_string: peer_socket.to_string(),
-            path,
-            progress: TransferProgress::Connecting,
+            peer_string: String::new(),
+            path: path.clone(),
+            progress: TransferState::Paused,
             cancellation_token: CancellationToken::new(),
         });
 
-        iced::Task::perform(
-            // TODO: If connections are recreated on startup, this should try to find an existing connection.
-            try_peer_connection(
-                PeerConnectionOrTarget::Target(endpoint.clone(), peer_socket),
-                hash,
-                FileYeetCommandType::Sub,
-            ),
-            move |c| Message::SubscribePeerConnectResulted(nonce, c),
-        )
+        iced::Task::done(Message::ResumePausedDownload(nonce))
     }
 
     /// Update after server has responded to a subscribe request.
+    #[tracing::instrument(skip_all)]
     fn update_subscribe_peers_result(
         &mut self,
         result: Result<IncomingSubscribePeers, Arc<SubscribeError>>,
@@ -2207,75 +2364,82 @@ impl AppState {
                 path,
                 hash,
             }) => {
-                if let ConnectionState::Connected(ConnectedState {
+                let ConnectionState::Connected(ConnectedState {
                     endpoint,
-                    hash_input,
                     downloads,
                     ..
                 }) = &mut self.connection_state
-                {
-                    if peers_with_size.is_empty() {
-                        // Let the user know why nothing else is happening.
-                        self.status_message = Some("No peers available".to_owned());
-                        return iced::Task::none();
-                    }
-
-                    // Create a new transfer state and connection attempt for each peer.
-                    let transfers_commands_iter =
-                        peers_with_size.into_iter().map(|(peer, file_size)| {
-                            // Create a nonce to identify the transfer.
-                            let nonce = rand::random();
-
-                            // New transfer state for this request.
-                            let transfer = Transfer {
-                                nonce,
-                                hash,
-                                hash_hex: hash_input.clone(),
-                                file_size,
-                                peer_string: peer.to_string(),
-                                path: path.clone(),
-                                progress: TransferProgress::Connecting,
-                                cancellation_token: CancellationToken::new(),
-                            };
-
-                            // New connection attempt for this peer with result command identified by the nonce.
-                            let task = {
-                                // Create a new connection or open a stream on an existing one.
-                                let peer = if let Some(c) =
-                                    ConnectionsManager::instance().get_connection(&peer)
-                                {
-                                    tracing::debug!("Reusing connection to peer {peer}");
-                                    PeerConnectionOrTarget::Connection(c)
-                                } else {
-                                    tracing::debug!("Creating new connection to peer {peer}");
-                                    PeerConnectionOrTarget::Target(endpoint.clone(), peer)
-                                };
-
-                                // The future to use to create the connection.
-                                let future =
-                                    try_peer_connection(peer, hash, FileYeetCommandType::Sub);
-                                iced::Task::perform(future, move |r| {
-                                    Message::SubscribePeerConnectResulted(nonce, r)
-                                })
-                            };
-
-                            // Return the pair to be separated later.
-                            (transfer, task)
-                        });
-
-                    // Create a new transfer for each peer.
-                    let (mut new_transfers, connect_commands): (
-                        Vec<Transfer>,
-                        Vec<iced::Task<Message>>,
-                    ) = transfers_commands_iter.unzip();
-
-                    // Add the new transfers to the list of active transfers.
-                    downloads.append(&mut new_transfers);
-                    iced::Task::batch(connect_commands)
-                } else {
+                else {
                     tracing::warn!("Subscribe peers result while not connected");
-                    iced::Task::none()
+                    return iced::Task::none();
+                };
+
+                if peers_with_size.is_empty() {
+                    // Let the user know why nothing else is happening.
+                    self.status_message = Some("No peers available".to_owned());
+                    return iced::Task::none();
                 }
+                let hash_hex = faster_hex::hex_string(&hash.bytes);
+
+                // Create a new transfer state and connection attempt for each peer.
+                let transfers_commands_iter =
+                    peers_with_size.into_iter().map(|(peer, file_size)| {
+                        // Create a nonce to identify the transfer.
+                        let nonce = rand::random();
+                        let cancellation_token = CancellationToken::new();
+
+                        // New transfer state for this request.
+                        let transfer = Transfer {
+                            nonce,
+                            hash,
+                            hash_hex: hash_hex.clone(),
+                            file_size,
+                            peer_string: peer.to_string(),
+                            path: path.clone(),
+                            progress: TransferState::Connecting,
+                            cancellation_token: cancellation_token.clone(),
+                        };
+
+                        // New connection attempt for this peer with result command identified by the nonce.
+                        let task = {
+                            // Create a new connection or open a stream on an existing one.
+                            let peer = if let Some(c) =
+                                ConnectionsManager::instance().get_connection_sync(&peer)
+                            {
+                                tracing::debug!("Reusing connection to peer {peer}");
+                                PeerConnectionOrTarget::Connection(c)
+                            } else {
+                                tracing::debug!("Creating new connection to peer {peer}");
+                                PeerConnectionOrTarget::Target(endpoint.clone(), peer)
+                            };
+
+                            // The future to use to create the connection.
+                            let future = async move {
+                                tokio::select! {
+                                    // Allow cancelling the connection attempt.
+                                    () = cancellation_token.cancelled() => None,
+
+                                    r = try_peer_connection(peer, hash, FileYeetCommandType::Sub) => r,
+                                }
+                            };
+                            iced::Task::perform(future, move |r| {
+                                Message::SubscribePeerConnectResulted(nonce, r)
+                            })
+                        };
+
+                        // Return the pair to be separated later.
+                        (transfer, task)
+                    });
+
+                // Create a new transfer for each peer.
+                let (mut new_transfers, connect_commands): (
+                    Vec<Transfer>,
+                    Vec<iced::Task<Message>>,
+                ) = transfers_commands_iter.unzip();
+
+                // Add the new transfers to the list of active transfers.
+                downloads.append(&mut new_transfers);
+                iced::Task::batch(connect_commands)
             }
             Err(e) => {
                 self.status_message = Some(format!("Error subscribing to the server: {e}"));
@@ -2285,6 +2449,7 @@ impl AppState {
     }
 
     /// Update the state after a subscribe connection attempt to a peer completed.
+    #[tracing::instrument(skip(self, result))]
     fn update_subscribe_connect_resulted(
         &mut self,
         nonce: Nonce,
@@ -2311,7 +2476,7 @@ impl AppState {
         // Update the state of the transfer with the result.
         if let Some(peer_request) = result {
             insert_nonce_for_peer(peer_request.connection.remote_address(), peers, nonce);
-            transfer.progress = TransferProgress::Consent(peer_request);
+            transfer.progress = TransferState::Consent(peer_request);
         } else {
             // Remove unreachable peers from view.
             downloads.remove(index);
@@ -2320,6 +2485,7 @@ impl AppState {
     }
 
     /// Tell the peer to send the file and begin receiving and writing the file.
+    #[tracing::instrument(skip(self))]
     fn update_accept_download(&mut self, nonce: Nonce) -> iced::Task<Message> {
         let ConnectionState::Connected(ConnectedState { downloads, .. }) =
             &mut self.connection_state
@@ -2335,7 +2501,7 @@ impl AppState {
         };
         let hash = transfer.hash;
         let file_size = transfer.file_size;
-        let peer_streams = if let TransferProgress::Consent(p) = &mut transfer.progress {
+        let peer_streams = if let TransferState::Consent(p) = &mut transfer.progress {
             p.clone()
         } else {
             tracing::warn!("Transfer is not in consent state");
@@ -2344,14 +2510,31 @@ impl AppState {
 
         // Begin the transfer.
         let byte_progress = Arc::new(RwLock::new(0));
-        transfer.progress = TransferProgress::Transferring {
-            request: peer_streams.clone(),
+        transfer.progress = TransferState::Transferring {
+            peer: peer_streams.connection.clone(),
             progress_lock: byte_progress.clone(),
             progress_animation: 0.,
             snapshot: TransferSnapshot::new(),
         };
         let output_path = transfer.path.clone();
         let cancellation_token = transfer.cancellation_token.clone();
+        let path = transfer.path.clone();
+
+        // Remove all downloads to the same path when accepting this one.
+        downloads.retain(|d| {
+            if d.path != path
+                || !matches!(
+                    d.progress,
+                    TransferState::Consent(_) | TransferState::Connecting
+                )
+                || d.nonce == nonce
+            {
+                true
+            } else {
+                d.cancellation_token.cancel();
+                false
+            }
+        });
 
         iced::Task::perform(
             async move {
@@ -2364,14 +2547,14 @@ impl AppState {
                     () = cancellation_token.cancelled() => TransferResult::Cancelled,
 
                     // Await the file to be downloaded.
-                    result = Box::pin(crate::core::download_from_peer(
+                    result = crate::core::download_from_peer(
                         hash,
                         &mut peer_streams_lock,
                         file_size,
                         &output_path,
                         &mut bb,
                         Some(&byte_progress),
-                    )) => {
+                    ) => {
                         match result {
                             Ok(()) => TransferResult::Success,
                             Err(e) => TransferResult::Failure(Arc::new(format!("Download failed: {e}"))),
@@ -2381,6 +2564,83 @@ impl AppState {
             },
             move |r| Message::TransferResulted(nonce, r, FileYeetCommandType::Sub),
         )
+    }
+
+    /// A download was rejected. Remove the transfer from the downloads list.
+    #[tracing::instrument(skip(self))]
+    fn update_reject_download(&mut self, nonce: Nonce) -> iced::Task<Message> {
+        let ConnectionState::Connected(ConnectedState {
+            peers, downloads, ..
+        }) = &mut self.connection_state
+        else {
+            tracing::warn!("No connected state to reject download");
+            return iced::Task::none();
+        };
+
+        let download = {
+            let Some(i) = downloads.iter().position(|d| d.nonce == nonce) else {
+                tracing::warn!("No download found to reject");
+                return iced::Task::none();
+            };
+
+            // Remove the download from the downloads list.
+            downloads.remove(i)
+        };
+
+        // Cancel any ongoing download tasks.
+        // There shouldn't be any, but it doesn't hurt and prevents such tasks from being created.
+        download.cancellation_token.cancel();
+
+        // Remove the nonce from the peer's transactions.
+        if let Some(connection) = download.progress.connection() {
+            remove_nonce_for_peer(connection, peers, nonce);
+        }
+
+        // Log download rejection based on the current progress state.
+        match &download.progress {
+            TransferState::Consent(_) => {}
+            TransferState::Transferring { .. } => {
+                tracing::error!("Rejecting download that is transferring, this should not happen");
+            }
+            _ => tracing::warn!("Rejecting download that is not in expected state"),
+        }
+
+        // Attempt a graceful rejection of the download request in the background.
+        iced::Task::future(async move {
+            let TransferState::Consent(r) = download.progress else {
+                return;
+            };
+            let mut bi_stream_lock = r.bistream.lock().await;
+            let _ = crate::core::reject_download_request(&mut bi_stream_lock).await;
+        })
+        .discard()
+    }
+
+    /// Copy a hash (and file extension) to the clipboard.
+    #[tracing::instrument(skip(self))]
+    fn update_copy_hash(&mut self, nonce: Nonce) -> iced::Task<Message> {
+        let ConnectionState::Connected(ConnectedState { publishes, .. }) =
+            &mut self.connection_state
+        else {
+            tracing::warn!("No connected state to copy hash");
+            return iced::Task::none();
+        };
+
+        let Some(publish_item) = publishes.iter().find(|p| p.nonce == nonce) else {
+            tracing::warn!("No publish found with input nonce");
+            return iced::Task::none();
+        };
+        let PublishState::Publishing(Publish { hash_hex, .. }) = &publish_item.state else {
+            tracing::warn!("Specified publish item is not in a publishing state");
+            return iced::Task::none();
+        };
+        let copy_string =
+            if let Some(extension) = publish_item.path.extension().and_then(OsStr::to_str) {
+                format!("{hash_hex}:{extension}")
+            } else {
+                hash_hex.clone()
+            };
+        iced::clipboard::write(copy_string)
     }
 
     #[tracing::instrument(skip(self))]
@@ -2412,6 +2672,7 @@ impl AppState {
     }
 
     /// Update the state after a publish was cancelled.
+    #[tracing::instrument(skip(self))]
     fn update_cancel_publish(&mut self, nonce: Nonce) -> iced::Task<Message> {
         if let ConnectionState::Connected(ConnectedState { publishes, .. }) =
             &mut self.connection_state
@@ -2431,45 +2692,228 @@ impl AppState {
         iced::Task::none()
     }
 
-    /// Update the state after a transfer was cancelled.
-    fn update_cancel_transfer(
+    /// Update the state after a transfer was cancelled or paused.
+    #[tracing::instrument(skip(self))]
+    fn update_cancel_or_pause(
         &mut self,
         nonce: Nonce,
         transfer_type: FileYeetCommandType,
+        cancel_or_pause: CancelOrPause,
     ) -> iced::Task<Message> {
-        if let ConnectionState::Connected(ConnectedState {
+        let ConnectionState::Connected(ConnectedState {
             peers,
             downloads,
             uploads,
             ..
         }) = &mut self.connection_state
-        {
-            let transfers = match transfer_type {
-                FileYeetCommandType::Sub => downloads,
-                FileYeetCommandType::Pub => uploads,
-            };
-            if let Some(t) = transfers.iter_mut().find(|t| t.nonce == nonce) {
-                // Cancel the transfer.
-                t.cancellation_token.cancel();
-
-                // If waiting for user interaction, mark the transfer as cancelled.
-                if matches!(t.progress, TransferProgress::Consent(_)) {
-                    let mut swap_space = TransferProgress::Done(TransferResult::Cancelled);
-                    std::mem::swap(&mut t.progress, &mut swap_space);
-                    if let TransferProgress::Consent(peer) = swap_space {
-                        remove_nonce_for_peer(&peer.connection, peers, nonce);
-                    } else {
-                        tracing::error!("Transfer was not in consent state after matching");
-                    }
-                }
-            }
-        } else {
+        else {
             tracing::warn!("No connected state to cancel transfer");
+            return iced::Task::none();
+        };
+
+        let transfers = match transfer_type {
+            FileYeetCommandType::Sub => downloads,
+            FileYeetCommandType::Pub => uploads,
+        };
+        let Some(t) = transfers.iter_mut().find(|t| t.nonce == nonce) else {
+            tracing::warn!("No transfer found to cancel or pause for nonce");
+            return iced::Task::none();
+        };
+        // Cancel the transfer tasks.
+        t.cancellation_token.cancel();
+
+        match cancel_or_pause {
+            CancelOrPause::Cancel => {
+                tracing::debug!("Cancelled transfer {}", t.hash_hex);
+
+                // If the transfer was connected to a peer, remove the nonce from transactions
+                if let Some(connection) = t.progress.connection() {
+                    remove_nonce_for_peer(connection, peers, nonce);
+                };
+
+                // Mark the transfer as cancelled.
+                t.progress = TransferState::Done(TransferResult::Cancelled);
+            }
+            CancelOrPause::Pause => {
+                tracing::debug!("Paused transfer {}", t.hash_hex);
+                t.progress = TransferState::Paused;
+            }
         }
         iced::Task::none()
     }
 
+    /// Update the state to resume a paused transfer.
+    #[tracing::instrument(skip(self))]
+    fn update_resume_paused(&mut self, nonce: Nonce) -> iced::Task<Message> {
+        let ConnectionState::Connected(ConnectedState {
+            endpoint,
+            server,
+            external_address,
+            downloads,
+            ..
+        }) = &mut self.connection_state
+        else {
+            tracing::warn!("No connected state to resume download");
+            return iced::Task::none();
+        };
+
+        let Some(t) = downloads.iter_mut().find(|t| t.nonce == nonce) else {
+            tracing::warn!("No download found to resume for nonce");
+            return iced::Task::none();
+        };
+        let endpoint = endpoint.clone();
+        let server = server.clone();
+        let external_address = external_address.0;
+        let path = t.path.clone();
+        let hash = t.hash;
+        let final_file_size = t.file_size;
+
+        let progress_lock = Arc::new(RwLock::new(0.));
+        t.progress = TransferState::ResumingHash(progress_lock.clone());
+        t.cancellation_token = CancellationToken::new();
+        let cancellation_token = t.cancellation_token.clone();
+
+        // Create a future to resume the download.
+        let resume_future = async move {
+            // Get the file size and digest state of the chosen file to publish.
+            let (_, file_size, digest) = Box::pin(crate::core::file_size_and_hasher(
+                &path,
+                Some(&progress_lock),
+            ))
+            .await
+            .map_err(|e| Some(Arc::new(e.into())))?;
+
+            // Get the list of peers to resume the download from.
+            let mut bb = bytes::BytesMut::with_capacity(MAX_PEER_COMMUNICATION_SIZE);
+            let peers = crate::core::subscribe(&server, &mut bb, hash, Some(external_address))
+                .await
+                .map_err(|e| Some(Arc::new(e.into())))?;
+
+            // Get a request stream to the peer to resume the download.
+            let request = first_matching_download(&endpoint, &peers, hash, final_file_size)
+                .await
+                .ok_or(None)?;
+
+            Ok((digest, file_size, request))
+        };
+
+        // Resume the transfer.
+        iced::Task::perform(
+            async move {
+                tokio::select! {
+                    // Allow cancelling the resume request.
+                    () = cancellation_token.cancelled() => {
+                        tracing::debug!("Cancelling the resume request");
+                        Err(Some(Arc::new(anyhow::anyhow!("Cancelled"))))
+                    }
+
+                    // Await the resume request to complete.
+                    result = resume_future => result,
+                }
+            },
+            move |r| Message::ResumeFromPartialHashFile(nonce, r),
+        )
+    }
+
+    /// Update the state after a resume partial hash has resulted.
+    #[tracing::instrument(skip(self))]
+    fn update_resume_partial_hash(
+        &mut self,
+        nonce: Nonce,
+        result: Result<(sha2::Sha256, u64, PeerRequestStream), Option<Arc<anyhow::Error>>>,
+    ) -> iced::Task<Message> {
+        let ConnectionState::Connected(ConnectedState { downloads, .. }) =
+            &mut self.connection_state
+        else {
+            tracing::warn!("No connected state to resume partial hash");
+            return iced::Task::none();
+        };
+
+        let Some(t) = downloads.iter_mut().find(|t| t.nonce == nonce) else {
+            tracing::warn!("No download found to resume partial hash for nonce");
+            return iced::Task::none();
+        };
+
+        match result {
+            // Resume the download with the partial hash
+            Ok((digest, start_index, request)) => {
+                let progress = Arc::new(RwLock::new(start_index));
+                let progress_animation = start_index as f32 / t.file_size as f32;
+                t.progress = TransferState::Transferring {
+                    peer: request.connection.clone(),
+                    progress_lock: progress.clone(),
+                    progress_animation,
+                    snapshot: TransferSnapshot::new(),
+                };
+                let cancellation_token = t.cancellation_token.clone();
+                let path = t.path.clone();
+                let hash = t.hash;
+                let file_size = t.file_size;
+
+                iced::Task::perform(
+                    async move {
+                        let mut file = match tokio::fs::OpenOptions::new()
+                            .write(true)
+                            .append(true)
+                            .open(&path)
+                            .await
+                        {
+                            Ok(f) => f,
+                            Err(e) => {
+                                return TransferResult::Failure(Arc::new(format!(
+                                    "Failed to open the file: {e}"
+                                )))
+                            }
+                        };
+
+                        // Try to upload the file to the peer connection.
+                        let mut request = request.bistream.lock().await;
+                        let mut bb = bytes::BytesMut::with_capacity(MAX_SERVER_COMMUNICATION_SIZE);
+                        tokio::select! {
+                            () = cancellation_token.cancelled() => TransferResult::Cancelled,
+
+                            result = Box::pin(crate::core::download_partial_from_peer(
+                                hash,
+                                &mut request,
+                                &mut file,
+                                &mut bb,
+                                crate::core::DownloadOffsetState::new(start_index..file_size, Some(digest)),
+                                Some(&progress),
+                            )) => match result {
+                                Ok(()) => TransferResult::Success,
+                                Err(e) => TransferResult::Failure(Arc::new(format!("Upload failed: {e}"))),
+                            }
+                        }
+                    },
+                    move |r| Message::TransferResulted(nonce, r, FileYeetCommandType::Sub),
+                )
+            }
+
+            // Failed to resume the download.
+            Err(e) => {
+                let e = if let Some(e) = e {
+                    tracing::warn!("Failed to resume partial hash: {e}");
+                    Arc::new(e.to_string())
+                } else {
+                    tracing::info!("Failed to connect to peer to resume partial hash");
+                    Arc::new("No reachable peers".into())
+                };
+                t.progress = TransferState::Done(TransferResult::Failure(e));
+
+                self.options.last_downloads.push(SavedDownload {
+                    path: t.path.clone(),
+                    hash: t.hash,
+                    file_size: t.file_size,
+                    peer_socket: t.peer_string.parse().ok(),
+                });
+
+                iced::Task::none()
+            }
+        }
+    }
+
     /// Update the state after a transfer has concluded, successfully or not.
+    #[tracing::instrument(skip(self))]
     fn update_transfer_resulted(
         &mut self,
         nonce: Nonce,
@@ -2494,14 +2938,37 @@ impl AppState {
             };
 
             if let Some(t) = transfers.find(|t| t.nonce == nonce) {
-                // If the transfer was connected to a peer, remove the nonce from transactions.
-                if let TransferProgress::Transferring { request, .. }
-                | TransferProgress::Consent(request) = &t.progress
-                {
-                    remove_nonce_for_peer(&request.connection, peers, nonce);
+                // Handle a paused transfer.
+                if let TransferState::Paused = &t.progress {
+                    // If the transfer result is cancelled, ignore it.
+                    // This is expected if the transfer was paused.
+                    if matches!(result, TransferResult::Cancelled) {
+                        tracing::debug!(
+                            "Transfer was paused and then cancelled, expected race condition"
+                        );
+                        return iced::Task::none();
+                    }
                 }
 
-                t.progress = TransferProgress::Done(result);
+                // Handle a transfer that is already done.
+                if let TransferState::Done(done) = &t.progress {
+                    // If we are cancelling twice, ignore the second cancellation.
+                    // Otherwise, this is an unexpected double-result.
+                    if !matches!(result, TransferResult::Cancelled)
+                        || !matches!(done, TransferResult::Cancelled)
+                    {
+                        tracing::warn!("Transfer already marked as done {done}");
+                    }
+                    return iced::Task::none();
+                }
+
+                // If the transfer was connected to a peer, remove the nonce from transactions.
+                if let Some(connection) = t.progress.connection() {
+                    remove_nonce_for_peer(connection, peers, nonce);
+                };
+
+                // Mark the transfer as done.
+                t.progress = TransferState::Done(result);
             }
         } else {
             tracing::warn!("No connected state to update transfer result");
@@ -2510,6 +2977,7 @@ impl AppState {
     }
 
     /// Update the state after the user has chosen to remove a transfer entry.
+    #[tracing::instrument(skip(self))]
     fn update_remove_from_transfers(
         &mut self,
         nonce: Nonce,
@@ -2533,6 +3001,7 @@ impl AppState {
     }
 
     /// Try to safely close.
+    #[tracing::instrument(skip(self))]
     fn safely_close(&mut self, close_type: CloseType) -> iced::Task<Message> {
         // If connected, close the connection and save the current state.
         if let ConnectionState::Connected(ConnectedState {
@@ -2563,25 +3032,27 @@ impl AppState {
                 })
                 .collect();
 
-            self.options.last_downloads = downloads
-                .drain(..)
-                .filter_map(|d| {
+            self.options
+                .last_downloads
+                .extend(downloads.drain(..).filter_map(|d| {
                     // If the download is in progress, cancel it.
                     d.cancellation_token.cancel();
 
                     // Ensure all downloads that were in-progress are saved.
-                    if let TransferProgress::Transferring { request, .. } = d.progress {
-                        Some(TransferBase {
-                            hash: d.hash,
-                            file_size: d.file_size,
-                            peer_socket: request.connection.remote_address(),
-                            path: d.path,
-                        })
-                    } else {
-                        None
-                    }
-                })
-                .collect();
+                    let peer_socket = match d.progress {
+                        TransferState::Transferring { peer, .. } => Some(peer.remote_address()),
+                        TransferState::Paused => None,
+
+                        // In most cases, do not save the download.
+                        _ => return None,
+                    };
+                    Some(SavedDownload {
+                        hash: d.hash,
+                        file_size: d.file_size,
+                        peer_socket,
+                        path: d.path,
+                    })
+                }));
 
             endpoint.close(GOODBYE_CODE, GOODBYE_MESSAGE.as_bytes());
 
@@ -2639,6 +3110,53 @@ impl AppState {
             }
         }
     }
+}
+
+/// Helper to get a consistent horizontal scrollbar for text overflow.
+fn text_horizontal_scrollbar() -> widget::scrollable::Direction {
+    widget::scrollable::Direction::Horizontal(
+        widget::scrollable::Scrollbar::new()
+            .width(8)
+            .scroller_width(8),
+    )
+}
+
+/// Helper to connect to peer publishing a known hash and file size.
+#[tracing::instrument(skip(endpoint, peers_with_size))]
+async fn first_matching_download(
+    endpoint: &quinn::Endpoint,
+    peers_with_size: &[(SocketAddr, u64)],
+    hash: HashBytes,
+    expected_size: u64,
+) -> Option<PeerRequestStream> {
+    let filtered_peers = peers_with_size
+        .iter()
+        .filter_map(|(peer, file_size)| file_size.eq(&expected_size).then_some(*peer));
+
+    for peer in filtered_peers {
+        // Create a new connection or open a stream on an existing one.
+        let peer = if let Some(c) = ConnectionsManager::instance()
+            .get_connection_async(&peer)
+            .await
+        {
+            tracing::debug!("Reusing connection to peer {peer}");
+            PeerConnectionOrTarget::Connection(c)
+        } else {
+            tracing::debug!("Creating new connection to peer {peer}");
+            PeerConnectionOrTarget::Target(endpoint.clone(), peer)
+        };
+
+        // Attempt to connect to the peer.
+        let r = try_peer_connection(peer, hash, FileYeetCommandType::Sub).await;
+
+        // Return the first successful connection.
+        if r.is_some() {
+            return r;
+        }
+    }
+
+    // TODO: Complete with error handling.
+    None
 }
 
 /// Either an existing peer connection or a local endpoint and peer address to connect to.
@@ -2849,6 +3367,7 @@ where
 
 /// Try to establish a peer connection for a command type.
 /// Either starts from an existing connection or attempts to holepunch.
+//  TODO: Consider returning a `Result` instead of an `Option` to handle errors.
 async fn try_peer_connection(
     peer: PeerConnectionOrTarget,
     hash: HashBytes,
@@ -2889,23 +3408,29 @@ fn insert_nonce_for_peer(
 }
 
 /// Remove the nonce of a transaction from a peer's set of known transactions.
+#[tracing::instrument(skip(peer, peers))]
 fn remove_nonce_for_peer(
-    connection: &quinn::Connection,
+    peer: &quinn::Connection,
     peers: &mut HashMap<SocketAddr, HashSet<Nonce>>,
     nonce: Nonce,
 ) {
-    let peer_address = connection.remote_address();
+    let peer_address = peer.remote_address();
     if let std::collections::hash_map::Entry::Occupied(mut e) = peers.entry(peer_address) {
         let nonces = e.get_mut();
-        nonces.remove(&nonce);
+        if !nonces.remove(&nonce) {
+            tracing::warn!("Nonce was not found for peer {peer_address}");
+        }
 
         // If there are no more streams to the peer, close the connection.
         if nonces.is_empty() {
             tracing::debug!("Closing peer {peer_address} connection");
 
-            // Close the connection. Peer cleanup will happen in the next update when the connection is dropped.
-            connection.close(GOODBYE_CODE, GOODBYE_MESSAGE.as_bytes());
+            // Close the connection.
+            // Peer cleanup will happen when `connected_peer_request_loop(..)` sees the connection is dropped.
+            peer.close(GOODBYE_CODE, GOODBYE_MESSAGE.as_bytes());
         }
+    } else {
+        tracing::debug!("Peer {peer_address} not found in peers map");
     }
 }
 

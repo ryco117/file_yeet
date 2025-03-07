@@ -724,18 +724,10 @@ async fn handle_introduction(
     let read_lock = clients.read().await;
     let Some(client_list) = read_lock.get(&hash).filter(|v| !v.is_empty()) else {
         tracing::debug!("Failed to find client for hash {hash}");
-
-        // Send the subscriber a message that no publishers are available.
-        client_streams
-            .send
-            .write_u8(0)
-            .await
-            .map_err(ClientRequestError::IoError)?;
         return Ok(());
     };
 
-    let clients = client_list.iter();
-    for (_, pub_client) in clients {
+    for pub_client in client_list.values() {
         // Get read access on client lock.
         let pub_client = pub_client.publisher.read().await;
         let client_address = pub_client.address.read().await;
@@ -745,18 +737,8 @@ async fn handle_introduction(
 
             // Feed the subscribing client's socket address to the task that handles communicating with the publisher.
             if let Ok(()) = pub_client.stream.send(sock_string.clone()).await {
-                // Send the file size to the subscribing client.
-                client_streams
-                    .send
-                    .write_u8(1)
-                    .await
-                    .map_err(ClientRequestError::IoError)?;
-
                 tracing::debug!("Introduced publisher {peer_address} to {sock_string}");
             }
-
-            // We found the correct socket address, stop searching the client list.
-            break;
         }
     }
 

@@ -1,4 +1,4 @@
-use std::{io::Write as _, num::NonZeroU16, path::Path};
+use std::{io::Write as _, num::NonZeroU16, path::Path, sync::Arc};
 
 use file_yeet_shared::{
     BiStream, HashBytes, GOODBYE_CODE, GOODBYE_MESSAGE, MAX_SERVER_COMMUNICATION_SIZE,
@@ -6,7 +6,7 @@ use file_yeet_shared::{
 use futures_util::{stream::FuturesUnordered, StreamExt};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
-use crate::core::{humanize_bytes, FileYeetCommandType, PreparedConnection};
+use crate::core::{humanize_bytes, FileYeetCommandType, PreparedConnection, HASH_EXT_REGEX};
 
 mod core;
 mod gui;
@@ -61,40 +61,47 @@ enum FileYeetCommand {
 
     /// Subscribe to a file from the server.
     Sub {
-        sha256_hex: String,
+        /// The SHA-256 hash of the file to download with optional file extension, formatted `hash[:ext]`.
+        /// A valid example is 3a948d839c93992627c938a174859d837195f837367a68385619357849a6547d:png
+        hash_ext: String,
+
+        /// Optional destination file path. Defaults to the current directory with the hash as the name [with the chosen extension].
         output: Option<String>,
     },
+}
+
+/// Initialize logging helper.
+fn logging(args: &Cli) {
+    use tracing_subscriber::prelude::*;
+
+    let filter = if cfg!(debug_assertions) || args.verbose {
+        tracing_subscriber::filter::Targets::new()
+            .with_target(core::APP_TITLE, tracing::Level::DEBUG)
+            .with_target("crab_nat", tracing::Level::DEBUG)
+    } else {
+        tracing_subscriber::filter::Targets::new()
+            .with_target(core::APP_TITLE, tracing::Level::INFO)
+            .with_target("crab_nat", tracing::Level::INFO)
+    };
+    let subscriber = tracing_subscriber::registry();
+    if args.verbose {
+        subscriber
+            .with(tracing_subscriber::fmt::layer().pretty())
+            .with(filter)
+            .init();
+    } else {
+        subscriber
+            .with(tracing_subscriber::fmt::layer().compact())
+            .with(filter)
+            .init();
+    }
 }
 
 fn main() {
     // Parse command line arguments.
     use clap::Parser as _;
     let args = Cli::parse();
-
-    // Initialize logging.
-    {
-        use tracing_subscriber::prelude::*;
-
-        let filter = if cfg!(debug_assertions) || args.verbose {
-            tracing_subscriber::filter::Targets::new()
-                .with_target(core::APP_TITLE, tracing::Level::DEBUG)
-        } else {
-            tracing_subscriber::filter::Targets::new()
-                .with_target(core::APP_TITLE, tracing::Level::INFO)
-        };
-        let subscriber = tracing_subscriber::registry();
-        if args.verbose {
-            subscriber
-                .with(tracing_subscriber::fmt::layer().pretty())
-                .with(filter)
-                .init();
-        } else {
-            subscriber
-                .with(tracing_subscriber::fmt::layer().compact())
-                .with(filter)
-                .init();
-        }
-    }
+    logging(&args);
 
     // If no subcommand was provided, run the GUI.
     let Some(cmd) = args.cmd else {
@@ -212,9 +219,16 @@ fn main() {
             }
 
             // Try to get the file hash from the rendezvous server and peers.
-            FileYeetCommand::Sub { sha256_hex, output } => {
-                if let Err(e) =
-                    subscribe_command(&prepared_connection, bb, sha256_hex, output).await
+            FileYeetCommand::Sub { hash_ext, output } => {
+                if let Err(e) = subscribe_command(
+                    &prepared_connection,
+                    bb,
+                    hash_ext,
+                    output,
+                    &mut task_master,
+                    cancellation_token.clone(),
+                )
+                .await
                 {
                     tracing::error!("Failed to download the file: {e}");
                 }
@@ -263,12 +277,15 @@ async fn publish_command(
         Ok(t) => t,
         Err(e) => anyhow::bail!("Failed to hash file: {e}"),
     };
-    tracing::info!(
-        "File {} has SHA-256 hash {} and size {} bytes",
-        file_path.display(),
-        &hash,
-        humanize_bytes(file_size),
-    );
+    let display_path = file_path.display();
+    let file_bytes = humanize_bytes(file_size);
+    if let Some(ext) = file_path.extension().and_then(std::ffi::OsStr::to_str) {
+        tracing::info!(
+            "File {display_path} has SHA-256 hash {hash}:{ext} and size {file_bytes} bytes",
+        );
+    } else {
+        tracing::info!("File {display_path} has SHA-256 hash {hash} and size {file_bytes} bytes");
+    }
 
     let core::PreparedConnection {
         endpoint,
@@ -293,27 +310,47 @@ async fn publish_command(
 async fn subscribe_command(
     prepared_connection: &PreparedConnection,
     mut bb: bytes::BytesMut,
-    sha256_hex: String,
+    hash_ext: String,
     output_path: Option<String>,
+    task_master: &mut TaskTracker,
+    cancellation_token: CancellationToken,
 ) -> anyhow::Result<()> {
+    // Parse the hash and optional extension with regex.
+    let (hash_hex, ext) = match HASH_EXT_REGEX.captures(&hash_ext) {
+        Some(c) => (
+            c.get(1)
+                .ok_or_else(|| anyhow::anyhow!("File hash not given in valid format"))?
+                .as_str(),
+            c.get(2).map(|m| m.as_str()),
+        ),
+        None => anyhow::bail!("Failed to parse the hash and optional extension"),
+    };
+
     let mut hash = HashBytes::default();
-    if let Err(e) = faster_hex::hex_decode(sha256_hex.as_bytes(), &mut hash.bytes) {
+    if let Err(e) = faster_hex::hex_decode(hash_hex.as_bytes(), &mut hash.bytes) {
         anyhow::bail!("Failed to parse hex hash: {e}");
     };
 
     // Determine the output file path to use.
-    let output = output_path.as_ref().filter(|s| !s.is_empty()).map_or_else(
-        || {
-            let mut output = std::env::temp_dir();
-            let mut hex_bytes = [0; 2 * file_yeet_shared::HASH_BYTE_COUNT];
-            output.push(
-                faster_hex::hex_encode(&hash.bytes, &mut hex_bytes)
-                    .expect("Failed to use a valid hex buffer"),
+    let output = {
+        let mut output = output_path
+            .as_ref()
+            .filter(|s| !s.trim().is_empty())
+            .map_or_else(
+                || std::path::PathBuf::from(hash_hex),
+                std::path::PathBuf::from,
             );
-            output
-        },
-        |o| o.clone().into(),
-    );
+
+        // If an extension hint was provided, use it as the default extension.
+        if let Some(ext) = ext {
+            if output.extension().is_none() {
+                //  TODO: Wait for `add_extension` to be stabilized.
+                //  https://github.com/rust-lang/rust/issues/127292
+                output.set_extension(ext);
+            }
+        }
+        output
+    };
 
     let core::PreparedConnection {
         endpoint,
@@ -348,16 +385,22 @@ async fn subscribe_command(
     // Allow the user to accept or reject the download from each peer until the first accepted connection.
     let peer_connection = loop {
         match connection_attempts.next().await {
-            Some(Some((c, b, file_size))) => {
+            Some(Some((c, mut b, file_size))) => {
                 let consent =
                     file_consent_cli(file_size, &output).expect("Failed to read user input");
                 if consent {
                     break Some((c, b, file_size));
                 }
 
-                // Close the connection because we won't download from this peer.
-                tracing::info!("Download rejected");
-                c.close(GOODBYE_CODE, &[]);
+                // Try to gracefully reject the download in the background.
+                task_master.spawn(async move {
+                    // Reject the download gracefully.
+                    if let Ok(()) = core::reject_download_request(&mut b).await {
+                        // Close the connection because we won't download from this peer.
+                        tracing::debug!("Download rejected");
+                    }
+                    c.close(GOODBYE_CODE, &[]);
+                });
             }
 
             // If the connection attempt failed, skip the peer.
@@ -368,27 +411,65 @@ async fn subscribe_command(
         }
     };
 
-    // Try to get a successful peer connection.
-    if let Some((peer_connection, mut peer_streams, file_size)) = peer_connection {
-        // Try to download the requested file using the peer connection.
-        // Pin the future to avoid a stack overflow. <https://rust-lang.github.io/rust-clippy/master/index.html#large_futures>
-        if let Err(e) = Box::pin(core::download_from_peer(
-            hash,
-            &mut peer_streams,
-            file_size,
-            &output,
-            &mut bb,
-            None,
-        ))
-        .await
-        {
-            anyhow::bail!("Failed to download from peer: {e}");
-        }
-
-        peer_connection.close(GOODBYE_CODE, "Thanks for sharing".as_bytes());
-    } else {
+    // If no connections were viable or accepted, then bail.
+    let Some((peer_connection, mut peer_streams, file_size)) = peer_connection else {
         anyhow::bail!("Failed to connect to any available peers");
     };
+
+    // Create a background task to update the download progress visually.
+    let progress = Arc::new(tokio::sync::RwLock::new(0));
+    let progress_clone = progress.clone();
+    task_master.spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+        let mut last_instant = interval.tick().await;
+        let mut last_progress = 0;
+        let empty_progress = "          ";
+        let full_progress = "██████████";
+
+        println!();
+        while !cancellation_token.is_cancelled() {
+            // Wait for the next interval tick and get the current time.
+            let now = interval.tick().await;
+            if cancellation_token.is_cancelled() {
+                break;
+            }
+
+            // Estimate the download speed.
+            let bytes_read = *progress.read().await;
+            let speed = (bytes_read - last_progress) as f64
+                / now.duration_since(last_instant).as_secs_f64();
+            let human_speed = human_bytes::human_bytes(speed);
+
+            last_instant = now;
+            last_progress = bytes_read;
+
+            // Print the current state of the download.
+            #[allow(clippy::cast_possible_truncation)]
+            let progress_chars = ((bytes_read * empty_progress.len() as u64) / file_size) as usize;
+            println!(
+                "\x1bM[{}{}] {human_speed}/s",
+                &full_progress[..3 * progress_chars],
+                &empty_progress[progress_chars..]
+            );
+        }
+    });
+
+    // Try to download the requested file using the accepted peer connection.
+    // Pin the future to avoid a stack overflow. <https://rust-lang.github.io/rust-clippy/master/index.html#large_futures>
+    if let Err(e) = core::download_from_peer(
+        hash,
+        &mut peer_streams,
+        file_size,
+        &output,
+        &mut bb,
+        Some(&progress_clone),
+    )
+    .await
+    {
+        anyhow::bail!("Failed to download from peer: {e}");
+    }
+
+    peer_connection.close(GOODBYE_CODE, "Thanks for sharing".as_bytes());
 
     Ok(())
 }
@@ -434,7 +515,7 @@ async fn publish_loop(
                 // Try to connect to the peer and upload the file.
                 () = async move {
                     // Attempt to connect to the peer using UDP hole punching.
-                    let Some((_peer_connection, mut peer_streams)) = core::udp_holepunch(
+                    let Some((peer_connection, mut peer_streams)) = core::udp_holepunch(
                         FileYeetCommandType::Pub,
                         hash,
                         endpoint,
@@ -461,6 +542,9 @@ async fn publish_loop(
                     if let Err(e) = Box::pin(core::upload_to_peer(&mut peer_streams, file_size, reader, None)).await {
                         tracing::warn!("Failed to upload to peer: {e}");
                     }
+
+                    // Close the connection to the peer.
+                    core::ConnectionsManager::instance().remove_peer(&peer_connection.remote_address()).await;
                 } => {}
             }
         });

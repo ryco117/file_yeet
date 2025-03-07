@@ -22,6 +22,13 @@ use tokio::{
 /// The name of the application.
 pub static APP_TITLE: &str = env!("CARGO_PKG_NAME");
 
+/// Lazily initialized regex for parsing hash hex strings.
+/// Produces capture groups `hash` and `ext` for the hash and optional extension.
+pub static HASH_EXT_REGEX: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"^\s*(?P<hash>[0-9a-fA-F]{64})(?::(?P<ext>\w+))?\s*$")
+        .expect("Failed to compile the hash hex regex")
+});
+
 /// Use a sane default timeout for server connections.
 pub const SERVER_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
 /// Sane default timeout for listening for a peer.
@@ -59,7 +66,7 @@ pub enum PortMappingConfig {
 }
 
 /// The command relationship between the two peers. Useful for asserting synchronization roles based on the command type.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FileYeetCommandType {
     Pub,
     Sub,
@@ -157,38 +164,38 @@ pub async fn prepare_server_connection(
     }
     tracing::info!("QUIC endpoint created with local address: {local_address}");
 
-    // Attempt to get a port forwarding, starting with user's override and then attempting NAT-PMP and PCP.
-    let gateway = if let Some(g) = suggested_gateway {
-        // Parse the string to an IP address.
-        g.parse()
-            .map_err(PrepareConnectionError::InvalidGatewayAddress)?
-    } else {
-        // Determine the default gateway.
-        let gateway =
-            netdev::get_default_gateway().map_err(PrepareConnectionError::UnknownGatewayAddress)?;
-
-        // Use the local address as preference for which IP version to use.
-        if local_address.is_ipv4() {
-            gateway
-                .ipv4
-                .first()
-                .map(|ip| IpAddr::V4(*ip))
-                .or_else(|| gateway.ipv6.first().map(|ip| IpAddr::V6(*ip)))
-        } else {
-            gateway
-                .ipv6
-                .first()
-                .map(|ip| IpAddr::V6(*ip))
-                .or_else(|| gateway.ipv4.first().map(|ip| IpAddr::V4(*ip)))
-        }
-        .expect("Gateway has no associated IP address")
-    };
     let (port_mapping, port_override) = match external_port_config {
         // Use a port that is explicitly set by the user without PCP/NAT-PMP.
         PortMappingConfig::PortForwarding(p) => (None, Some(p)),
 
         // Attempt PCP and NAT-PMP port mappings to the gateway.
         PortMappingConfig::PcpNatPmp(None) => {
+            let gateway = if let Some(g) = suggested_gateway {
+                // Parse the string to an IP address.
+                g.parse()
+                    .map_err(PrepareConnectionError::InvalidGatewayAddress)?
+            } else {
+                // Determine the default gateway.
+                let gateway = netdev::get_default_gateway()
+                    .map_err(PrepareConnectionError::UnknownGatewayAddress)?;
+
+                // Use the local address as preference for which IP version to use.
+                if local_address.is_ipv4() {
+                    gateway
+                        .ipv4
+                        .first()
+                        .map(|ip| IpAddr::V4(*ip))
+                        .or_else(|| gateway.ipv6.first().map(|ip| IpAddr::V6(*ip)))
+                } else {
+                    gateway
+                        .ipv6
+                        .first()
+                        .map(|ip| IpAddr::V6(*ip))
+                        .or_else(|| gateway.ipv4.first().map(|ip| IpAddr::V4(*ip)))
+                }
+                .expect("Gateway has no associated IP address")
+            };
+
             match try_port_mapping(gateway, local_address).await {
                 Ok(m) => {
                     let external_port = m.external_port();
@@ -454,6 +461,41 @@ pub async fn port_override_request(
     bb.put_u16(port.get());
 
     // Send the port override request to the server and clear the buffer.
+    server_streams.send.write_all(bb).await?;
+
+    Ok(())
+}
+
+/// Errors that may occur when sending an introduction request.
+#[derive(Debug, thiserror::Error)]
+pub enum IntroductionError {
+    /// Failed to establish a new QUIC stream for the introduction request.
+    #[error("{0}")]
+    Connection(#[from] quinn::ConnectionError),
+
+    /// Failed to send the introduction request.
+    #[error("{0}")]
+    SendRequest(#[from] quinn::WriteError),
+}
+
+/// Perform an introduction request to the server for a specific peer and hash.
+#[tracing::instrument(skip(server_connection, bb))]
+pub async fn introduction(
+    server_connection: &quinn::Connection,
+    bb: &mut bytes::BytesMut,
+    hash: HashBytes,
+    external_address: SocketAddr,
+) -> Result<(), IntroductionError> {
+    // Create a bi-directional stream to the server.
+    let mut server_streams: BiStream = server_connection.open_bi().await?.into();
+
+    // Send the server an introduction request.
+    bb.clear();
+    bb.put_u16(file_yeet_shared::ClientApiRequest::Introduction as u16);
+    bb.put(&hash.bytes[..]);
+    let address_str = external_address.to_string();
+    bb.put_u8(u8::try_from(address_str.len()).expect("Address string is too long"));
+    bb.put(address_str.as_bytes());
     server_streams.send.write_all(bb).await?;
 
     Ok(())
@@ -808,7 +850,6 @@ async fn connect_to_peer(
 
     // Ensure we have retries left and there isn't already a peer `Connection` to use.
     while connect_attempts > 0 {
-        #[cfg(debug_assertions)]
         tracing::debug!("Connection attempt to peer at {peer_address}");
 
         match endpoint.connect(peer_address, "peer") {
@@ -828,27 +869,38 @@ async fn connect_to_peer(
 
             Err(e) => {
                 tracing::warn!("Failed to connect to peer with unrecoverable error: {e}");
+                return None;
             }
         }
     }
 
+    tracing::debug!("Failed to connect to peer after all attempts");
     None
+}
+
+/// The range of bytes to download and an optional starting hash state.
+pub struct DownloadOffsetState {
+    pub range: std::ops::Range<u64>,
+    pub hasher: Option<sha2::Sha256>,
+}
+impl DownloadOffsetState {
+    /// Create a new download offset state with a specific range and optional hasher.
+    pub fn new(range: std::ops::Range<u64>, hasher: Option<sha2::Sha256>) -> Self {
+        Self { range, hasher }
+    }
 }
 
 /// Errors that may occur when downloading a file from a peer.
 #[derive(Debug, thiserror::Error)]
 pub enum DownloadError {
     #[error("A file access error occurred: {0}")]
-    FileAccess(std::io::Error),
+    FileAccess(#[from] FileAccessError),
 
     #[error("An error occurred reading from peer: {0}")]
     QuicRead(#[from] quinn::ReadError),
 
     #[error("An error occurred sending to peer: {0}")]
     QuicWrite(#[from] quinn::WriteError),
-
-    #[error("A file write error occurred: {0}")]
-    FileWrite(std::io::Error),
 
     #[error("Unexpected end of file")]
     UnexpectedEof,
@@ -857,31 +909,33 @@ pub enum DownloadError {
     HashMismatch,
 }
 
-/// Download a file from the peer. Initiates the download by consenting to the peer to receive the file.
-#[allow(clippy::cast_precision_loss)]
-#[tracing::instrument(skip(peer_streams, bb, byte_progress))]
-pub async fn download_from_peer(
-    hash: HashBytes,
+/// Download a slice of a file from the peer. Initiates the download by specifying the range of bytes to download.
+#[tracing::instrument(skip(peer_streams, bb, file_offsets, byte_progress))]
+pub async fn download_partial_from_peer(
+    expected_hash: HashBytes,
     peer_streams: &mut BiStream,
-    file_size: u64,
-    output_path: &Path,
+    file: &mut tokio::fs::File,
     bb: &mut bytes::BytesMut,
+    file_offsets: DownloadOffsetState,
     byte_progress: Option<&RwLock<u64>>,
 ) -> Result<(), DownloadError> {
-    // Open the file for writing.
-    let mut file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&output_path)
+    // Determine the range of bytes to download and an existing hasher state.
+    let DownloadOffsetState { range, hasher } = file_offsets;
+    let mut hasher = hasher.unwrap_or_default();
+
+    // Seek to the requested offset.
+    file.seek(std::io::SeekFrom::Start(range.start))
         .await
-        .map_err(DownloadError::FileAccess)?;
+        .map_err(FileAccessError::Seek)?;
+
+    // Get the number of bytes to download.
+    let download_size = range.end.saturating_sub(range.start);
 
     // Let the peer know which range we want to download using this QUIC stream.
-    // Here we want the entire file.
+    // TODO: Do not require a `BytesMut` buffer just for these two `u64` values.
     bb.clear();
-    bb.put_u64(0); // Start at the beginning of the file.
-    bb.put_u64(file_size); // Request the file's entire size.
+    bb.put_u64(range.start);
+    bb.put_u64(download_size);
     peer_streams.send.write_all(bb).await?;
 
     // Create a scratch space for reading data from the stream.
@@ -889,8 +943,7 @@ pub async fn download_from_peer(
 
     // Read from the peer and write to the file.
     let mut bytes_written = 0;
-    let mut hasher = sha2::Sha256::new();
-    while bytes_written < file_size {
+    while bytes_written < download_size {
         // Read a natural amount of bytes from the peer.
         let size = peer_streams
             .recv
@@ -900,7 +953,7 @@ pub async fn download_from_peer(
 
         if size > 0 {
             // Ensure we don't write more bytes than were requested in the handshake.
-            let size = usize::try_from(file_size - bytes_written)
+            let size = usize::try_from(download_size - bytes_written)
                 .map(|x| x.min(size))
                 .unwrap_or(size);
 
@@ -911,14 +964,15 @@ pub async fn download_from_peer(
             hasher.update(bb);
 
             // Write the bytes to the file.
-            file.write_all(bb).await.map_err(DownloadError::FileWrite)?;
+            file.write_all(bb).await.map_err(FileAccessError::Write)?;
 
             // Update the number of bytes written.
-            bytes_written += size as u64;
+            let size = size as u64;
+            bytes_written += size;
 
             // Update the caller with the number of bytes written.
             if let Some(progress) = byte_progress.as_ref() {
-                *progress.write().await = bytes_written;
+                *progress.write().await += size;
             }
         }
     }
@@ -931,7 +985,7 @@ pub async fn download_from_peer(
 
     // Ensure the file hash is correct.
     let downloaded_hash = HashBytes::new(hasher.finalize().into());
-    if hash != downloaded_hash {
+    if expected_hash != downloaded_hash {
         return Err(DownloadError::HashMismatch);
     }
 
@@ -940,7 +994,82 @@ pub async fn download_from_peer(
     Ok(())
 }
 
-/// Errors that may occur when attempting to get a file's size and hash.
+/// Reject a download request gracefully by sending a null download range to the peer.
+#[tracing::instrument(skip_all)]
+pub async fn reject_download_request(peer_streams: &mut BiStream) -> Result<(), DownloadError> {
+    // Send a null download range to the peer to reject the download request.
+    let bytes = [0u8; size_of::<u64>() * 2];
+    peer_streams.send.write_all(&bytes).await?;
+
+    Ok(())
+}
+
+/// Download a file from the peer to the specified file path.
+#[tracing::instrument(skip(peer_streams, bb, byte_progress))]
+pub async fn download_from_peer(
+    expected_hash: HashBytes,
+    peer_streams: &mut BiStream,
+    file_size: u64,
+    output_path: &Path,
+    bb: &mut bytes::BytesMut,
+    byte_progress: Option<&RwLock<u64>>,
+) -> Result<(), DownloadError> {
+    let file_offsets = DownloadOffsetState::new(0..file_size, None);
+
+    // Open the file for writing, ensuring it is empty.
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&output_path)
+        .await
+        .map_err(FileAccessError::Open)?;
+
+    Box::pin(download_partial_from_peer(
+        expected_hash,
+        peer_streams,
+        &mut file,
+        bb,
+        file_offsets,
+        byte_progress,
+    ))
+    .await
+}
+
+/// Resume downloading a file from the peer, continuing from the specified `start_offset`.
+#[tracing::instrument(skip(peer_streams, hasher, bb, byte_progress))]
+pub async fn resume_download(
+    expected_hash: HashBytes,
+    peer_streams: &mut BiStream,
+    file_size: u64,
+    start_offset: u64,
+    hasher: sha2::Sha256,
+    output_path: &Path,
+    bb: &mut bytes::BytesMut,
+    byte_progress: Option<&RwLock<u64>>,
+) -> Result<(), DownloadError> {
+    // Indicate to peer that we will start at the given offset and continue to the end of the file.
+    let file_offsets = DownloadOffsetState::new(start_offset..file_size, Some(hasher));
+
+    // Open the file for writing, ensuring the file exists and is appended to.
+    let mut file = tokio::fs::OpenOptions::new()
+        .append(true)
+        .open(&output_path)
+        .await
+        .map_err(FileAccessError::Open)?;
+
+    Box::pin(download_partial_from_peer(
+        expected_hash,
+        peer_streams,
+        &mut file,
+        bb,
+        file_offsets,
+        byte_progress,
+    ))
+    .await
+}
+
+/// Errors that may occur when making file access attempts.
 #[derive(Debug, thiserror::Error)]
 pub enum FileAccessError {
     /// Failed to open the file.
@@ -954,57 +1083,73 @@ pub enum FileAccessError {
     /// Failed to read from the file.
     #[error("Failed to read from the file: {0}")]
     Read(std::io::Error),
+
+    /// Failed to write to the file.
+    #[error("Failed to write to the file: {0}")]
+    Write(std::io::Error),
 }
 
-/// Get a file's size and its SHA-256 hash.
-#[allow(clippy::cast_precision_loss)]
+/// Get access to a file with its size and its current hash state.
+/// The file read position will be after the last byte that was read into the hasher.
 #[tracing::instrument(skip(progress))]
-pub async fn file_size_and_hash(
+pub async fn file_size_and_hasher(
     file_path: &Path,
     progress: Option<&RwLock<f32>>,
-) -> Result<(u64, HashBytes), FileAccessError> {
+) -> Result<(tokio::fs::File, u64, sha2::Sha256), FileAccessError> {
     let mut hasher = sha2::Sha256::new();
-    let mut reader = tokio::io::BufReader::new(
-        tokio::fs::File::open(file_path)
-            .await
-            .map_err(FileAccessError::Open)?,
-    );
+    let mut file = tokio::fs::File::open(file_path)
+        .await
+        .map_err(FileAccessError::Open)?;
 
     // Get the file size so we can report progress.
-    let file_size = reader
+    // It also lets us set a finite size to read.
+    let file_size = file
         .seek(std::io::SeekFrom::End(0))
         .await
         .map_err(FileAccessError::Seek)?;
 
     // Reset the reader to the start of the file.
-    reader
-        .seek(std::io::SeekFrom::Start(0))
+    file.seek(std::io::SeekFrom::Start(0))
         .await
         .map_err(FileAccessError::Seek)?;
 
     let size_float = file_size as f32;
-    let mut hash_byte_buffer = [0; 8192];
+    let mut hash_byte_buffer = [0; 16_384];
     let mut bytes_hashed = 0;
-    loop {
-        let n = reader
+    let mut read_count = 0;
+    while bytes_hashed < file_size {
+        let n = file
             .read(&mut hash_byte_buffer)
             .await
             .map_err(FileAccessError::Read)?;
         if n == 0 {
             break;
         }
+        read_count += 1;
 
         hasher.update(&hash_byte_buffer[..n]);
-        bytes_hashed += n;
+        bytes_hashed += n as u64;
 
         // Update the caller with the number of bytes read.
-        if let Some(progress) = progress.as_ref() {
-            *progress.write().await = bytes_hashed as f32 / size_float;
+        if read_count % 20 == 0 {
+            if let Some(progress) = progress.as_ref() {
+                *progress.write().await = bytes_hashed as f32 / size_float;
+            }
         }
     }
-    let hash = HashBytes::new(hasher.finalize().into());
 
-    Ok((file_size, hash))
+    // Return the actual number of bytes hashed instead of the original fseek position.
+    Ok((file, bytes_hashed, hasher))
+}
+
+/// Get a file's size and its SHA-256 hash.
+#[tracing::instrument(skip(progress))]
+pub async fn file_size_and_hash(
+    file_path: &Path,
+    progress: Option<&RwLock<f32>>,
+) -> Result<(u64, HashBytes), FileAccessError> {
+    let (_, size, hasher) = Box::pin(file_size_and_hasher(file_path, progress)).await?;
+    Ok((size, HashBytes::new(hasher.finalize().into())))
 }
 
 /// Errors that may occur when uploading a file to a peer.
@@ -1036,7 +1181,6 @@ pub enum UploadError {
 }
 
 /// Upload the file to the peer. Ensure they consent to the file size before sending the file.
-#[allow(clippy::cast_precision_loss)]
 #[tracing::instrument(skip(peer_streams, reader, byte_progress))]
 pub async fn upload_to_peer(
     peer_streams: &mut BiStream,
@@ -1062,6 +1206,11 @@ pub async fn upload_to_peer(
         }
     })?;
 
+    if upload_length == 0 {
+        // The peer doesn't want any data from us.
+        return Ok(());
+    }
+
     // Sanity check the upload range.
     match start_index.checked_add(upload_length) {
         Some(end) if end > file_size => Err(UploadError::InvalidRange),
@@ -1086,7 +1235,7 @@ pub async fn upload_to_peer(
 
         if n == 0 {
             // Log that the file has ended unexpectedly. Possible corruption,
-            // but continue loop because `await` call above will ensure we aren't blocking.
+            // but continue loop because `await` call above will ensure we aren't blocking threads.
             tracing::error!("Unexpected EOF while uploading");
             continue;
         }
@@ -1095,7 +1244,10 @@ pub async fn upload_to_peer(
         let remaining = upload_length - bytes_sent;
         if n as u64 > remaining {
             // `remaining` must be able to fit in `usize` since it is less than `n: usize`.
-            n = usize::try_from(remaining).unwrap();
+            #[allow(clippy::cast_possible_truncation)]
+            let remaining = remaining as usize;
+
+            n = remaining;
         }
 
         // Write the bytes to the peer.
@@ -1133,6 +1285,7 @@ pub enum IncomingPeerState {
 }
 
 /// A manager for incoming and connected peers.
+//  TODO: Use a task master to spawn tasks for each connected peer.
 #[derive(Clone, Default)]
 pub struct ConnectionsManager {
     map: Arc<RwLock<HashMap<SocketAddr, IncomingPeerState>>>,
@@ -1196,10 +1349,15 @@ impl ConnectionsManager {
         };
 
         // Wait for the peer to connect or timeout.
-        tokio::time::timeout(timeout, rx.into_future())
+        let incoming_connection = tokio::time::timeout(timeout, rx.into_future())
             .await
             .ok()
-            .and_then(Result::ok)
+            .and_then(Result::ok);
+
+        // Log the time when the incoming wait completes.
+        tracing::debug!("Peer connection awaited");
+
+        incoming_connection
     }
 
     /// Accept a peer connection and hand-off to any threads awaiting the connection.
@@ -1239,6 +1397,16 @@ impl ConnectionsManager {
     #[tracing::instrument(skip(self))]
     pub fn blocking_remove_peer(&mut self, peer_address: &SocketAddr) {
         if self.map.blocking_write().remove(peer_address).is_none() {
+            tracing::warn!("Connection manager removed a non-existent peer");
+        } else {
+            tracing::debug!("Connection manager removed peer");
+        }
+    }
+
+    /// Remove a peer from the manager, with asynchronous lock behavior.
+    #[tracing::instrument(skip(self))]
+    pub async fn remove_peer(&mut self, peer_address: &SocketAddr) {
+        if self.map.write().await.remove(peer_address).is_none() {
             tracing::warn!("Connection manager removed a non-existent peer");
         } else {
             tracing::debug!("Connection manager removed peer");
@@ -1285,8 +1453,22 @@ impl ConnectionsManager {
     }
 
     /// Get the connection state of a peer.
-    pub fn get_connection(&self, peer_address: &SocketAddr) -> Option<quinn::Connection> {
+    /// # Panics
+    /// Cannot be used in async contexts. Will panic if used in an async runtime.
+    pub fn get_connection_sync(&self, peer_address: &SocketAddr) -> Option<quinn::Connection> {
         if let Some(IncomingPeerState::Connected(c)) = self.map.blocking_read().get(peer_address) {
+            Some(c.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Get the connection state of a peer.
+    pub async fn get_connection_async(
+        &self,
+        peer_address: &SocketAddr,
+    ) -> Option<quinn::Connection> {
+        if let Some(IncomingPeerState::Connected(c)) = self.map.read().await.get(peer_address) {
             Some(c.clone())
         } else {
             None
