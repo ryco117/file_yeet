@@ -8,9 +8,7 @@ use std::{
 };
 
 use bytes::BufMut as _;
-use file_yeet_shared::{
-    BiStream, HashBytes, SocketAddrHelper, GOODBYE_CODE, MAX_SERVER_COMMUNICATION_SIZE,
-};
+use file_yeet_shared::{BiStream, ExpectedSocketError, HashBytes, SocketAddrHelper, GOODBYE_CODE};
 use futures_util::TryFutureExt;
 use rustls::pki_types::CertificateDer;
 use sha2::Digest as _;
@@ -221,7 +219,8 @@ pub async fn prepare_server_connection(
     };
 
     // Read the server's response to the sanity check.
-    let mut sanity_check = socket_ping_request(&connection).await?;
+    let sanity_check = socket_ping_request(&connection).await?;
+    let mut sanity_check = (sanity_check, sanity_check.to_string());
     tracing::info!("Server sees us as {}", sanity_check.1);
 
     if let Some(port) = port_override {
@@ -391,13 +390,9 @@ pub enum SocketPingError {
     #[error("Failed to send ping: {0}")]
     SendRequest(std::io::Error),
 
-    /// Failed to read ping response size.
-    #[error("Failed to read ping response size: {0}")]
-    ReadSize(std::io::Error),
-
     /// Failed to read response text.
     #[error("Failed to read ping response text: {0}")]
-    ResponseText(#[from] ExpectedTextError),
+    ResponseText(#[from] ExpectedSocketError),
 
     /// Failed to parse the response socket address.
     #[error("Failed to parse the response address: {0}")]
@@ -409,7 +404,7 @@ pub enum SocketPingError {
 #[tracing::instrument(skip_all)]
 pub async fn socket_ping_request(
     server_connection: &quinn::Connection,
-) -> Result<(SocketAddr, String), SocketPingError> {
+) -> Result<SocketAddr, SocketPingError> {
     // Create a bi-directional stream to the server.
     let mut server_streams: BiStream = server_connection.open_bi().await?.into();
 
@@ -421,16 +416,9 @@ pub async fn socket_ping_request(
         .map_err(SocketPingError::SendRequest)
         .await?;
 
-    // Read the server's response to the sanity check.
-    let string_len = server_streams
-        .recv
-        .read_u16()
-        .await
-        .map_err(SocketPingError::ReadSize)?;
-    let sanity_check = expect_server_text(&mut server_streams.recv, string_len).await?;
-    let sanity_check_addr = sanity_check.parse()?;
-
-    Ok((sanity_check_addr, sanity_check))
+    // Read the server's response to the ping request.
+    let (ip, port) = file_yeet_shared::read_ip_and_port(&mut server_streams.recv).await?;
+    Ok(SocketAddr::new(ip, port))
 }
 
 /// Errors that may occur when sending a port override request.
@@ -493,9 +481,7 @@ pub async fn introduction(
     bb.clear();
     bb.put_u16(file_yeet_shared::ClientApiRequest::Introduction as u16);
     bb.put(&hash.bytes[..]);
-    let address_str = external_address.to_string();
-    bb.put_u8(u8::try_from(address_str.len()).expect("Address string is too long"));
-    bb.put(address_str.as_bytes());
+    file_yeet_shared::write_ip_and_port(bb, external_address.ip(), external_address.port());
     server_streams.send.write_all(bb).await?;
 
     Ok(())
@@ -537,31 +523,11 @@ pub async fn publish(
 }
 
 /// Errors that may occur when reading a subscriber address from the server.
-#[derive(Clone, Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum ReadSubscribingPeerError {
-    /// Failed to read response size from the server and got a `ReadError`.
-    #[error("Failed to read response size from the server: {0}")]
-    ReadSizeFailedWithError(#[from] quinn::ReadError),
-
-    /// Failed to read response size from the server and got an `ErrorKind`.
-    #[error("Failed to read response size from the server: {0}")]
-    ReadSizeFailedWithKind(std::io::ErrorKind),
-
-    /// The server sent an invalid response size.
-    #[error("The server sent an invalid response size: {0}")]
-    InvalidResponseSize(u16),
-
-    /// Failed to read peer address from the server.
-    #[error("Failed to read peer address from the server: {0}")]
-    ReadAddressFailed(#[from] quinn::ReadExactError),
-
-    /// The server did not send a valid UTF-8 response.
-    #[error("The server did not send a valid UTF-8 response: {0}")]
-    InvalidUtf8(#[from] std::str::Utf8Error),
-
-    /// The server did not send a valid socket address string.
-    #[error("The server did not send a valid socket address string: {0}")]
-    InvalidAddress(#[from] std::net::AddrParseError),
+    /// Failed to get valid socket address from stream.
+    #[error("Failed to read valid peer address from stream: {0}")]
+    ReadSocket(#[from] ExpectedSocketError),
 
     /// The server sent our address back to us.
     #[error("The server sent our address back to us")]
@@ -574,26 +540,9 @@ pub async fn read_subscribing_peer(
     server_recv: &mut quinn::RecvStream,
     our_external_address: Option<SocketAddr>,
 ) -> Result<SocketAddr, ReadSubscribingPeerError> {
-    let data_len = server_recv.read_u16().await.map_err(|e| {
-        let kind = e.kind();
-        if let Ok(e) = e.downcast::<quinn::ReadError>() {
-            ReadSubscribingPeerError::ReadSizeFailedWithError(e)
-        } else {
-            ReadSubscribingPeerError::ReadSizeFailedWithKind(kind)
-        }
-    })?;
-    if data_len == 0 || data_len as usize > MAX_SERVER_COMMUNICATION_SIZE {
-        return Err(ReadSubscribingPeerError::InvalidResponseSize(data_len));
-    }
-
-    // Allocate scratch space for the maximum response size.
-    let mut scratch_space = [0; MAX_SERVER_COMMUNICATION_SIZE];
-    let peer_string_bytes = &mut scratch_space[..data_len as usize];
-    server_recv.read_exact(peer_string_bytes).await?;
-
     // Parse the response as a peer socket address or skip this message.
-    let peer_string = std::str::from_utf8(peer_string_bytes)?;
-    let peer_address = peer_string.parse()?;
+    let (ip, port) = file_yeet_shared::read_ip_and_port(server_recv).await?;
+    let peer_address = SocketAddr::new(ip, port);
 
     // Ensure the server isn't sending us our own address.
     if our_external_address.is_some_and(|a| a == peer_address) {
@@ -624,7 +573,7 @@ pub enum SubscribeError {
 
     /// Failed to read response from the server.
     #[error("Failed to read response from the server: {0}")]
-    ReadResponse(#[from] ExpectedTextError),
+    ReadResponse(#[from] ExpectedSocketError),
 
     /// Failed to parse a peer address from the server response.
     #[error("Failed to parse a peer address from the server response: {0}")]
@@ -666,23 +615,13 @@ pub async fn subscribe(
         return Ok(Vec::with_capacity(0));
     }
 
-    let mut peers = Vec::new();
-
     // Parse each peer socket address and file size.
+    let mut peers = Vec::new();
     for _ in 0..response_count {
-        // Read the incoming peer address length.
-        let address_len = server_streams.recv.read_u8().await.map_err(|e| {
-            let kind = e.kind();
-            if let Ok(e) = e.downcast::<quinn::ReadError>() {
-                SubscribeError::ReadSizeFailedWithError(e)
-            } else {
-                SubscribeError::ReadSizeFailedWithKind(kind)
-            }
-        })?;
-
-        // Read the incoming peer address to memory.
-        let peer_address_str =
-            expect_server_text(&mut server_streams.recv, u16::from(address_len)).await?;
+        // Read the incoming peer socket address.
+        let (peer_ip, peer_port) =
+            file_yeet_shared::read_ip_and_port(&mut server_streams.recv).await?;
+        let peer_address = SocketAddr::new(peer_ip, peer_port);
 
         // Read the incoming file size.
         let file_size = server_streams.recv.read_u64().await.map_err(|e| {
@@ -694,15 +633,7 @@ pub async fn subscribe(
             }
         })?;
 
-        // Parse the peer address into a socket address.
-        let peer_address = match peer_address_str.parse() {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!("Failed to parse peer address {peer_address_str}: {e}");
-                continue;
-            }
-        };
-
+        // TODO: Warn if `our_external_address` is not set.
         if our_external_address.is_some_and(|a| a == peer_address) {
             tracing::debug!("Skipping our own address from the server response");
             continue;
@@ -712,39 +643,6 @@ pub async fn subscribe(
     }
 
     Ok(peers)
-}
-
-/// Errors that may occur when attempting to read a UTF-8 string from a connection.
-#[derive(Debug, thiserror::Error)]
-pub enum ExpectedTextError {
-    /// Specified size was larger than the allowed maximum.
-    #[error("Specified size was larger than the allowed maximum")]
-    SizeExceeded,
-
-    /// Failed to read the expected number of bytes from the server.
-    #[error("{0}")]
-    ReadError(#[from] quinn::ReadExactError),
-
-    /// The bytes read were not valid UTF-8.
-    #[error("{0}")]
-    Utf8Error(#[from] std::str::Utf8Error),
-}
-
-/// Try to read a valid UTF-8 from the server until the expected length is reached.
-#[tracing::instrument(skip(stream))]
-async fn expect_server_text(
-    stream: &mut quinn::RecvStream,
-    len: u16,
-) -> Result<String, ExpectedTextError> {
-    // Ensure the expected max size is respected.
-    if len as usize > MAX_SERVER_COMMUNICATION_SIZE {
-        return Err(ExpectedTextError::SizeExceeded);
-    }
-
-    let mut raw_bytes = [0; MAX_SERVER_COMMUNICATION_SIZE];
-    let expected_slice = &mut raw_bytes[..len as usize];
-    stream.read_exact(expected_slice).await?;
-    Ok(std::str::from_utf8(expected_slice)?.to_owned())
 }
 
 /// Attempt to connect to peer using UDP hole punching.

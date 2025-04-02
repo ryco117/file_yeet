@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     mem::size_of,
-    net::SocketAddr,
+    net::{IpAddr, Ipv6Addr, SocketAddr},
     num::{NonZeroU16, NonZeroU32},
     sync::Arc,
 };
@@ -21,11 +21,14 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 /// A client stream that is handling a publish request.
 #[derive(Debug)]
 struct Publisher {
-    /// A reference to the client's socket address as a string.
-    pub address: Arc<RwLock<String>>,
+    /// The IPv6-mapped address of the client publishing the file.
+    pub peer_ip: Ipv6Addr,
+
+    /// A reference to the mutable preferred port of the publishing client.
+    pub preferred_port: Arc<RwLock<u16>>,
 
     /// A channel to send messages to the task handling this client's publish request.
-    pub stream: mpsc::Sender<String>,
+    pub stream: mpsc::Sender<(Ipv6Addr, u16)>,
 }
 type PublisherRef = Arc<RwLock<Publisher>>;
 
@@ -232,10 +235,6 @@ enum ClientRequestError {
     /// An I/O error on occurred when reading or writing to a QUIC stream.
     #[error("I/O error on peer stream: {0}")]
     IoError(std::io::Error),
-
-    /// Invalid content was sent by the client in the request.
-    #[error("Invalid request content was sent by the client")]
-    InvalidRequestContent,
 }
 
 /// Track a connection with a client and the state made through requests.
@@ -243,23 +242,18 @@ enum ClientRequestError {
 struct ClientSession {
     /// Unique identifier for the client session.
     pub nonce: Nonce,
-    pub sock_string: Arc<RwLock<String>>,
-    pub port_used: u16,
+    pub preferred_port: Arc<RwLock<u16>>,
     pub client_pubs: Vec<PublisherRef>,
     pub cancellation_token: CancellationToken,
 }
 impl ClientSession {
     pub fn new(socket_addr: SocketAddr, cancellation_token: CancellationToken) -> Self {
-        let mut sock_string = socket_addr.to_string();
-        sock_string.make_ascii_lowercase();
-        let sock_string = Arc::new(RwLock::new(sock_string));
-        let port_used = socket_addr.port();
+        let preferred_port = Arc::new(RwLock::new(socket_addr.port()));
         let nonce = random_nonce();
 
         Self {
             nonce,
-            sock_string,
-            port_used,
+            preferred_port,
             client_pubs: Vec::new(),
             cancellation_token,
         }
@@ -281,9 +275,9 @@ async fn handle_quic_connection(
 
     let session = Arc::new(RwLock::new(ClientSession::new(
         socket_addr,
-        cancellation_token,
+        cancellation_token.clone(),
     )));
-    let session_sock_string = session.read().await.sock_string.clone();
+    let client_preferred_port = session.read().await.preferred_port.clone();
     loop {
         // Accept a new stream for each client request.
         // QUIC streams are very cheap and multiple streams lends itself to concurrent requests.
@@ -301,20 +295,20 @@ async fn handle_quic_connection(
                 .map_err(ClientRequestError::IoError)?,
         )
         .map_err(|e| ClientRequestError::InvalidApiRequestCode(e.number))?;
-        tracing::info!("{api} from {}", session_sock_string.read().await);
+        tracing::info!("{api} from {socket_addr}");
 
         match api {
             // Send a ping response to the client.
             ClientApiRequest::SocketPing => {
-                let cancel = session.read().await.cancellation_token.clone();
-                let sock_string = session_sock_string.clone();
+                let cancel = cancellation_token.clone();
+                let port = client_preferred_port.clone();
                 task_master.spawn(async move {
                     tokio::select! {
                         // Allow the server to cancel the task.
                         () = cancel.cancelled() => {}
 
                         // Handle the client's request for a ping response.
-                        r = socket_ping(client_streams.send, &sock_string) => {
+                        r = socket_ping(client_streams.send, socket_addr.ip(), &port) => {
                             if let Err(e) = r {
                                 tracing::error!("Failed to send ping response: {e}");
                             }
@@ -325,15 +319,15 @@ async fn handle_quic_connection(
 
             // Update the client's address string with the new port.
             ClientApiRequest::PortOverride => {
-                let session = session.clone();
+                let port = client_preferred_port.clone();
+                let cancel = cancellation_token.clone();
                 task_master.spawn(async move {
-                    let cancel = session.read().await.cancellation_token.clone();
                     tokio::select! {
                         // Allow the server to cancel the task.
                         () = cancel.cancelled() => {}
 
                         // Handle the client's request to override the port.
-                        r = port_override(&session, client_streams.recv, socket_addr) => {
+                        r = port_override(client_streams.recv, socket_addr, &port) => {
                             if let Err(e) = r {
                                 tracing::error!("Failed to send ping response: {e}");
                             }
@@ -345,16 +339,22 @@ async fn handle_quic_connection(
             // Create a new task to handle the client's file-publishing request.
             ClientApiRequest::Publish => {
                 let session = session.clone();
+                let cancel = cancellation_token.clone();
                 let task_master_copy = task_master.clone();
                 let publishers = publishers.clone();
                 task_master.spawn(async move {
-                    let cancel = session.read().await.cancellation_token.clone();
                     tokio::select! {
                         // Allow the server to cancel the task.
                         () = cancel.cancelled() => {}
 
                         // Handle the publish request.
-                        r = handle_publish(&session, client_streams, publishers, task_master_copy) => {
+                        r = handle_publish(
+                            &session,
+                            client_streams,
+                            socket_addr.ip(),
+                            publishers,
+                            task_master_copy,
+                        ) => {
                             if let Err(e) = r {
                                 tracing::error!("Failed to handle publish request: {e}");
                             }
@@ -365,16 +365,16 @@ async fn handle_quic_connection(
 
             // Handle the client's file-subscription request.
             ClientApiRequest::Subscribe => {
-                let session = session.clone();
+                let cancel = cancellation_token.clone();
+                let port = *client_preferred_port.read().await;
                 let publishers = publishers.clone();
                 task_master.spawn(async move {
-                    let cancel = session.read().await.cancellation_token.clone();
                     tokio::select! {
                         // Allow the server to cancel the task.
                         () = cancel.cancelled() => {}
 
                         // Handle the client's request to subscribe to a file hash.
-                        r = handle_subscribe(&session, client_streams, &publishers) => {
+                        r = handle_subscribe(client_streams, socket_addr.ip(), port, &publishers) => {
                             if let Err(e) = r {
                                 tracing::error!("Failed to handle subscribe request: {e}");
                             }
@@ -385,16 +385,16 @@ async fn handle_quic_connection(
 
             // Handle the client's request to be introduced to a specific peer over a certain file hash.
             ClientApiRequest::Introduction => {
-                let session = session.clone();
+                let cancel = cancellation_token.clone();
+                let port = *client_preferred_port.read().await;
                 let publishers = publishers.clone();
                 task_master.spawn(async move {
-                    let cancel = session.read().await.cancellation_token.clone();
                     tokio::select! {
                         // Allow the server to cancel the task.
                         () = cancel.cancelled() => {}
 
                         // Handle the client's request to be introduced to a specific peer.
-                        r = handle_introduction(&session, client_streams, &publishers) => {
+                        r = handle_introduction(client_streams, socket_addr.ip(), port, &publishers) => {
                             if let Err(e) = r {
                                 tracing::error!("Failed to handle introduction request: {e}");
                             }
@@ -415,16 +415,14 @@ fn random_nonce() -> Nonce {
 #[tracing::instrument(skip_all)]
 async fn socket_ping(
     mut quic_send: quinn::SendStream,
-    sock_string: &RwLock<String>,
+    peer_ip: IpAddr,
+    preferred_port: &RwLock<u16>,
 ) -> Result<(), ClientRequestError> {
-    let mut bb = bytes::BytesMut::with_capacity(MAX_SERVER_COMMUNICATION_SIZE);
+    const RESPONSE_SIZE: usize = 16 + 2;
+    let mut bb = bytes::BytesMut::with_capacity(RESPONSE_SIZE);
 
-    // Format the ping response as a length and UTF-8 string.
-    {
-        let sock_string = sock_string.read().await;
-        bb.put_u16(u16::try_from(sock_string.len()).expect("Message content length is invalid"));
-        bb.put(sock_string.as_bytes());
-    }
+    // Format the ping response as a mapped IPv6 address and port.
+    file_yeet_shared::write_ip_and_port(&mut bb, peer_ip, *preferred_port.read().await);
 
     // Send the ping response to the client.
     quic_send
@@ -434,44 +432,24 @@ async fn socket_ping(
 }
 
 /// Update the client's address string with the new port.
-#[tracing::instrument(skip(session, quic_recv))]
+#[tracing::instrument(skip(quic_recv, preferred_port))]
 async fn port_override(
-    session: &RwLock<ClientSession>,
     mut quic_recv: quinn::RecvStream,
-    socket_addr: SocketAddr,
+    peer_socket: SocketAddr,
+    preferred_port: &RwLock<u16>,
 ) -> Result<(), ClientRequestError> {
-    let port = quic_recv
+    let mut port = quic_recv
         .read_u16()
         .await
         .map_err(ClientRequestError::IoError)?;
 
-    {
-        let session = session.read().await;
-
-        // Avoid unnecessary string allocations.
-        if port == session.port_used {
-            return Ok(());
-        }
-
-        // Update the shared string with the new port.
-        *session.sock_string.write().await = {
-            let mut a = socket_addr;
-            a.set_port(port);
-            a.to_string()
-        };
+    tracing::info!("Overriding port with {port}");
+    if port == 0 {
+        port = peer_socket.port();
     }
 
-    tracing::info!("Overriding port to {port}");
-    session.write().await.port_used = port;
-
-    {
-        let session = session.read().await;
-
-        // Update the client address string for each
-        for pub_lock in &session.client_pubs {
-            pub_lock.write().await.address = session.sock_string.clone();
-        }
-    }
+    // Update the mutable lock with the new port.
+    *preferred_port.write().await = port;
 
     Ok(())
 }
@@ -481,6 +459,7 @@ async fn port_override(
 async fn handle_publish(
     session: &RwLock<ClientSession>,
     mut client_streams: BiStream,
+    peer_address: IpAddr,
     publishers: PublishersRef,
     task_master: TaskTracker,
 ) -> Result<(), ClientRequestError> {
@@ -504,23 +483,17 @@ async fn handle_publish(
         }
     }
     /// A loop to handle messages to be sent to a client publishing a file hash.
-    #[tracing::instrument(skip(quic_send, rx, sock_string))]
+    #[tracing::instrument(skip(quic_send, rx))]
     async fn handle_publish_inner(
         mut quic_send: quinn::SendStream,
-        mut rx: mpsc::Receiver<String>,
-        sock_string: &RwLock<String>,
-        hash_hex: &str,
+        mut rx: mpsc::Receiver<(Ipv6Addr, u16)>,
     ) {
-        tracing::info!(
-            "Starting publish task for client {}",
-            sock_string.read().await
-        );
+        tracing::info!("Starting publish task for client");
         let mut bb = bytes::BytesMut::with_capacity(MAX_SERVER_COMMUNICATION_SIZE);
 
-        while let Some(message) = rx.recv().await {
-            // Format the message as a length and UTF-8 string.
-            bb.put_u16(u16::try_from(message.len()).expect("Message content length is invalid"));
-            bb.put(message.as_bytes());
+        while let Some((peer_ip, port)) = rx.recv().await {
+            // Format the message as an IP address and port.
+            file_yeet_shared::write_ipv6_and_port(&mut bb, peer_ip, port);
 
             // Try to send the message to the client.
             if let Err(e) = quic_send.write_all(&bb).await {
@@ -530,7 +503,7 @@ async fn handle_publish(
             // Clear the scratch space before the next iteration.
             bb.clear();
 
-            tracing::info!("Introduced {message} to {}", sock_string.read().await);
+            tracing::info!("Introduced {peer_ip} to peer");
         }
     }
 
@@ -548,15 +521,17 @@ async fn handle_publish(
 
     // Use a channel to handle buffering and flushing of messages.
     // Ensures that the stream doesn't need to be cloned or passed between threads.
-    let (tx, rx) = mpsc::channel::<String>(8);
+    let (tx, rx) = mpsc::channel::<(Ipv6Addr, u16)>(8);
 
-    let (sock_string, session_nonce) = {
+    let (preferred_port, session_nonce) = {
         let session = session.read().await;
-        (session.sock_string.clone(), session.nonce)
+        (session.preferred_port.clone(), session.nonce)
     };
 
+    let peer_ip = file_yeet_shared::ipv6_mapped(peer_address);
     let client: Arc<RwLock<Publisher>> = Arc::new(RwLock::new(Publisher {
-        address: sock_string.clone(),
+        peer_ip,
+        preferred_port: preferred_port.clone(),
         stream: tx,
     }));
     session.write().await.client_pubs.push(client.clone());
@@ -576,40 +551,34 @@ async fn handle_publish(
     // Create a cancellable task to handle the client's publish request.
     let mut client_cancel_scratch = [0u8; 1];
 
-    // Copy relevant session data to the task context.
     let cancellation_token = session.read().await.cancellation_token.clone();
-
     task_master.spawn(async move {
-        let hash_hex = hash.to_string();
-
         tokio::select! {
             // Allow the server to cancel the task.
             () = cancellation_token.cancelled() => {}
 
-            // Allow the client to cancel their publish request with a single byte.
+            // Allow the client to gracefully cancel their publish request with a single byte.
             _ = client_streams.recv.read_exact(&mut client_cancel_scratch) => {}
 
             // Handle the client's file-publishing task.
-            () = handle_publish_inner(client_streams.send, rx, &sock_string, &hash_hex) => {}
+            () = handle_publish_inner(client_streams.send, rx) => {}
         }
 
         // Remove any reference there may be to this publish task.
         try_remove_publisher(session_nonce, hash, publishers).await;
 
-        tracing::info!(
-            "Finishing publish task for client {} {hash_hex}",
-            sock_string.read().await
-        );
+        tracing::info!("Finishing publish task for client {hash}",);
     });
 
     Ok(())
 }
 
 /// Handle a client request to subscribe to a file hash, receiving a list of peers that are publishing this hash.
-#[tracing::instrument(skip_all)]
+#[tracing::instrument(skip(client_streams, client_preferred_port, clients))]
 async fn handle_subscribe(
-    session: &RwLock<ClientSession>,
     mut client_streams: BiStream,
+    client_ip: IpAddr,
+    client_preferred_port: u16,
     clients: &PublishersRef,
 ) -> Result<(), ClientRequestError> {
     // Start by getting the file hash from the client.
@@ -621,6 +590,7 @@ async fn handle_subscribe(
         .map_err(|_| {
             ClientRequestError::IoError(std::io::Error::from(std::io::ErrorKind::UnexpectedEof))
         })?;
+    let client_ip = file_yeet_shared::ipv6_mapped(client_ip);
 
     // Attempt to get the client from the map.
     let read_lock = clients.read().await;
@@ -642,17 +612,17 @@ async fn handle_subscribe(
     bb.put_u16(0);
 
     let clients = client_list.iter();
-    let publisher_sock_string = session.read().await.sock_string.read().await.clone();
     let mut n: u16 = 0;
     for (_, pub_client) in clients {
         let file_size = pub_client.file_size;
 
         // Get read access on client lock.
         let pub_client = pub_client.publisher.read().await;
-        let client_address = pub_client.address.read().await;
+        let publishing_ip = pub_client.peer_ip;
+        let publishing_port = *pub_client.preferred_port.read().await;
 
         // Ensure that the message doesn't exceed the maximum size.
-        if bb.len() + (size_of::<u64>() + size_of::<u8>()) + client_address.len()
+        if bb.len() + size_of::<[u8; 16]>() + size_of::<u16>() + size_of::<u64>()
             > MAX_SERVER_COMMUNICATION_SIZE
         {
             break;
@@ -660,11 +630,13 @@ async fn handle_subscribe(
 
         // Feed the subscribing client's socket address to the task that handles communicating with the publisher.
         // Only include the peer if the message was successfully passed.
-        if let Ok(()) = pub_client.stream.send(publisher_sock_string.clone()).await {
+        if let Ok(()) = pub_client
+            .stream
+            .send((client_ip, client_preferred_port))
+            .await
+        {
             // Send the publisher's socket address to the subscribing client.
-            let client_address_bytes = client_address.as_bytes();
-            bb.put_u8(u8::try_from(client_address_bytes.len()).unwrap());
-            bb.put(client_address_bytes);
+            file_yeet_shared::write_ipv6_and_port(&mut bb, publishing_ip, publishing_port);
 
             // Send the file size to the subscribing client.
             bb.put_u64(file_size);
@@ -685,7 +657,7 @@ async fn handle_subscribe(
         .map_err(|e| ClientRequestError::IoError(e.into()))?;
 
     if n != 0 {
-        tracing::debug!("Introduced {n} peers to {publisher_sock_string}");
+        tracing::debug!("Introduced {n} peers");
     }
 
     Ok(())
@@ -694,8 +666,9 @@ async fn handle_subscribe(
 /// Handle a client request to be introduced to a specific client regarding a file they are publishing.
 #[tracing::instrument(skip_all)]
 async fn handle_introduction(
-    session: &RwLock<ClientSession>,
     mut client_streams: BiStream,
+    client_ip: IpAddr,
+    client_preferred_port: u16,
     clients: &PublishersRef,
 ) -> Result<(), ClientRequestError> {
     let mut hash = HashBytes::default();
@@ -707,18 +680,13 @@ async fn handle_introduction(
             ClientRequestError::IoError(std::io::Error::from(std::io::ErrorKind::UnexpectedEof))
         })?;
 
-    let address_len = client_streams.recv.read_u8().await.map_err(|_| {
-        ClientRequestError::IoError(std::io::Error::from(std::io::ErrorKind::UnexpectedEof))
-    })?;
-
-    let mut scratch_space = [0; 256];
-    let slice = &mut scratch_space[..address_len as usize];
-    client_streams.recv.read_exact(slice).await.map_err(|_| {
-        ClientRequestError::IoError(std::io::Error::from(std::io::ErrorKind::UnexpectedEof))
-    })?;
-    let peer_address = std::str::from_utf8(slice)
-        .map(str::to_lowercase)
-        .map_err(|_| ClientRequestError::InvalidRequestContent)?;
+    // Read the requested IP address and port from the stream.
+    let (requested_peer_ip, requested_peer_port) =
+        file_yeet_shared::read_ip_and_port(&mut client_streams.recv)
+            .await
+            .map_err(|_| {
+                ClientRequestError::IoError(std::io::Error::from(std::io::ErrorKind::UnexpectedEof))
+            })?;
 
     // Attempt to get the clients from the file-hash map.
     let read_lock = clients.read().await;
@@ -727,17 +695,23 @@ async fn handle_introduction(
         return Ok(());
     };
 
+    let client_ip = file_yeet_shared::ipv6_mapped(client_ip);
     for pub_client in client_list.values() {
         // Get read access on client lock.
         let pub_client = pub_client.publisher.read().await;
-        let client_address = pub_client.address.read().await;
+        let publishing_ip = pub_client.peer_ip;
+        let publishing_port = &pub_client.preferred_port;
 
-        if client_address.eq(&peer_address) {
-            let sock_string = session.read().await.sock_string.read().await.clone();
-
+        if publishing_ip.eq(&requested_peer_ip)
+            && *publishing_port.read().await == requested_peer_port
+        {
             // Feed the subscribing client's socket address to the task that handles communicating with the publisher.
-            if let Ok(()) = pub_client.stream.send(sock_string.clone()).await {
-                tracing::debug!("Introduced publisher {peer_address} to {sock_string}");
+            if let Ok(()) = pub_client
+                .stream
+                .send((client_ip, client_preferred_port))
+                .await
+            {
+                tracing::debug!("Introduced publisher {publishing_ip}");
             }
         }
     }

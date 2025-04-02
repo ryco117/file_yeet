@@ -1,5 +1,5 @@
 use std::{
-    net::{Ipv4Addr, SocketAddr, ToSocketAddrs as _},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs as _},
     num::NonZeroU16,
     sync::Arc,
     time::Duration,
@@ -159,6 +159,80 @@ impl From<(quinn::SendStream, quinn::RecvStream)> for BiStream {
     fn from((send, recv): (quinn::SendStream, quinn::RecvStream)) -> Self {
         Self { send, recv }
     }
+}
+
+/// Convert an IP address to an IPv6-mapped address.
+/// This is an unambiguous way to represent either IPv4 or IPv6 addresses within an IPv6 address.
+/// See <https://en.wikipedia.org/wiki/IPv6#IPv4-mapped_IPv6_addresses>
+/// or <https://www.rfc-editor.org/rfc/rfc4291#section-2.5.5.2> for more information.
+#[must_use]
+pub fn ipv6_mapped(ip: IpAddr) -> Ipv6Addr {
+    match ip {
+        IpAddr::V4(ip) => ip.to_ipv6_mapped(),
+        IpAddr::V6(ip) => ip,
+    }
+}
+
+/// Write an IPv6 address and port to the stream as a fixed length.
+pub fn write_ipv6_and_port(bb: &mut bytes::BytesMut, ipv6: Ipv6Addr, port: u16) {
+    use bytes::BufMut as _;
+    bb.put(&ipv6.octets()[..]);
+    bb.put_u16(port);
+}
+
+/// Write an IP address and port to the stream as a fixed length.
+pub fn write_ip_and_port(bb: &mut bytes::BytesMut, ip: IpAddr, port: u16) {
+    write_ipv6_and_port(bb, ipv6_mapped(ip), port);
+}
+
+/// Errors that may occur when attempting to read a UTF-8 string from a connection.
+#[derive(Debug, thiserror::Error)]
+pub enum ExpectedSocketError {
+    /// Failed to read the IP address from the stream.
+    #[error("Failed to read IP: {0}")]
+    ReadIp(#[from] quinn::ReadExactError),
+
+    /// Failed to read the port from the stream.
+    #[error("Failed to read port: {0}")]
+    ReadPort(#[from] std::io::Error),
+
+    /// The IP address received was empty.
+    #[error("The received IP address was empty")]
+    UnspecifiedAddress,
+}
+
+/// Try to read a valid IP address and port from the stream.
+/// # Errors
+/// Fails if the IP address is empty, or the address and port cannot be read from the stream.
+pub async fn read_ip_and_port(
+    stream: &mut quinn::RecvStream,
+) -> Result<(IpAddr, u16), ExpectedSocketError> {
+    use tokio::io::AsyncReadExt as _;
+
+    // Read the requested IP address from the stream.
+    let mut ip_octets = [0; 16];
+    stream.read_exact(&mut ip_octets).await?;
+    let mapped_ipv6 = Ipv6Addr::from(ip_octets);
+
+    if mapped_ipv6.is_unspecified() {
+        return Err(ExpectedSocketError::UnspecifiedAddress);
+    }
+
+    // Use mapped IPv6 addresses for a fixed length IP address without version ambiguity.
+    let ip = if let Some(ipv4) = mapped_ipv6.to_ipv4_mapped() {
+        if ipv4.is_unspecified() {
+            return Err(ExpectedSocketError::UnspecifiedAddress);
+        }
+
+        IpAddr::V4(ipv4)
+    } else {
+        IpAddr::V6(mapped_ipv6)
+    };
+
+    // Read the requested port from the stream.
+    let port = stream.read_u16().await?;
+
+    Ok((ip, port))
 }
 
 /// Set reasonable transport config defaults for the server as well as peers when receiving connections.

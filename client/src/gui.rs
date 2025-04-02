@@ -10,7 +10,8 @@ use std::{
 };
 
 use file_yeet_shared::{
-    BiStream, HashBytes, DEFAULT_PORT, GOODBYE_CODE, GOODBYE_MESSAGE, MAX_SERVER_COMMUNICATION_SIZE,
+    BiStream, ExpectedSocketError, HashBytes, DEFAULT_PORT, GOODBYE_CODE, GOODBYE_MESSAGE,
+    MAX_SERVER_COMMUNICATION_SIZE,
 };
 use iced::{widget, window, Element};
 use tokio::{io::AsyncWriteExt as _, sync::RwLock};
@@ -552,7 +553,7 @@ pub enum Message {
     PublishRequestResulted(Nonce, PublishRequestResult),
 
     /// The result of trying to receive a peer from the server.
-    PublishPeerReceived(Nonce, Result<SocketAddr, ReadSubscribingPeerError>),
+    PublishPeerReceived(Nonce, Result<SocketAddr, Arc<ReadSubscribingPeerError>>),
 
     /// The result of trying to connect to a peer to publish to.
     PublishPeerConnectResulted(Nonce, Option<PeerRequestStream>),
@@ -2056,7 +2057,7 @@ impl AppState {
     fn update_publish_peer_received(
         &mut self,
         nonce: Nonce,
-        result: Result<SocketAddr, ReadSubscribingPeerError>,
+        result: Result<SocketAddr, Arc<ReadSubscribingPeerError>>,
     ) -> iced::Task<Message> {
         let ConnectionState::Connected(ConnectedState {
             endpoint,
@@ -3282,17 +3283,7 @@ async fn peers_requesting_publish_loop(
             ) => {
                 // Handle errors appropriately based on the error type.
                 if let Err(e) = &result {
-                    match e {
-                        // Locally closed connection, expected.
-                        ReadSubscribingPeerError::ReadAddressFailed(
-                            quinn::ReadExactError::ReadError(crate::core::LOCALLY_CLOSED_READ))
-                        | ReadSubscribingPeerError::ReadSizeFailedWithError(
-                            crate::core::LOCALLY_CLOSED_READ
-                        ) => {
-                            tracing::debug!("Expected failure to read peer introduction: Locally closed connection");
-                            return;
-                        }
-
+                    match &e {
                         // Our address was sent as a peer, expected while testing.
                         ReadSubscribingPeerError::SelfAddress => {
                             tracing::debug!("Expected failure to read peer introduction: {e}");
@@ -3300,18 +3291,20 @@ async fn peers_requesting_publish_loop(
                         }
 
                         // Unexpected error, log and continue.
-                        e => {
+                        ReadSubscribingPeerError::ReadSocket(e) => {
+                            if matches!(e, ExpectedSocketError::ReadIp(
+                                quinn::ReadExactError::ReadError(crate::core::LOCALLY_CLOSED_READ)
+                            )) {
+                                // Locally closed connection, expected.
+                                tracing::debug!("Expected failure to read peer introduction: Locally closed connection");
+                                return;
+                            }
                             tracing::warn!("Failed to read peer introduction: {e}");
 
                             if matches!(
                                 e,
-                                ReadSubscribingPeerError::ReadSizeFailedWithError(
-                                    quinn::ReadError::ConnectionLost(
-                                        quinn::ConnectionError::ConnectionClosed(_)
-                                        | quinn::ConnectionError::ApplicationClosed(_)))
-                                | ReadSubscribingPeerError::ReadSizeFailedWithKind(
-                                    std::io::ErrorKind::UnexpectedEof)
-                                | ReadSubscribingPeerError::ReadAddressFailed(
+                                ExpectedSocketError::ReadPort(_)
+                                | ExpectedSocketError::ReadIp(
                                     quinn::ReadExactError::ReadError(quinn::ReadError::ConnectionLost(
                                         quinn::ConnectionError::ConnectionClosed(_)
                                         | quinn::ConnectionError::ApplicationClosed(_))))
@@ -3332,7 +3325,7 @@ async fn peers_requesting_publish_loop(
                 // Send the result back to the main loop.
                 if let Err(e) = output.try_send(Message::PublishPeerReceived(
                         nonce,
-                        result,
+                        result.map_err(Arc::new),
                     ))
                 {
                     tracing::error!("Failed to perform internal message passing for subscription peer: {e}");
