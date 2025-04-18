@@ -329,7 +329,7 @@ async fn subscribe_command(
     let mut hash = HashBytes::default();
     if let Err(e) = faster_hex::hex_decode(hash_hex.as_bytes(), &mut hash.bytes) {
         anyhow::bail!("Failed to parse hex hash: {e}");
-    };
+    }
 
     // Determine the output file path to use.
     let output = {

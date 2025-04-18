@@ -615,6 +615,11 @@ pub async fn subscribe(
         return Ok(Vec::with_capacity(0));
     }
 
+    // Warn if we do not have an external address.
+    if our_external_address.is_none() {
+        tracing::warn!("Cannot determine if the server sent our own address in subscribe response");
+    }
+
     // Parse each peer socket address and file size.
     let mut peers = Vec::new();
     for _ in 0..response_count {
@@ -633,7 +638,6 @@ pub async fn subscribe(
             }
         })?;
 
-        // TODO: Warn if `our_external_address` is not set.
         if our_external_address.is_some_and(|a| a == peer_address) {
             tracing::debug!("Skipping our own address from the server response");
             continue;

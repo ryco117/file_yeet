@@ -53,7 +53,7 @@ pub static EMOJI_FONT: &[u8] = include_bytes!("../NotoEmoji-Regular.ttf");
 const TRANSFER_SPEED_UPDATE_INTERVAL: Duration = Duration::from_millis(400);
 
 /// The delay of mouse inactivity before showing tooltips.
-const TOOLTIP_WAIT_DURATION: Duration = Duration::from_millis(350);
+const TOOLTIP_WAIT_DURATION: Duration = Duration::from_millis(400);
 
 /// The state of the port mapping options in the GUI.
 #[derive(
@@ -172,7 +172,7 @@ impl TransferSnapshot {
 
 /// The state of a file transfer with a peer.
 //  TODO: Separate progress enum for uploads and downloads. Consider using a trait if there is a
-//        usecase for sharing certain aspects.
+//        use case for sharing certain aspects.
 #[derive(Debug)]
 enum TransferState {
     /// The transfer is awaiting a connection attempt. Only used for downloads.
@@ -190,7 +190,7 @@ enum TransferState {
     },
 
     /// The transfer has been paused. Only used for downloads.
-    Paused,
+    Paused(Option<SocketAddr>),
 
     /// Resuming a download by hashing the partial file. Only used for downloads.
     ResumingHash(Arc<RwLock<f32>>),
@@ -592,7 +592,7 @@ pub enum Message {
     CancelOrPauseTransfer(Nonce, FileYeetCommandType, CancelOrPause),
 
     /// The resume button was pressed for a paused download.
-    ResumePausedDownload(Nonce),
+    ResumePausedDownload(Nonce, Option<SocketAddr>),
 
     /// A resume attempt to get a partial file hash completed.
     ResumeFromPartialHashFile(
@@ -827,7 +827,7 @@ impl AppState {
             Message::CancelOrPauseTransfer(nonce, transfer_type, cancel_or_pause) => {
                 self.update_cancel_or_pause(nonce, transfer_type, cancel_or_pause)
             }
-            Message::ResumePausedDownload(nonce) => self.update_resume_paused(nonce),
+            Message::ResumePausedDownload(nonce, peer) => self.update_resume_paused(nonce, peer),
             Message::ResumeFromPartialHashFile(nonce, result) => {
                 self.update_resume_partial_hash(nonce, result)
             }
@@ -1262,7 +1262,7 @@ impl AppState {
                         .into()
                 }
 
-                TransferState::Paused => {
+                TransferState::Paused(peer) => {
                     let cancel = widget::button(widget::text("Cancel").size(12)).on_press(
                         Message::CancelOrPauseTransfer(
                             t.nonce,
@@ -1274,7 +1274,7 @@ impl AppState {
                         "Transfer is paused",
                         widget::horizontal_space(),
                         widget::button(widget::text("Resume").size(12))
-                            .on_press(Message::ResumePausedDownload(t.nonce)),
+                            .on_press(Message::ResumePausedDownload(t.nonce, *peer)),
                         cancel,
                     )
                     .spacing(6)
@@ -2331,12 +2331,11 @@ impl AppState {
             return iced::Task::none();
         };
 
-        // TODO: If the peer socket is non-empty, attempt to reconnect to the original peer first.
         let SavedDownload {
             hash,
             file_size,
+            peer_socket,
             path,
-            ..
         } = saved_download;
         let nonce = rand::random();
         downloads.push(Transfer {
@@ -2346,11 +2345,11 @@ impl AppState {
             file_size,
             peer_string: String::new(),
             path: path.clone(),
-            progress: TransferState::Paused,
+            progress: TransferState::Paused(peer_socket),
             cancellation_token: CancellationToken::new(),
         });
 
-        iced::Task::done(Message::ResumePausedDownload(nonce))
+        iced::Task::done(Message::ResumePausedDownload(nonce, peer_socket))
     }
 
     /// Update after server has responded to a subscribe request.
@@ -2730,14 +2729,18 @@ impl AppState {
                 // If the transfer was connected to a peer, remove the nonce from transactions
                 if let Some(connection) = t.progress.connection() {
                     remove_nonce_for_peer(connection, peers, nonce);
-                };
+                }
 
                 // Mark the transfer as cancelled.
                 t.progress = TransferState::Done(TransferResult::Cancelled);
             }
             CancelOrPause::Pause => {
                 tracing::debug!("Paused transfer {}", t.hash_hex);
-                t.progress = TransferState::Paused;
+                let peer = t
+                    .progress
+                    .connection()
+                    .map(quinn::Connection::remote_address);
+                t.progress = TransferState::Paused(peer);
             }
         }
         iced::Task::none()
@@ -2745,7 +2748,11 @@ impl AppState {
 
     /// Update the state to resume a paused transfer.
     #[tracing::instrument(skip(self))]
-    fn update_resume_paused(&mut self, nonce: Nonce) -> iced::Task<Message> {
+    fn update_resume_paused(
+        &mut self,
+        nonce: Nonce,
+        peer: Option<SocketAddr>,
+    ) -> iced::Task<Message> {
         let ConnectionState::Connected(ConnectedState {
             endpoint,
             server,
@@ -2786,9 +2793,35 @@ impl AppState {
 
             // Get the list of peers to resume the download from.
             let mut bb = bytes::BytesMut::with_capacity(MAX_PEER_COMMUNICATION_SIZE);
-            let peers = crate::core::subscribe(&server, &mut bb, hash, Some(external_address))
+            let mut peers = crate::core::subscribe(&server, &mut bb, hash, Some(external_address))
                 .await
                 .map_err(|e| Some(Arc::new(e.into())))?;
+
+            // Try to connect to the previous peer first if one was provided.
+            if let Some(peer) = peer {
+                if let Some(i) = peers
+                    .iter()
+                    .position(|(p, f)| peer.eq(p) && *f == file_size)
+                {
+                    // No need for introduction if the peer is already in the list.
+                    // Ensure the peer is at the front of the list.
+                    if i != 0 {
+                        peers.swap(0, i);
+                    }
+                } else if let Some(e) = crate::core::introduction(&server, &mut bb, hash, peer)
+                    .await
+                    .err()
+                {
+                    tracing::warn!("Failed to receive introduction with peer {peer}: {e}");
+                } else {
+                    // Attempt to connect to the original peer first.
+                    let i = peers.len();
+                    peers.push((peer, file_size));
+                    if i != 0 {
+                        peers.swap(0, i);
+                    }
+                }
+            }
 
             // Get a request stream to the peer to resume the download.
             let request = first_matching_download(&endpoint, &peers, hash, final_file_size)
@@ -2940,7 +2973,7 @@ impl AppState {
 
             if let Some(t) = transfers.find(|t| t.nonce == nonce) {
                 // Handle a paused transfer.
-                if let TransferState::Paused = &t.progress {
+                if let TransferState::Paused(_) = &t.progress {
                     // If the transfer result is cancelled, ignore it.
                     // This is expected if the transfer was paused.
                     if matches!(result, TransferResult::Cancelled) {
@@ -2966,7 +2999,7 @@ impl AppState {
                 // If the transfer was connected to a peer, remove the nonce from transactions.
                 if let Some(connection) = t.progress.connection() {
                     remove_nonce_for_peer(connection, peers, nonce);
-                };
+                }
 
                 // Mark the transfer as done.
                 t.progress = TransferState::Done(result);
@@ -3042,7 +3075,7 @@ impl AppState {
                     // Ensure all downloads that were in-progress are saved.
                     let peer_socket = match d.progress {
                         TransferState::Transferring { peer, .. } => Some(peer.remote_address()),
-                        TransferState::Paused => None,
+                        TransferState::Paused(peer) => peer,
 
                         // In most cases, do not save the download.
                         _ => return None,
@@ -3069,7 +3102,7 @@ impl AppState {
             } else {
                 tracing::info!("Settings saved");
             }
-        };
+        }
 
         if let Some(port_mapping) = self.port_mapping.take() {
             // Set the state to `Stalling` before waiting for the safe close to complete.

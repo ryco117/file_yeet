@@ -9,7 +9,7 @@ use num_enum::TryFromPrimitive;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 /// Magic number for the default port.
-pub const DEFAULT_PORT: NonZeroU16 = unsafe { std::num::NonZeroU16::new_unchecked(7828) };
+pub const DEFAULT_PORT: NonZeroU16 = std::num::NonZeroU16::new(7828).unwrap();
 
 /// Define a sane maximum payload size for the client-server messages.
 pub const MAX_SERVER_COMMUNICATION_SIZE: usize = 1024;
