@@ -12,6 +12,7 @@ use file_yeet_shared::{
     BiStream, ClientApiRequest, HashBytes, SocketAddrHelper, GOODBYE_CODE,
     MAX_SERVER_COMMUNICATION_SIZE,
 };
+use rand::seq::SliceRandom;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     sync::{mpsc, RwLock},
@@ -581,6 +582,11 @@ async fn handle_subscribe(
     client_preferred_port: u16,
     clients: &PublishersRef,
 ) -> Result<(), ClientRequestError> {
+    // Constants for the maximum number of peer-published items to send to the client.
+    const PEER_PUBLISH_BYTE_SIZE: usize =
+        size_of::<[u8; 16]>() + size_of::<u16>() + size_of::<u64>();
+    const MAX_PUBLISHES_SENT: usize = MAX_SERVER_COMMUNICATION_SIZE / PEER_PUBLISH_BYTE_SIZE;
+
     // Start by getting the file hash from the client.
     let mut hash = HashBytes::default();
     client_streams
@@ -611,9 +617,17 @@ async fn handle_subscribe(
     let mut bb = bytes::BytesMut::with_capacity(MAX_SERVER_COMMUNICATION_SIZE);
     bb.put_u16(0);
 
-    let clients = client_list.iter();
+    // Take a random sample of the publishers to send to the client.
+    // TODO: If client_list has more than `MAX_PUBLISHES_SENT` items, random sampling should be used before the `take` call.
+    let mut peer_publish_list: Vec<_> = client_list
+        .iter()
+        .map(|(_, p)| p)
+        .take(MAX_PUBLISHES_SENT)
+        .collect();
+    slice_shuffle(&mut peer_publish_list);
+
     let mut n: u16 = 0;
-    for (_, pub_client) in clients {
+    for pub_client in peer_publish_list {
         let file_size = pub_client.file_size;
 
         // Get read access on client lock.
@@ -622,9 +636,7 @@ async fn handle_subscribe(
         let publishing_port = *pub_client.preferred_port.read().await;
 
         // Ensure that the message doesn't exceed the maximum size.
-        if bb.len() + size_of::<[u8; 16]>() + size_of::<u16>() + size_of::<u64>()
-            > MAX_SERVER_COMMUNICATION_SIZE
-        {
+        if bb.len() + PEER_PUBLISH_BYTE_SIZE > MAX_SERVER_COMMUNICATION_SIZE {
             break;
         }
 
@@ -646,7 +658,6 @@ async fn handle_subscribe(
     }
 
     // Overwrite the number of peers shared with the actual count, in big-endian.
-    // TODO: Consider permuting this list before it is sent to the client.
     bb[..2].copy_from_slice(&n.to_be_bytes());
 
     // Send the message to the client.
@@ -717,4 +728,10 @@ async fn handle_introduction(
     }
 
     Ok(())
+}
+
+/// A helper to randomly permute a mutable slice.
+fn slice_shuffle<T>(v: &mut [T]) {
+    let mut rng = rand::rng();
+    v.shuffle(&mut rng);
 }

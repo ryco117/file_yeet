@@ -812,12 +812,11 @@ pub enum DownloadError {
 }
 
 /// Download a slice of a file from the peer. Initiates the download by specifying the range of bytes to download.
-#[tracing::instrument(skip(peer_streams, bb, file_offsets, byte_progress))]
+#[tracing::instrument(skip(peer_streams, file_offsets, byte_progress))]
 pub async fn download_partial_from_peer(
     expected_hash: HashBytes,
     peer_streams: &mut BiStream,
     file: &mut tokio::fs::File,
-    bb: &mut bytes::BytesMut,
     file_offsets: DownloadOffsetState,
     byte_progress: Option<&RwLock<u64>>,
 ) -> Result<(), DownloadError> {
@@ -834,11 +833,10 @@ pub async fn download_partial_from_peer(
     let download_size = range.end.saturating_sub(range.start);
 
     // Let the peer know which range we want to download using this QUIC stream.
-    // TODO: Do not require a `BytesMut` buffer just for these two `u64` values.
-    bb.clear();
-    bb.put_u64(range.start);
-    bb.put_u64(download_size);
-    peer_streams.send.write_all(bb).await?;
+    let mut bb = [0u8; size_of::<u64>() * 2];
+    bb[..size_of::<u64>()].copy_from_slice(range.start.to_be_bytes().as_slice());
+    bb[size_of::<u64>()..].copy_from_slice(download_size.to_be_bytes().as_slice());
+    peer_streams.send.write_all(&bb).await?;
 
     // Create a scratch space for reading data from the stream.
     let mut buf = [0; MAX_PEER_COMMUNICATION_SIZE];
@@ -907,13 +905,12 @@ pub async fn reject_download_request(peer_streams: &mut BiStream) -> Result<(), 
 }
 
 /// Download a file from the peer to the specified file path.
-#[tracing::instrument(skip(peer_streams, bb, byte_progress))]
+#[tracing::instrument(skip(peer_streams, byte_progress))]
 pub async fn download_from_peer(
     expected_hash: HashBytes,
     peer_streams: &mut BiStream,
     file_size: u64,
     output_path: &Path,
-    bb: &mut bytes::BytesMut,
     byte_progress: Option<&RwLock<u64>>,
 ) -> Result<(), DownloadError> {
     let file_offsets = DownloadOffsetState::new(0..file_size, None);
@@ -931,7 +928,6 @@ pub async fn download_from_peer(
         expected_hash,
         peer_streams,
         &mut file,
-        bb,
         file_offsets,
         byte_progress,
     ))
@@ -939,7 +935,7 @@ pub async fn download_from_peer(
 }
 
 /// Resume downloading a file from the peer, continuing from the specified `start_offset`.
-#[tracing::instrument(skip(peer_streams, hasher, bb, byte_progress))]
+#[tracing::instrument(skip(peer_streams, hasher, byte_progress))]
 pub async fn resume_download(
     expected_hash: HashBytes,
     peer_streams: &mut BiStream,
@@ -947,7 +943,6 @@ pub async fn resume_download(
     start_offset: u64,
     hasher: sha2::Sha256,
     output_path: &Path,
-    bb: &mut bytes::BytesMut,
     byte_progress: Option<&RwLock<u64>>,
 ) -> Result<(), DownloadError> {
     // Indicate to peer that we will start at the given offset and continue to the end of the file.
@@ -964,7 +959,6 @@ pub async fn resume_download(
         expected_hash,
         peer_streams,
         &mut file,
-        bb,
         file_offsets,
         byte_progress,
     ))

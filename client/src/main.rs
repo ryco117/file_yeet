@@ -461,7 +461,6 @@ async fn subscribe_command(
         &mut peer_streams,
         file_size,
         &output,
-        &mut bb,
         Some(&progress_clone),
     )
     .await

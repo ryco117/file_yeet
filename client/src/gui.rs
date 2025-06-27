@@ -2540,8 +2540,6 @@ impl AppState {
             async move {
                 let mut peer_streams_lock = peer_streams.bistream.lock().await;
 
-                // Create a buffer for the file transfer range. Need to send a `u64` start index and `u64` length.
-                let mut bb = bytes::BytesMut::with_capacity(16);
                 tokio::select! {
                     // Let the transfer be cancelled. This is not an error if cancelled.
                     () = cancellation_token.cancelled() => TransferResult::Cancelled,
@@ -2552,7 +2550,6 @@ impl AppState {
                         &mut peer_streams_lock,
                         file_size,
                         &output_path,
-                        &mut bb,
                         Some(&byte_progress),
                     ) => {
                         match result {
@@ -2902,7 +2899,6 @@ impl AppState {
 
                         // Try to upload the file to the peer connection.
                         let mut request = request.bistream.lock().await;
-                        let mut bb = bytes::BytesMut::with_capacity(MAX_SERVER_COMMUNICATION_SIZE);
                         tokio::select! {
                             () = cancellation_token.cancelled() => TransferResult::Cancelled,
 
@@ -2910,7 +2906,6 @@ impl AppState {
                                 hash,
                                 &mut request,
                                 &mut file,
-                                &mut bb,
                                 crate::core::DownloadOffsetState::new(start_index..file_size, Some(digest)),
                                 Some(&progress),
                             )) => match result {
@@ -3163,6 +3158,7 @@ async fn first_matching_download(
     hash: HashBytes,
     expected_size: u64,
 ) -> Option<PeerRequestStream> {
+    // Filter the peers to find those with the expected file size.
     let filtered_peers = peers_with_size
         .iter()
         .filter_map(|(peer, file_size)| file_size.eq(&expected_size).then_some(*peer));
@@ -3189,7 +3185,7 @@ async fn first_matching_download(
         }
     }
 
-    // TODO: Complete with error handling.
+    // No matching peer found.
     None
 }
 
