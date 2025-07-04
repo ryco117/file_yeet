@@ -10,6 +10,7 @@ use crate::core::{humanize_bytes, FileYeetCommandType, PreparedConnection, HASH_
 
 mod core;
 mod gui;
+mod settings;
 #[cfg(all(target_os = "windows", not(debug_assertions)))]
 mod win_cmd;
 

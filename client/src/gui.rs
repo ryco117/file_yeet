@@ -17,11 +17,16 @@ use iced::{widget, window, Element};
 use tokio::{io::AsyncWriteExt as _, sync::RwLock};
 use tokio_util::sync::CancellationToken;
 
-use crate::core::{
-    humanize_bytes, peer_connection_into_stream, udp_holepunch, ConnectionsManager,
-    FileAccessError, FileYeetCommandType, PortMappingConfig, PrepareConnectionError,
-    PreparedConnection, ReadSubscribingPeerError, SubscribeError, HASH_EXT_REGEX,
-    MAX_PEER_COMMUNICATION_SIZE, PEER_CONNECT_TIMEOUT, SERVER_CONNECTION_TIMEOUT,
+use crate::{
+    core::{
+        humanize_bytes, peer_connection_into_stream, udp_holepunch, ConnectionsManager,
+        FileAccessError, FileYeetCommandType, PortMappingConfig, PrepareConnectionError,
+        PreparedConnection, ReadSubscribingPeerError, SubscribeError, HASH_EXT_REGEX,
+        MAX_PEER_COMMUNICATION_SIZE, PEER_CONNECT_TIMEOUT, SERVER_CONNECTION_TIMEOUT,
+    },
+    settings::{
+        load_settings, save_settings, AppSettings, PortMappingSetting, SavedDownload, SavedPublish,
+    },
 };
 
 /// The string corresponding to a regex pattern for matching valid IPv6 addresses.
@@ -54,41 +59,6 @@ const TRANSFER_SPEED_UPDATE_INTERVAL: Duration = Duration::from_millis(400);
 
 /// The delay of mouse inactivity before showing tooltips.
 const TOOLTIP_WAIT_DURATION: Duration = Duration::from_millis(400);
-
-/// The state of the port mapping options in the GUI.
-#[derive(
-    Clone,
-    Copy,
-    std::cmp::PartialEq,
-    std::cmp::Eq,
-    Debug,
-    Default,
-    serde::Deserialize,
-    serde::Serialize,
-)]
-pub enum PortMappingGuiOptions {
-    #[default]
-    None,
-    PortForwarding(Option<NonZeroU16>),
-    TryPcpNatPmp,
-}
-impl PortMappingGuiOptions {
-    /// Get the port mapping option as a human-readable string.
-    fn to_label(self) -> &'static str {
-        match self {
-            PortMappingGuiOptions::None => "None",
-            PortMappingGuiOptions::PortForwarding(_) => "Port Forward",
-            PortMappingGuiOptions::TryPcpNatPmp => "NAT-PMP / PCP",
-        }
-    }
-}
-impl std::fmt::Display for PortMappingGuiOptions {
-    /// Display the port mapping option as a human-readable string.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let label = self.to_label();
-        write!(f, "{label}")
-    }
-}
 
 /// A peer connection representing a single request/command.
 /// Peers may have multiple connections to the same peer for different requests.
@@ -226,15 +196,6 @@ struct Transfer {
     pub path: PathBuf,
     pub progress: TransferState,
     pub cancellation_token: CancellationToken,
-}
-
-/// The elements of a saved download transfer with partial or no progress.
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
-pub struct SavedDownload {
-    pub hash: HashBytes,
-    pub file_size: u64,
-    pub peer_socket: Option<SocketAddr>,
-    pub path: PathBuf,
 }
 
 /// The result of a file publish request.
@@ -454,25 +415,6 @@ impl ConnectionState {
     }
 }
 
-/// The saveable information for a file that was published.
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
-struct SavedPublish {
-    pub path: PathBuf,
-    pub hash_and_file_size: Option<(HashBytes, u64)>,
-}
-
-/// The current settings for the app in a saveable format.
-#[derive(Default, serde::Deserialize, serde::Serialize)]
-struct AppSettings {
-    pub server_address: String,
-    pub gateway_address: Option<String>,
-    pub port_forwarding_text: String,
-    pub internal_port_text: String,
-    pub port_mapping: PortMappingGuiOptions,
-    pub last_publishes: Vec<SavedPublish>,
-    pub last_downloads: Vec<SavedDownload>,
-}
-
 /// The state of the application for interacting with the GUI.
 #[derive(Default)]
 pub struct AppState {
@@ -499,7 +441,7 @@ pub enum Message {
     InternalPortTextChanged(String),
 
     /// The port mapping radio button was changed.
-    PortMappingRadioChanged(PortMappingGuiOptions),
+    PortMappingRadioChanged(PortMappingSetting),
 
     /// The port forward text field was changed.
     PortForwardTextChanged(String),
@@ -616,34 +558,18 @@ pub enum Message {
     ForceExit,
 }
 
-/// Try to get the path to the app settings file.
-fn settings_path() -> Option<std::path::PathBuf> {
-    dirs::data_local_dir().map(|mut p| {
-        p.push("file_yeet_client/settings.json");
-        p
-    })
-}
-
 /// The application state and logic.
 impl AppState {
     /// Create a new application state.
     pub fn new(args: crate::Cli) -> (Self, iced::Task<Message>) {
+        let mut status_message = None;
+
         // Get base settings from the settings file, or default.
-        let mut settings = settings_path()
-            .and_then(|p| {
-                // Ensure the settings file and directory exist.
-                if p.exists() {
-                    // Try to read the settings for the app.
-                    let settings = std::fs::read_to_string(p).ok()?;
-                    serde_json::from_str::<AppSettings>(&settings).ok()
-                } else {
-                    // Create the settings file and directory.
-                    std::fs::create_dir_all(p.parent()?).ok()?;
-                    std::fs::write(p, "").ok()?;
-                    None
-                }
-            })
-            .unwrap_or_default();
+        // If there is an error, show the error message and use default settings.
+        let mut settings = load_settings().unwrap_or_else(|e| {
+            status_message = Some(format!("Failed to load settings: {e}"));
+            AppSettings::default()
+        });
 
         {
             // The CLI arguments take final precedence on start.
@@ -671,19 +597,20 @@ impl AppState {
             }
             if let Some(port) = external_port_override {
                 settings.port_forwarding_text = port.to_string();
-                settings.port_mapping = PortMappingGuiOptions::PortForwarding(Some(port));
-            } else if (!used_cli && matches!(settings.port_mapping, PortMappingGuiOptions::None))
+                settings.port_mapping = PortMappingSetting::PortForwarding(Some(port));
+            } else if (!used_cli && matches!(settings.port_mapping, PortMappingSetting::None))
                 || nat_map
             {
                 // Default to enabling NAT-PMP/PCP if no port forwarding is set.
                 // Average users may not know that this is usually the best option for them.
-                settings.port_mapping = PortMappingGuiOptions::TryPcpNatPmp;
+                settings.port_mapping = PortMappingSetting::TryPcpNatPmp;
             }
         }
 
         // Create the initial state with the settings.
         let mut initial_state = Self {
             options: settings,
+            status_message,
             ..Self::default()
         };
 
@@ -1106,14 +1033,14 @@ impl AppState {
             connect_button = connect_button.on_press(Message::ConnectClicked);
 
             internal_port_text = internal_port_text.on_input(Message::InternalPortTextChanged);
-            if let PortMappingGuiOptions::PortForwarding(_) = &self.options.port_mapping {
+            if let PortMappingSetting::PortForwarding(_) = &self.options.port_mapping {
                 port_forward_text = port_forward_text.on_input(Message::PortForwardTextChanged);
             }
         }
 
         // Ignore the data field in the radio selection status.
         let selected_mapping = match self.options.port_mapping {
-            PortMappingGuiOptions::PortForwarding(_) => PortMappingGuiOptions::PortForwarding(None),
+            PortMappingSetting::PortForwarding(_) => PortMappingSetting::PortForwarding(None),
             other => other,
         };
 
@@ -1121,15 +1048,15 @@ impl AppState {
         let choose_port_mapping = widget::column!(
             widget::row!(widget::text("Internal Port to Bind"), internal_port_text).spacing(12),
             widget::radio(
-                PortMappingGuiOptions::None.to_label(),
-                PortMappingGuiOptions::None,
+                PortMappingSetting::None.to_label(),
+                PortMappingSetting::None,
                 Some(selected_mapping),
                 Message::PortMappingRadioChanged,
             ),
             widget::row!(
                 widget::radio(
-                    PortMappingGuiOptions::PortForwarding(None).to_label(),
-                    PortMappingGuiOptions::PortForwarding(None),
+                    PortMappingSetting::PortForwarding(None).to_label(),
+                    PortMappingSetting::PortForwarding(None),
                     Some(selected_mapping),
                     Message::PortMappingRadioChanged,
                 ),
@@ -1137,8 +1064,8 @@ impl AppState {
             )
             .spacing(32),
             widget::radio(
-                PortMappingGuiOptions::TryPcpNatPmp.to_label(),
-                PortMappingGuiOptions::TryPcpNatPmp,
+                PortMappingSetting::TryPcpNatPmp.to_label(),
+                PortMappingSetting::TryPcpNatPmp,
                 Some(selected_mapping),
                 Message::PortMappingRadioChanged,
             ),
@@ -1604,16 +1531,13 @@ impl AppState {
     }
 
     /// Handle the port mapping radio button being changed.
-    fn update_port_radio_changed(
-        &mut self,
-        selection: PortMappingGuiOptions,
-    ) -> iced::Task<Message> {
+    fn update_port_radio_changed(&mut self, selection: PortMappingSetting) -> iced::Task<Message> {
         self.options.port_mapping = match selection {
-            PortMappingGuiOptions::None => {
+            PortMappingSetting::None => {
                 self.status_message = None;
-                PortMappingGuiOptions::None
+                PortMappingSetting::None
             }
-            PortMappingGuiOptions::PortForwarding(_) => PortMappingGuiOptions::PortForwarding({
+            PortMappingSetting::PortForwarding(_) => PortMappingSetting::PortForwarding({
                 let o = self
                     .options
                     .port_forwarding_text
@@ -1625,9 +1549,9 @@ impl AppState {
                 }
                 o
             }),
-            PortMappingGuiOptions::TryPcpNatPmp => {
+            PortMappingSetting::TryPcpNatPmp => {
                 self.status_message = None;
-                PortMappingGuiOptions::TryPcpNatPmp
+                PortMappingSetting::TryPcpNatPmp
             }
         };
         iced::Task::none()
@@ -1636,7 +1560,7 @@ impl AppState {
     /// Update the state after the port forward text field was changed.
     fn update_port_forward_text(&mut self, text: String) -> iced::Task<Message> {
         self.options.port_forwarding_text = text;
-        if let PortMappingGuiOptions::PortForwarding(port) = &mut self.options.port_mapping {
+        if let PortMappingSetting::PortForwarding(port) = &mut self.options.port_mapping {
             if let Ok(p) = self
                 .options
                 .port_forwarding_text
@@ -1728,13 +1652,13 @@ impl AppState {
 
         // Try to get the user's intent from the GUI options.
         let port_mapping = match self.options.port_mapping {
-            PortMappingGuiOptions::None | PortMappingGuiOptions::PortForwarding(None) => {
+            PortMappingSetting::None | PortMappingSetting::PortForwarding(None) => {
                 PortMappingConfig::None
             }
-            PortMappingGuiOptions::PortForwarding(Some(port)) => {
+            PortMappingSetting::PortForwarding(Some(port)) => {
                 PortMappingConfig::PortForwarding(port)
             }
-            PortMappingGuiOptions::TryPcpNatPmp => {
+            PortMappingSetting::TryPcpNatPmp => {
                 PortMappingConfig::PcpNatPmp(self.port_mapping.take())
             }
         };
@@ -3086,13 +3010,7 @@ impl AppState {
             endpoint.close(GOODBYE_CODE, GOODBYE_MESSAGE.as_bytes());
 
             // Save the app settings when closing our connections.
-            if let Err(e) = settings_path()
-                .ok_or_else(|| {
-                    anyhow::anyhow!("Could not determine a settings path for this environment.")
-                })
-                .and_then(|p| Ok(std::fs::File::create(p)?))
-                .and_then(|f| Ok(serde_json::to_writer_pretty(f, &self.options)?))
-            {
+            if let Err(e) = save_settings(&self.options) {
                 tracing::warn!("Could not save settings: {e}");
             } else {
                 tracing::info!("Settings saved");

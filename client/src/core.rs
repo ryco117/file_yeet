@@ -934,37 +934,6 @@ pub async fn download_from_peer(
     .await
 }
 
-/// Resume downloading a file from the peer, continuing from the specified `start_offset`.
-#[tracing::instrument(skip(peer_streams, hasher, byte_progress))]
-pub async fn resume_download(
-    expected_hash: HashBytes,
-    peer_streams: &mut BiStream,
-    file_size: u64,
-    start_offset: u64,
-    hasher: sha2::Sha256,
-    output_path: &Path,
-    byte_progress: Option<&RwLock<u64>>,
-) -> Result<(), DownloadError> {
-    // Indicate to peer that we will start at the given offset and continue to the end of the file.
-    let file_offsets = DownloadOffsetState::new(start_offset..file_size, Some(hasher));
-
-    // Open the file for writing, ensuring the file exists and is appended to.
-    let mut file = tokio::fs::OpenOptions::new()
-        .append(true)
-        .open(&output_path)
-        .await
-        .map_err(FileAccessError::Open)?;
-
-    Box::pin(download_partial_from_peer(
-        expected_hash,
-        peer_streams,
-        &mut file,
-        file_offsets,
-        byte_progress,
-    ))
-    .await
-}
-
 /// Errors that may occur when making file access attempts.
 #[derive(Debug, thiserror::Error)]
 pub enum FileAccessError {
