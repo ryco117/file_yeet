@@ -49,7 +49,7 @@ Options:
           The server port to connect to [default: 7828]
   -x, --external-port-override <EXTERNAL_PORT_OVERRIDE>
           Override the port seen by the server to communicate a custom external port to peers. Useful when manually port forwarding
-  -i, --interal-port <INTERAL_PORT>
+  -i, --internal-port <INTERNAL_PORT>
           Require the client to bind to a specific local port. Useful when manually port forwarding
   -g, --gateway <GATEWAY>
           The IP address of local gateway to use when attempting the Port Control Protocol. If not specified, a default gateway will be searched for

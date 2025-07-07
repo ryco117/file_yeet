@@ -619,11 +619,7 @@ async fn handle_subscribe(
 
     // Take a random sample of the publishers to send to the client.
     // TODO: If client_list has more than `MAX_PUBLISHES_SENT` items, random sampling should be used before the `take` call.
-    let mut peer_publish_list: Vec<_> = client_list
-        .iter()
-        .map(|(_, p)| p)
-        .take(MAX_PUBLISHES_SENT)
-        .collect();
+    let mut peer_publish_list: Vec<_> = client_list.values().take(MAX_PUBLISHES_SENT).collect();
     slice_shuffle(&mut peer_publish_list);
 
     let mut n: u16 = 0;

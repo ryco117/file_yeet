@@ -45,7 +45,7 @@ static SERVER_ADDRESS_REGEX: std::sync::LazyLock<regex::Regex> = std::sync::Lazy
     .expect("Failed to compile the server address regex")
 });
 
-/// The maximum time to wait before forcing the application to exit.
+/// The maximum time to wait for a clean shutdown before forcing the application to exit.
 const MAX_SHUTDOWN_WAIT: Duration = Duration::from_secs(3);
 
 /// The red used to display errors to the user.
@@ -393,6 +393,7 @@ pub enum CancelOrPause {
 
 /// The state of the connection to a `file_yeet` server.
 #[derive(Debug, Default)]
+#[allow(clippy::large_enum_variant)]
 enum ConnectionState {
     /// No server connection is active.
     #[default]
@@ -545,7 +546,7 @@ pub enum Message {
     /// The result of a download attempt.
     TransferResulted(Nonce, TransferResult, FileYeetCommandType),
 
-    /// Open the file containing using system defaults.
+    /// Open the file using the system launcher for that file type.
     OpenFile(PathBuf),
 
     /// A completed transfer is being removed from its list.
@@ -737,7 +738,7 @@ impl AppState {
             }
             Message::SubscribeStarted => self.update_subscribe_started(),
             Message::SubscribePathChosen(path, hash_hex) => {
-                self.update_subscribe_path_chosen(path, hash_hex)
+                self.update_subscribe_path_chosen(path, &hash_hex)
             }
             Message::SubscribeRecreated(transfer_base) => {
                 self.update_subscribe_recreated(transfer_base)
@@ -1751,8 +1752,8 @@ impl AppState {
                         .options
                         .last_publishes
                         .drain(..)
-                        .map(|mut p| {
-                            let message = if let Some(hfs) = p.hash_and_file_size.take() {
+                        .map(|p| {
+                            let message = if let Some(hfs) = p.hash_and_file_size {
                                 Message::PublishFileHashed(
                                     NewOrExistingPublish::New(p.path),
                                     hfs.0,
@@ -1855,6 +1856,7 @@ impl AppState {
         let nonce = publish.nonce;
 
         publishes.push(publish);
+
         iced::Task::perform(
             async move {
                 tokio::select! {
@@ -1897,29 +1899,60 @@ impl AppState {
             return iced::Task::none();
         };
 
-        let (nonce, cancellation_token) = match publish {
+        let saving_hash = file_size > 1_000_000_000; // If the file is larger than 1GB, save the hash to disk.
+        if saving_hash {
+            // Before saving the new hash to disk, recreate `last_publishes`.
+            self.options.last_publishes = publishes
+                .iter_mut()
+                .filter_map(|publish_item| {
+                    // If the publish has been hashed, add it to the list of publishes to save now.
+                    match &publish_item.state {
+                        PublishState::Publishing(p) => Some(SavedPublish::new(
+                            publish_item.path.clone(),
+                            Some((p.hash, p.file_size)),
+                        )),
+                        _ => None,
+                    }
+                })
+                .collect();
+        }
+
+        let (nonce, cancellation_token, path) = match publish {
             NewOrExistingPublish::New(path) => {
-                let publish = PublishItem::new(path.clone());
+                let publish = PublishItem::new(path);
                 let nonce = publish.nonce;
                 let cancellation_token = publish.cancellation_token.clone();
                 publishes.push(publish);
-                (nonce, cancellation_token)
+                (nonce, cancellation_token, &publishes.last().unwrap().path)
             }
             NewOrExistingPublish::Existing(nonce) => {
                 let publish = publishes.iter_mut().find(|p| p.nonce == nonce);
                 if let Some(publish) = publish {
-                    (nonce, publish.cancellation_token.clone())
+                    (nonce, publish.cancellation_token.clone(), &publish.path)
                 } else {
                     tracing::warn!("Publish file hashed for unknown nonce {nonce}");
                     return iced::Task::none();
                 }
             }
         };
-        tracing::debug!("Attempting to publish file with known hash");
+
+        if saving_hash {
+            tracing::info!("File is larger than 1GB, saving hash to disk early");
+            self.options
+                .last_publishes
+                .push(SavedPublish::new(path.clone(), Some((hash, file_size))));
+            if let Err(e) = save_settings(&self.options) {
+                tracing::warn!("Failed to save settings after publish: {e}");
+                self.status_message = Some(format!("Failed to save settings: {e}"));
+            } else {
+                tracing::debug!("Settings saved after hashing file");
+            }
+        }
 
         let server = server.clone();
         iced::Task::perform(
             async move {
+                tracing::debug!("Attempting to publish file with known hash");
                 tokio::select! {
                     // Allow cancelling the publish request thread.
                     () = cancellation_token.cancelled() => PublishRequestResult::Cancelled,
@@ -2177,7 +2210,7 @@ impl AppState {
     fn update_subscribe_path_chosen(
         &mut self,
         path: Option<PathBuf>,
-        hash_hex: String,
+        hash_hex: &str,
     ) -> iced::Task<Message> {
         self.modal = false;
 
@@ -2972,14 +3005,13 @@ impl AppState {
 
                     // If the publish is valid or in progress, add it to the list of open publishes.
                     match publish_item.state {
-                        PublishState::Publishing(p) => Some(SavedPublish {
-                            path: publish_item.path,
-                            hash_and_file_size: Some((p.hash, p.file_size)),
-                        }),
-                        PublishState::Hashing(_) => Some(SavedPublish {
-                            path: publish_item.path,
-                            hash_and_file_size: None,
-                        }),
+                        PublishState::Publishing(p) => Some(SavedPublish::new(
+                            publish_item.path,
+                            Some((p.hash, p.file_size)),
+                        )),
+                        PublishState::Hashing(_) => {
+                            Some(SavedPublish::new(publish_item.path, None))
+                        }
                         _ => None,
                     }
                 })

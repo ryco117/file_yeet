@@ -8,6 +8,15 @@ pub struct SavedPublish {
     pub path: PathBuf,
     pub hash_and_file_size: Option<(HashBytes, u64)>,
 }
+impl SavedPublish {
+    /// Create a new saved publish with the given path and hash+file-size info.
+    pub fn new(path: PathBuf, hash_and_file_size: Option<(HashBytes, u64)>) -> Self {
+        Self {
+            path,
+            hash_and_file_size,
+        }
+    }
+}
 
 /// The elements of a saved download transfer with partial or no progress.
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
