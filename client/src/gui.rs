@@ -226,8 +226,8 @@ struct Publish {
 
 /// The information to create a new publish item, or the nonce of an existing one.
 #[derive(Clone, Debug)]
-pub enum NewOrExistingPublish {
-    New(PathBuf),
+pub enum CreateOrExistingPublish {
+    Create(PathBuf),
     Existing(Nonce),
 }
 
@@ -489,8 +489,8 @@ pub enum Message {
     /// The path to a file to publish was chosen or cancelled.
     PublishPathChosen(Option<PathBuf>),
 
-    /// Hashing a file has completed.
-    PublishFileHashed(NewOrExistingPublish, HashBytes, u64),
+    /// Create or update a publish item with a known hash. The hash may be from disk or freshly calculated.
+    PublishFileHashed(CreateOrExistingPublish, HashBytes, u64, bool),
 
     /// The result of a publish request.
     PublishRequestResulted(Nonce, PublishRequestResult),
@@ -726,8 +726,8 @@ impl AppState {
             }
 
             Message::PublishPathChosen(path) => self.update_publish_path_chosen(path),
-            Message::PublishFileHashed(publish, hash, file_size) => {
-                self.update_publish_file_hashed(publish, hash, file_size)
+            Message::PublishFileHashed(publish, hash, file_size, new_hash) => {
+                self.update_publish_file_hashed(publish, hash, file_size, new_hash)
             }
             Message::PublishRequestResulted(nonce, r) => {
                 self.update_publish_request_resulted(nonce, r)
@@ -1755,9 +1755,10 @@ impl AppState {
                         .map(|p| {
                             let message = if let Some(hfs) = p.hash_and_file_size {
                                 Message::PublishFileHashed(
-                                    NewOrExistingPublish::New(p.path),
+                                    CreateOrExistingPublish::Create(p.path),
                                     hfs.0,
                                     hfs.1,
+                                    false, // The hash is from disk, not a new hash.
                                 )
                             } else {
                                 Message::PublishPathChosen(Some(p.path))
@@ -1875,9 +1876,10 @@ impl AppState {
             move |r| match r {
                 Err(r) => Message::PublishRequestResulted(nonce, r),
                 Ok((file_size, hash)) => Message::PublishFileHashed(
-                    NewOrExistingPublish::Existing(nonce),
+                    CreateOrExistingPublish::Existing(nonce),
                     hash,
                     file_size,
+                    true, // The hash was freshly calculated.
                 ),
             },
         )
@@ -1887,9 +1889,10 @@ impl AppState {
     #[tracing::instrument(skip(self, publish))]
     fn update_publish_file_hashed(
         &mut self,
-        publish: NewOrExistingPublish,
+        publish: CreateOrExistingPublish,
         hash: HashBytes,
         file_size: u64,
+        new_hash: bool,
     ) -> iced::Task<Message> {
         let ConnectionState::Connected(ConnectedState {
             server, publishes, ..
@@ -1899,7 +1902,7 @@ impl AppState {
             return iced::Task::none();
         };
 
-        let saving_hash = file_size > 1_000_000_000; // If the file is larger than 1GB, save the hash to disk.
+        let saving_hash = file_size > 1_000_000_000 && new_hash; // If the file is larger than 1GB, save the hash to disk.
         if saving_hash {
             // Before saving the new hash to disk, recreate `last_publishes`.
             self.options.last_publishes = publishes
@@ -1918,14 +1921,14 @@ impl AppState {
         }
 
         let (nonce, cancellation_token, path) = match publish {
-            NewOrExistingPublish::New(path) => {
+            CreateOrExistingPublish::Create(path) => {
                 let publish = PublishItem::new(path);
                 let nonce = publish.nonce;
                 let cancellation_token = publish.cancellation_token.clone();
                 publishes.push(publish);
                 (nonce, cancellation_token, &publishes.last().unwrap().path)
             }
-            NewOrExistingPublish::Existing(nonce) => {
+            CreateOrExistingPublish::Existing(nonce) => {
                 let publish = publishes.iter_mut().find(|p| p.nonce == nonce);
                 if let Some(publish) = publish {
                     (nonce, publish.cancellation_token.clone(), &publish.path)
@@ -3216,7 +3219,7 @@ fn hash_publish_task(
         move |r| match r {
             Err(r) => Message::PublishRequestResulted(nonce, r),
             Ok((file_size, hash)) => {
-                Message::PublishFileHashed(NewOrExistingPublish::Existing(nonce), hash, file_size)
+                Message::PublishFileHashed(CreateOrExistingPublish::Existing(nonce), hash, file_size, true)
             }
         },
     )

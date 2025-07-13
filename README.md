@@ -3,6 +3,7 @@
 A minimal client/server model to allow peers to share files directly by using a rendezvous server for peer discovery to establish a peer-to-peer connection.
 
 Uses UDP hole punching and [port mapping techniques](https://crates.io/crates/crab_nat) to allow peers to transfer data directly.
+Connections use the [quinn](https://github.com/quinn-rs/quinn) library to communicate over the [QUIC](https://en.wikipedia.org/wiki/QUIC) protocol.
 
 ## Usage
 

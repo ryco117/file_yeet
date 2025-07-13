@@ -74,10 +74,18 @@ pub struct AppSettings {
     pub last_downloads: Vec<SavedDownload>,
 }
 
+/// Try to get the path to the app's data folder.
+pub fn app_folder() -> Option<std::path::PathBuf> {
+    dirs::data_local_dir().map(|mut p| {
+        p.push("file_yeet_client");
+        p
+    })
+}
+
 /// Try to get the path to the app settings file.
 pub fn settings_path() -> Option<std::path::PathBuf> {
-    dirs::data_local_dir().map(|mut p| {
-        p.push("file_yeet_client/settings.json");
+    app_folder().map(|mut p| {
+        p.push("settings.json");
         p
     })
 }

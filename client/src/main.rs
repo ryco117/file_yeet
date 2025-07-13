@@ -71,10 +71,21 @@ enum FileYeetCommand {
     },
 }
 
-/// Initialize logging helper.
+/// Initialize logging. Attempt to log to a file in the application folder, or stdout if it fails.
 fn logging(args: &Cli) {
-    use tracing_subscriber::prelude::*;
+    /// Generic function to create a tracing subscriber with a layer and filter.
+    fn create<L>(
+        subscriber: tracing_subscriber::Registry,
+        layer: L,
+        filter: tracing_subscriber::filter::Targets,
+    ) where
+        L: tracing_subscriber::layer::Layer<tracing_subscriber::Registry> + Send + Sync + 'static,
+    {
+        use tracing_subscriber::prelude::*;
+        subscriber.with(layer).with(filter).init();
+    }
 
+    // Choose filters to apply to tracing statements to log.
     let filter = if cfg!(debug_assertions) || args.verbose {
         tracing_subscriber::filter::Targets::new()
             .with_target(core::APP_TITLE, tracing::Level::DEBUG)
@@ -85,16 +96,33 @@ fn logging(args: &Cli) {
             .with_target("crab_nat", tracing::Level::INFO)
     };
     let subscriber = tracing_subscriber::registry();
-    if args.verbose {
-        subscriber
-            .with(tracing_subscriber::fmt::layer().pretty())
-            .with(filter)
-            .init();
+    let layer = tracing_subscriber::fmt::layer();
+    if let Some(app_folder) = settings::app_folder() {
+        // If logging to a file, disable logging with ANSI coloring.
+        let layer = layer.with_ansi(false);
+
+        // Log to a file in the application folder.
+        let file_appender = tracing_appender::rolling::never(&app_folder, "file_yeet.log");
+        if args.verbose {
+            create(
+                subscriber,
+                layer.pretty().with_writer(file_appender),
+                filter,
+            );
+        } else {
+            create(
+                subscriber,
+                layer.compact().with_writer(file_appender),
+                filter,
+            );
+        }
     } else {
-        subscriber
-            .with(tracing_subscriber::fmt::layer().compact())
-            .with(filter)
-            .init();
+        if args.verbose {
+            create(subscriber, layer.pretty(), filter);
+        } else {
+            create(subscriber, layer.compact(), filter);
+        }
+        tracing::warn!("Failed to find the application folder for logging, using stdout");
     }
 }
 
