@@ -221,6 +221,9 @@ pub async fn prepare_server_connection(
     // Read the server's response to the sanity check.
     let sanity_check = socket_ping_request(&connection).await?;
     let mut sanity_check = (sanity_check, sanity_check.to_string());
+
+    // Only debug builds may log the public IP address of clients.
+    #[cfg(debug_assertions)]
     tracing::info!("Server sees us as {}", sanity_check.1);
 
     if let Some(port) = port_override {
@@ -311,8 +314,13 @@ pub fn instant_to_datetime_string(i: std::time::Instant) -> String {
 }
 
 /// Helper to configure a waiting period based on a port mapping lifetime.
-pub async fn new_renewal_interval(lifetime: u64) -> tokio::time::Interval {
-    let mut interval = tokio::time::interval(Duration::from_secs(lifetime).div_f64(3.));
+/// The interval is set to one-third of the lifetime, with a minimum of 120 seconds.
+pub async fn new_renewal_interval(lifetime_seconds: u64) -> tokio::time::Interval {
+    let mut interval = tokio::time::interval(
+        Duration::from_secs(lifetime_seconds)
+            .div_f64(3.)
+            .max(Duration::from_secs(120)),
+    );
     interval.tick().await; // Skip the first tick.
     interval
 }
@@ -467,7 +475,7 @@ pub enum IntroductionError {
 }
 
 /// Perform an introduction request to the server for a specific peer and hash.
-#[tracing::instrument(skip(server_connection, bb))]
+#[tracing::instrument(skip(server_connection, bb, external_address))]
 pub async fn introduction(
     server_connection: &quinn::Connection,
     bb: &mut bytes::BytesMut,
@@ -535,7 +543,7 @@ pub enum ReadSubscribingPeerError {
 }
 
 /// Read a peer address from the server in response to a publish task.
-#[tracing::instrument(skip(server_recv))]
+#[tracing::instrument(skip_all)]
 pub async fn read_subscribing_peer(
     server_recv: &mut quinn::RecvStream,
     our_external_address: Option<SocketAddr>,
@@ -582,7 +590,7 @@ pub enum SubscribeError {
 
 /// Perform a subscribe request to the server.
 /// Returns a list of peers that are sharing the file and the file size they promise to send.
-#[tracing::instrument(skip(server_connection, bb))]
+#[tracing::instrument(skip(server_connection, bb, our_external_address))]
 pub async fn subscribe(
     server_connection: &quinn::Connection,
     bb: &mut bytes::BytesMut,
@@ -615,7 +623,7 @@ pub async fn subscribe(
         return Ok(Vec::with_capacity(0));
     }
 
-    // Warn if we do not have an external address.
+    // Warn if we do not know our external address.
     if our_external_address.is_none() {
         tracing::warn!("Cannot determine if the server sent our own address in subscribe response");
     }
@@ -651,7 +659,7 @@ pub async fn subscribe(
 
 /// Attempt to connect to peer using UDP hole punching.
 /// Specifically, both peers attempt outgoing connections while listening for incoming connections.
-#[tracing::instrument(skip(endpoint, hash))]
+#[tracing::instrument(skip(endpoint, hash, peer_address))]
 pub async fn udp_holepunch(
     cmd: FileYeetCommandType,
     hash: HashBytes,
@@ -742,7 +750,7 @@ pub async fn peer_connection_into_stream(
 }
 
 /// Make an outgoing connection attempt to a peer at the given address.
-#[tracing::instrument(skip(endpoint))]
+#[tracing::instrument(skip_all)]
 async fn connect_to_peer(
     endpoint: quinn::Endpoint,
     peer_address: SocketAddr,
@@ -752,7 +760,12 @@ async fn connect_to_peer(
 
     // Ensure we have retries left and there isn't already a peer `Connection` to use.
     while connect_attempts > 0 {
-        tracing::debug!("Connection attempt to peer at {peer_address}");
+        if cfg!(debug_assertions) {
+            tracing::debug!("Connection attempt to peer at {peer_address}");
+        } else {
+            // TODO: Use some kind of nonce to track connection attempts to the same peer.
+            tracing::debug!("Connection attempt to peer");
+        }
 
         match endpoint.connect(peer_address, "peer") {
             Ok(connecting) => {
@@ -765,7 +778,11 @@ async fn connect_to_peer(
                     }
                 };
 
-                tracing::info!("Connected to peer at {peer_address}");
+                if cfg!(debug_assertions) {
+                    tracing::info!("Connected to peer at {peer_address}");
+                } else {
+                    tracing::info!("Connected to peer");
+                }
                 return Some(connection);
             }
 
@@ -905,7 +922,7 @@ pub async fn reject_download_request(peer_streams: &mut BiStream) -> Result<(), 
 }
 
 /// Download a file from the peer to the specified file path.
-#[tracing::instrument(skip(peer_streams, byte_progress))]
+#[tracing::instrument(skip(expected_hash, peer_streams, byte_progress))]
 pub async fn download_from_peer(
     expected_hash: HashBytes,
     peer_streams: &mut BiStream,
@@ -1003,7 +1020,7 @@ pub async fn file_size_and_hasher(
         }
     }
 
-    // Return the actual number of bytes hashed instead of the original fseek position.
+    // Return the number of bytes hashed.
     Ok((file, bytes_hashed, hasher))
 }
 
@@ -1165,7 +1182,7 @@ impl ConnectionsManager {
     }
 
     /// Await the connection of a peer from a specified socket address.
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(skip(self, peer_address))]
     pub async fn await_peer(
         &self,
         peer_address: SocketAddr,
@@ -1179,17 +1196,30 @@ impl ConnectionsManager {
                     match e.get_mut() {
                         // If the peer is already connected, return the connection.
                         IncomingPeerState::Connected(c) => {
-                            tracing::debug!("Awaited peer connection is already established");
+                            if cfg!(debug_assertions) {
+                                tracing::debug!(
+                                    "Awaited peer {peer_address} connection is already established"
+                                );
+                            } else {
+                                tracing::debug!("Awaited peer connection is already established");
+                            }
 
                             return Some(c.clone());
                         }
 
                         // Otherwise, append another receiver to the list.
                         IncomingPeerState::Awaiting(v) => {
-                            tracing::debug!(
-                                "Joining wait at index {} for peer connection",
-                                v.len()
-                            );
+                            if cfg!(debug_assertions) {
+                                tracing::debug!(
+                                    "Joining wait at index {} for peer {peer_address} connection",
+                                    v.len()
+                                );
+                            } else {
+                                tracing::debug!(
+                                    "Joining wait at index {} for peer connection",
+                                    v.len()
+                                );
+                            }
 
                             let (tx, rx) = tokio::sync::oneshot::channel();
                             v.push(tx);
@@ -1255,11 +1285,15 @@ impl ConnectionsManager {
             }
         }
 
-        tracing::debug!("Peer connection accepted by manager: {peer_address}");
+        if cfg!(debug_assertions) {
+            tracing::debug!("Peer connection accepted by manager: {peer_address}");
+        } else {
+            tracing::debug!("Peer connection accepted by manager");
+        }
     }
 
     /// Remove a peer from the manager, with synchronous lock behavior.
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(skip_all)]
     pub fn blocking_remove_peer(&mut self, peer_address: &SocketAddr) {
         if self.map.blocking_write().remove(peer_address).is_none() {
             tracing::warn!("Connection manager removed a non-existent peer");
@@ -1282,6 +1316,11 @@ impl ConnectionsManager {
     #[tracing::instrument(skip_all)]
     pub async fn manage_incoming_loop(endpoint: quinn::Endpoint) {
         let manager = Self::instance();
+
+        // Use a timer to avoid spamming logging in case of bad endpoint state.
+        let mut interval = tokio::time::interval(Duration::from_millis(100));
+        interval.tick().await; // Skip the first tick.
+
         while let Some(connecting) = endpoint.accept().await {
             let connecting = match connecting.accept() {
                 Ok(c) => c,
@@ -1289,6 +1328,7 @@ impl ConnectionsManager {
                     tracing::warn!("Failed to accept an incoming peer connection: {e}");
 
                     // Skip incomplete connections.
+                    interval.tick().await;
                     continue;
                 }
             };
@@ -1298,6 +1338,7 @@ impl ConnectionsManager {
                     tracing::warn!("Failed to complete a peer connection: {e}");
 
                     // Skip incomplete connections.
+                    interval.tick().await;
                     continue;
                 }
             };

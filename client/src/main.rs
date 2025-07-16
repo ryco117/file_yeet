@@ -23,7 +23,7 @@ pub struct Cli {
     server_address: Option<String>,
 
     /// The server port to connect to.
-    #[arg(short='p', long, default_value_t = file_yeet_shared::DEFAULT_PORT)]
+    #[arg(short = 'p', long, default_value_t = file_yeet_shared::DEFAULT_PORT)]
     server_port: NonZeroU16,
 
     /// Override the port seen by the server to communicate a custom external port to peers.
@@ -49,6 +49,10 @@ pub struct Cli {
     /// Enable verbose debug logging.
     #[arg(short, long)]
     verbose: bool,
+
+    /// Log to stdout instead of trying to log to a file.
+    #[arg(short, long)]
+    log_to_stdout: bool,
 
     #[command(subcommand)]
     cmd: Option<FileYeetCommand>,
@@ -97,38 +101,48 @@ fn logging(args: &Cli) {
     };
     let subscriber = tracing_subscriber::registry();
     let layer = tracing_subscriber::fmt::layer();
-    if let Some(app_folder) = settings::app_folder() {
-        // If logging to a file, disable logging with ANSI coloring.
-        let layer = layer.with_ansi(false);
 
-        // Log to a file in the application folder.
-        let file_appender = tracing_appender::rolling::never(&app_folder, "file_yeet.log");
-        if args.verbose {
-            create(
-                subscriber,
-                layer.pretty().with_writer(file_appender),
-                filter,
-            );
-        } else {
-            create(
-                subscriber,
-                layer.compact().with_writer(file_appender),
-                filter,
-            );
+    if !args.log_to_stdout {
+        if let Some(app_folder) = settings::app_folder() {
+            // If logging to a file, disable logging with ANSI coloring.
+            let layer = layer.with_ansi(false);
+
+            // Log to a file in the application folder.
+            let file_appender = tracing_appender::rolling::never(&app_folder, "file_yeet.log");
+            if args.verbose {
+                create(
+                    subscriber,
+                    layer.pretty().with_writer(file_appender),
+                    filter,
+                );
+            } else {
+                create(
+                    subscriber,
+                    layer.compact().with_writer(file_appender),
+                    filter,
+                );
+            }
+            return;
         }
+        println!("Failed to find an application folder for logging, using stdout");
+    }
+
+    if args.verbose {
+        create(subscriber, layer.pretty(), filter);
     } else {
-        if args.verbose {
-            create(subscriber, layer.pretty(), filter);
-        } else {
-            create(subscriber, layer.compact(), filter);
-        }
-        tracing::warn!("Failed to find the application folder for logging, using stdout");
+        create(subscriber, layer.compact(), filter);
     }
 }
 
 fn main() {
     // Parse command line arguments.
     use clap::Parser as _;
+
+    // Warn the user if this is a debug build.
+    #[cfg(debug_assertions)]
+    println!("This is a debug build. YOUR PUBLIC IP ADDRESS may be included in your logs!");
+
+    // Initialize logging based on the command line arguments.
     let args = Cli::parse();
     logging(&args);
 

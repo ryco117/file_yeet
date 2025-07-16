@@ -56,6 +56,10 @@ Options:
           The IP address of local gateway to use when attempting the Port Control Protocol. If not specified, a default gateway will be searched for
   -n, --nat-map
           When enabled the client will attempt NAT-PMP and PCP port mapping protocols
+  -v, --verbose
+          Enable verbose debug logging
+  -l, --log-to-stdout
+          Log to stdout instead of trying to log to a file
   -h, --help
           Print help
   -V, --version

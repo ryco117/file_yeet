@@ -867,7 +867,9 @@ impl AppState {
                             let mut interval =
                                 crate::core::new_renewal_interval(last_lifetime).await;
                             loop {
+                                // Ensure a reasonable wait time before each renewal attempt.
                                 interval.tick().await;
+
                                 match crate::core::renew_port_mapping(&mut mapping).await {
                                     Ok(changed) if changed => {
                                         if let Err(e) = output.try_send(
@@ -878,6 +880,8 @@ impl AppState {
                                                 "Failed to send port mapping update: {e}"
                                             );
                                         }
+
+                                        // Update interval if the lifetime has changed.
                                         let lifetime = mapping.lifetime() as u64;
                                         if lifetime != last_lifetime {
                                             last_lifetime = lifetime;
@@ -907,6 +911,12 @@ impl AppState {
                     else {
                         return None;
                     };
+                    if cancellation_token.is_cancelled() {
+                        // If the cancellation token is cancelled, skip this publish.
+                        // TODO: Return a message to update the `PublishState` to `Cancelled`.
+                        return None;
+                    }
+
                     let nonce = *nonce;
                     let cancellation_token = cancellation_token.clone();
                     let publish = publish.clone();
@@ -914,14 +924,18 @@ impl AppState {
                     // Subscribe to the server for new peers to upload to.
                     Some(iced::Subscription::run_with_id(
                         nonce,
-                        iced::stream::channel(8, move |output| {
+                        iced::stream::channel(8, async move |output| {
                             peers_requesting_publish_loop(
                                 publish,
                                 nonce,
-                                cancellation_token,
+                                &cancellation_token,
                                 external_address,
                                 output,
                             )
+                            .await;
+
+                            // If we needed to return from the loop, then cancel this item.
+                            cancellation_token.cancel();
                         }),
                     ))
                 });
@@ -933,13 +947,21 @@ impl AppState {
                         else {
                             return None;
                         };
+                        if connection.close_reason().is_some() {
+                            // If the connection is closed, skip this peer.
+                            // TODO: Return a message to remove this connection.
+                            return None;
+                        }
 
                         let peer_addr = *peer_addr;
                         let connection = connection.clone();
                         Some(iced::Subscription::run_with_id(
                             peer_addr,
-                            iced::stream::channel(8, move |output| {
-                                connected_peer_request_loop(connection, peer_addr, output)
+                            iced::stream::channel(8, async move |output| {
+                                connected_peer_request_loop(&connection, peer_addr, output).await;
+
+                                // If we needed to return from the loop, then cancel this item.
+                                connection.close(GOODBYE_CODE, GOODBYE_MESSAGE.as_bytes());
                             }),
                         ))
                     });
@@ -2013,7 +2035,7 @@ impl AppState {
     }
 
     /// Update after the server has sent a peer to publish to, or there was an error.
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(skip(self, result))]
     fn update_publish_peer_received(
         &mut self,
         nonce: Nonce,
@@ -2043,7 +2065,12 @@ impl AppState {
         match (result, publish) {
             // Attempt a new request stream from an existing or new peer connection.
             (Ok(peer), Some(publish)) => {
-                tracing::debug!("Received peer {peer} for publish {}", &publish.hash,);
+                if cfg!(debug_assertions) {
+                    tracing::debug!("Received peer {peer} for publish {}", &publish.hash);
+                } else {
+                    tracing::debug!("Received peer for publish {}", &publish.hash);
+                }
+
                 let data =
                     if let Some(c) = ConnectionsManager::instance().get_connection_sync(&peer) {
                         tracing::debug!("Reusing connection to peer {peer}");
@@ -2366,10 +2393,18 @@ impl AppState {
                             let peer = if let Some(c) =
                                 ConnectionsManager::instance().get_connection_sync(&peer)
                             {
-                                tracing::debug!("Reusing connection to peer {peer}");
+                                if cfg!(debug_assertions) {
+                                    tracing::debug!("Reusing connection to peer {peer}");
+                                } else {
+                                    tracing::debug!("Reusing connection to peer");
+                                }
                                 PeerConnectionOrTarget::Connection(c)
                             } else {
-                                tracing::debug!("Creating new connection to peer {peer}");
+                                if cfg!(debug_assertions) {
+                                    tracing::debug!("Creating new connection to peer {peer}");
+                                } else {
+                                    tracing::debug!("Creating new connection to peer");
+                                }
                                 PeerConnectionOrTarget::Target(endpoint.clone(), peer)
                             };
 
@@ -2704,7 +2739,7 @@ impl AppState {
     }
 
     /// Update the state to resume a paused transfer.
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(skip(self, peer))]
     fn update_resume_paused(
         &mut self,
         nonce: Nonce,
@@ -2756,6 +2791,12 @@ impl AppState {
 
             // Try to connect to the previous peer first if one was provided.
             if let Some(peer) = peer {
+                if cfg!(debug_assertions) {
+                    tracing::debug!("Resuming with preferred peer: {peer}");
+                } else {
+                    tracing::debug!("Resuming with a preferred peer");
+                }
+
                 if let Some(i) = peers
                     .iter()
                     .position(|(p, f)| peer.eq(p) && *f == file_size)
@@ -3122,10 +3163,18 @@ async fn first_matching_download(
             .get_connection_async(&peer)
             .await
         {
-            tracing::debug!("Reusing connection to peer {peer}");
+            if cfg!(debug_assertions) {
+                tracing::debug!("Reusing connection to peer {peer}");
+            } else {
+                tracing::debug!("Reusing connection to peer");
+            }
             PeerConnectionOrTarget::Connection(c)
         } else {
-            tracing::debug!("Creating new connection to peer {peer}");
+            if cfg!(debug_assertions) {
+                tracing::debug!("Creating new connection to peer {peer}");
+            } else {
+                tracing::debug!("Creating new connection to peer");
+            }
             PeerConnectionOrTarget::Target(endpoint.clone(), peer)
         };
 
@@ -3153,9 +3202,9 @@ enum PeerConnectionOrTarget {
 
 /// A loop to await the server to send peers requesting the specified publish.
 /// An asynchronous loop to await new requests from a peer connection.
-#[tracing::instrument(skip(connection, output))]
+#[tracing::instrument(skip_all)]
 async fn connected_peer_request_loop(
-    connection: quinn::Connection,
+    connection: &quinn::Connection,
     peer_address: SocketAddr,
     mut output: futures_channel::mpsc::Sender<Message>,
 ) {
@@ -3169,7 +3218,6 @@ async fn connected_peer_request_loop(
                     tracing::warn!("Failed to read hash from peer: {e}");
                     continue;
                 }
-
                 tracing::debug!("Peer requested transfer: {hash}");
 
                 if let Err(e) = output.try_send(Message::PeerRequestedTransfer((
@@ -3179,11 +3227,16 @@ async fn connected_peer_request_loop(
                     tracing::error!(
                         "Failed to perform internal message passing for peer requested stream: {e}"
                     );
+                    return;
                 }
             }
 
             Err(e) => {
-                tracing::debug!("Peer connection closed: {peer_address} {e:?}");
+                if cfg!(debug_assertions) {
+                    tracing::debug!("Peer connection closed: {peer_address} {e:?}");
+                } else {
+                    tracing::debug!("Peer connection closed: {e:?}");
+                }
 
                 // The peer has disconnected or the connection deteriorated.
                 if let Err(e) = output.try_send(Message::PeerDisconnected(peer_address)) {
@@ -3218,19 +3271,22 @@ fn hash_publish_task(
         },
         move |r| match r {
             Err(r) => Message::PublishRequestResulted(nonce, r),
-            Ok((file_size, hash)) => {
-                Message::PublishFileHashed(CreateOrExistingPublish::Existing(nonce), hash, file_size, true)
-            }
+            Ok((file_size, hash)) => Message::PublishFileHashed(
+                CreateOrExistingPublish::Existing(nonce),
+                hash,
+                file_size,
+                true, // Indicate that this hash was freshly calculated.
+            ),
         },
     )
 }
 
 /// For the given publish, await peers desiring to receive the file.
-#[tracing::instrument(skip(publish, cancellation_token, output))]
+#[tracing::instrument(skip(publish, cancellation_token, output, our_external_address))]
 async fn peers_requesting_publish_loop(
     publish: Publish,
     nonce: Nonce,
-    cancellation_token: CancellationToken,
+    cancellation_token: &CancellationToken,
     our_external_address: SocketAddr,
     mut output: futures_channel::mpsc::Sender<Message>,
 ) {
@@ -3283,23 +3339,11 @@ async fn peers_requesting_publish_loop(
                             }
                             tracing::warn!("Failed to read peer introduction: {e}");
 
-                            if matches!(
-                                e,
-                                ExpectedSocketError::ReadPort(_)
-                                | ExpectedSocketError::ReadIp(
-                                    quinn::ReadExactError::ReadError(quinn::ReadError::ConnectionLost(
-                                        quinn::ConnectionError::ConnectionClosed(_)
-                                        | quinn::ConnectionError::ApplicationClosed(_))))
-                            ) {
-                                // The server connection has closed, but not by our intention.
-                                tracing::warn!("Server connection closed unexpectedly");
-
-                                // Try to tell the client to cancel the publish task.
-                                if let Err(e) = output.try_send(Message::CancelPublish(nonce)) {
-                                    tracing::error!("Failed to perform internal message passing for subscription peer: {e}");
-                                }
-                                return;
+                            // Try to tell the client to cancel the publish task.
+                            if let Err(e) = output.try_send(Message::CancelPublish(nonce)) {
+                                tracing::error!("Failed to perform internal message passing for subscription peer: {e}");
                             }
+                            return;
                         }
                     }
                 }
@@ -3311,6 +3355,7 @@ async fn peers_requesting_publish_loop(
                     ))
                 {
                     tracing::error!("Failed to perform internal message passing for subscription peer: {e}");
+                    return;
                 }
             }
         }
@@ -3393,19 +3438,29 @@ fn remove_nonce_for_peer(
     if let std::collections::hash_map::Entry::Occupied(mut e) = peers.entry(peer_address) {
         let nonces = e.get_mut();
         if !nonces.remove(&nonce) {
-            tracing::warn!("Nonce was not found for peer {peer_address}");
+            if cfg!(debug_assertions) {
+                tracing::warn!("Nonce was not found for peer {peer_address}");
+            } else {
+                tracing::warn!("Nonce was not found for peer");
+            }
         }
 
         // If there are no more streams to the peer, close the connection.
         if nonces.is_empty() {
-            tracing::debug!("Closing peer {peer_address} connection");
+            if cfg!(debug_assertions) {
+                tracing::debug!("Closing peer {peer_address} connection");
+            } else {
+                tracing::debug!("Closing peer connection");
+            }
 
             // Close the connection.
             // Peer cleanup will happen when `connected_peer_request_loop(..)` sees the connection is dropped.
             peer.close(GOODBYE_CODE, GOODBYE_MESSAGE.as_bytes());
         }
-    } else {
+    } else if cfg!(debug_assertions) {
         tracing::debug!("Peer {peer_address} not found in peers map");
+    } else {
+        tracing::debug!("Peer not found in peers map");
     }
 }
 
