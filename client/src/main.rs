@@ -100,33 +100,47 @@ fn logging(args: &Cli) {
             .with_target("crab_nat", tracing::Level::INFO)
     };
     let subscriber = tracing_subscriber::registry();
-    let layer = tracing_subscriber::fmt::layer();
 
     if !args.log_to_stdout {
         if let Some(app_folder) = settings::app_folder() {
             // If logging to a file, disable logging with ANSI coloring.
-            let layer = layer.with_ansi(false);
+            let layer = tracing_subscriber::fmt::layer().with_ansi(false);
 
             // Log to a file in the application folder.
-            let file_appender = tracing_appender::rolling::never(&app_folder, "file_yeet.log");
-            if args.verbose {
-                create(
-                    subscriber,
-                    layer.pretty().with_writer(file_appender),
-                    filter,
-                );
-            } else {
-                create(
-                    subscriber,
-                    layer.compact().with_writer(file_appender),
-                    filter,
-                );
+            let file_appender = tracing_appender::rolling::Builder::new()
+                .rotation(tracing_appender::rolling::Rotation::DAILY)
+                .filename_suffix("file_yeet.log")
+                .max_log_files(2)
+                .build(&app_folder);
+
+            if let Ok(file_appender) = file_appender {
+                if args.verbose {
+                    create(
+                        subscriber,
+                        layer.pretty().with_writer(file_appender),
+                        filter,
+                    );
+                } else {
+                    create(
+                        subscriber,
+                        layer.compact().with_writer(file_appender),
+                        filter,
+                    );
+                }
+
+                // Initialization of logging to disk was successful
+                return;
             }
-            return;
+
+            eprintln!("Failed to create a log file in the application folder");
+        } else {
+            eprintln!("Failed to find an application folder for logging");
         }
-        println!("Failed to find an application folder for logging, using stdout");
+        eprintln!("Fallback to stdout logging");
     }
 
+    // Default stdout logging.
+    let layer = tracing_subscriber::fmt::layer();
     if args.verbose {
         create(subscriber, layer.pretty(), filter);
     } else {
@@ -135,20 +149,23 @@ fn logging(args: &Cli) {
 }
 
 fn main() {
-    // Parse command line arguments.
     use clap::Parser as _;
 
     // Warn the user if this is a debug build.
     #[cfg(debug_assertions)]
-    println!("This is a debug build. YOUR PUBLIC IP ADDRESS may be included in your logs!");
+    println!("Debug build: YOUR & PEER PUBLIC IP ADDRESS may be included in your logs!");
+
+    // Parse command line arguments.
+    let args = Cli::parse();
 
     // Initialize logging based on the command line arguments.
-    let args = Cli::parse();
     logging(&args);
 
     // If no subcommand was provided, run the GUI.
     let Some(cmd) = args.cmd else {
         // If Windows, ensure we aren't displaying an unwanted console window.
+        // NOTE: The "real" solution is to use `windows_subsystem = "windows"`,
+        //       but this makes even `--help` not possible, among other undesirable behavior.
         #[cfg(all(target_os = "windows", not(debug_assertions)))]
         if !args.verbose {
             tracing::info!("Freeing Windows console for GUI");

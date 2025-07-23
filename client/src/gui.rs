@@ -490,6 +490,7 @@ pub enum Message {
     PublishPathChosen(Option<PathBuf>),
 
     /// Create or update a publish item with a known hash. The hash may be from disk or freshly calculated.
+    //  TODO: Turn this into a struct-enum for clarity.
     PublishFileHashed(CreateOrExistingPublish, HashBytes, u64, bool),
 
     /// The result of a publish request.
@@ -2073,9 +2074,18 @@ impl AppState {
 
                 let data =
                     if let Some(c) = ConnectionsManager::instance().get_connection_sync(&peer) {
-                        tracing::debug!("Reusing connection to peer {peer}");
+                        if cfg!(debug_assertions) {
+                            tracing::debug!("Reusing connection to peer {peer}");
+                        } else {
+                            tracing::debug!("Reusing connection to peer");
+                        }
                         PeerConnectionOrTarget::Connection(c)
                     } else {
+                        if cfg!(debug_assertions) {
+                            tracing::debug!("Creating new connection to peer {peer}");
+                        } else {
+                            tracing::debug!("Creating new connection to peer");
+                        }
                         PeerConnectionOrTarget::Target(endpoint.clone(), peer)
                     };
                 let hash = publish.hash;
@@ -2776,7 +2786,7 @@ impl AppState {
         // Create a future to resume the download.
         let resume_future = async move {
             // Get the file size and digest state of the chosen file to publish.
-            let (_, file_size, digest) = Box::pin(crate::core::file_size_and_hasher(
+            let (_, current_file_size, digest) = Box::pin(crate::core::file_size_and_hasher(
                 &path,
                 Some(&progress_lock),
             ))
@@ -2789,7 +2799,8 @@ impl AppState {
                 .await
                 .map_err(|e| Some(Arc::new(e.into())))?;
 
-            // Try to connect to the previous peer first if one was provided.
+            // Try to connect to the previous peer first if one was provided and they are still
+            // publishing the hash.
             if let Some(peer) = peer {
                 if cfg!(debug_assertions) {
                     tracing::debug!("Resuming with preferred peer: {peer}");
@@ -2797,9 +2808,10 @@ impl AppState {
                     tracing::debug!("Resuming with a preferred peer");
                 }
 
+                // Find the previous connection for resuming.
                 if let Some(i) = peers
                     .iter()
-                    .position(|(p, f)| peer.eq(p) && *f == file_size)
+                    .position(|(p, f)| peer.eq(p) && *f == final_file_size)
                 {
                     // No need for introduction if the peer is already in the list.
                     // Ensure the peer is at the front of the list.
@@ -2814,7 +2826,7 @@ impl AppState {
                 } else {
                     // Attempt to connect to the original peer first.
                     let i = peers.len();
-                    peers.push((peer, file_size));
+                    peers.push((peer, final_file_size));
                     if i != 0 {
                         peers.swap(0, i);
                     }
@@ -2826,7 +2838,7 @@ impl AppState {
                 .await
                 .ok_or(None)?;
 
-            Ok((digest, file_size, request))
+            Ok((digest, current_file_size, request))
         };
 
         // Resume the transfer.

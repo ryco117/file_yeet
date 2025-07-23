@@ -19,6 +19,8 @@ pub fn free_allocated_console() {
     // Launched without a console if the current process is the owner of the provided console window.
     if unsafe { Win32::System::Threading::GetCurrentProcessId() == console_process } {
         // Free the allocated console window.
-        unsafe { Console::FreeConsole().expect("Failed to free allocated console") };
+        if let Err(e) = unsafe { Console::FreeConsole() } {
+            eprintln!("Failed to free console: {e}");
+        }
     }
 }

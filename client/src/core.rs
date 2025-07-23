@@ -1057,6 +1057,10 @@ pub enum UploadError {
     #[error("File access encountered an error: {0}")]
     FileAccess(#[from] FileAccessError),
 
+    /// File read early EOF.
+    #[error("File read encountered an early EOF")]
+    EarlyEof,
+
     /// Failed to write to the peer.
     #[error("Failed to write to the peer: {0}")]
     Write(#[from] quinn::WriteError),
@@ -1094,11 +1098,12 @@ pub async fn upload_to_peer(
     }
 
     // Sanity check the upload range.
-    match start_index.checked_add(upload_length) {
+    let end_index = match start_index.checked_add(upload_length) {
         Some(end) if end > file_size => Err(UploadError::InvalidRange),
         None => Err(UploadError::RangeOverflow),
-        Some(_) => Ok(()),
+        Some(end) => Ok(end),
     }?;
+    tracing::debug!("Peer requested upload range: {start_index}..{end_index} bytes");
 
     // Ensure that the file reader is at the starting index for the upload.
     reader
@@ -1116,10 +1121,9 @@ pub async fn upload_to_peer(
         let mut n = reader.read(&mut buf).await.map_err(FileAccessError::Read)?;
 
         if n == 0 {
-            // Log that the file has ended unexpectedly. Possible corruption,
-            // but continue loop because `await` call above will ensure we aren't blocking threads.
-            tracing::error!("Unexpected EOF while uploading");
-            continue;
+            // Ensure we bail out if we reach the end of the file before expected
+            // since this indicates the file has likely changed underneath us.
+            return Err(UploadError::EarlyEof);
         }
 
         // Ensure we don't send more bytes than were requested in the range.
