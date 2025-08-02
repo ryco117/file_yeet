@@ -28,7 +28,7 @@ pub const GOODBYE_CODE: quinn::VarInt = quinn::VarInt::from_u32(0);
 pub const GOODBYE_MESSAGE: &str = "Goodbye!";
 
 /// A block of raw SHA-256 bytes.
-#[derive(Clone, Copy, Default, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Copy, Default, Eq, Hash, PartialEq)]
 pub struct HashBytes {
     pub bytes: [u8; HASH_BYTE_COUNT],
 }
@@ -55,6 +55,43 @@ impl std::fmt::Debug for HashBytes {
 impl std::fmt::Display for HashBytes {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Debug::fmt(self, f)
+    }
+}
+
+/// Serialize `HashBytes` as a hexadecimal string.
+impl serde::Serialize for HashBytes {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        // Hexadecimal requires 2 characters per byte.
+        let mut hex_str_bytes = [0u8; HASH_BYTE_COUNT << 1];
+
+        // Encode the hash bytes into a hexadecimal string.
+        let hex = faster_hex::hex_encode(&self.bytes, &mut hex_str_bytes)
+            .map_err(|_| serde::ser::Error::custom("Hex encoding of hash failed"))?;
+
+        serializer.serialize_str(hex)
+    }
+}
+/// Deserialize `HashBytes` from a hexadecimal string.
+impl<'de> serde::Deserialize<'de> for HashBytes {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const EXPECTED_CHAR_COUNT: usize = HASH_BYTE_COUNT << 1;
+        let hex_str = String::deserialize(deserializer)?;
+        if hex_str.len() != EXPECTED_CHAR_COUNT {
+            return Err(serde::de::Error::invalid_length(
+                hex_str.len(),
+                &"Expected 64 hex characters",
+            ));
+        }
+
+        let mut bytes = [0u8; HASH_BYTE_COUNT];
+        faster_hex::hex_decode(hex_str.as_bytes(), &mut bytes).map_err(serde::de::Error::custom)?;
+        Ok(Self { bytes })
     }
 }
 

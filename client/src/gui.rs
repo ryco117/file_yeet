@@ -490,8 +490,12 @@ pub enum Message {
     PublishPathChosen(Option<PathBuf>),
 
     /// Create or update a publish item with a known hash. The hash may be from disk or freshly calculated.
-    //  TODO: Turn this into a struct-enum for clarity.
-    PublishFileHashed(CreateOrExistingPublish, HashBytes, u64, bool),
+    PublishFileHashed {
+        publish: CreateOrExistingPublish,
+        hash: HashBytes,
+        file_size: u64,
+        new_hash: bool,
+    },
 
     /// The result of a publish request.
     PublishRequestResulted(Nonce, PublishRequestResult),
@@ -727,9 +731,12 @@ impl AppState {
             }
 
             Message::PublishPathChosen(path) => self.update_publish_path_chosen(path),
-            Message::PublishFileHashed(publish, hash, file_size, new_hash) => {
-                self.update_publish_file_hashed(publish, hash, file_size, new_hash)
-            }
+            Message::PublishFileHashed {
+                publish,
+                hash,
+                file_size,
+                new_hash,
+            } => self.update_publish_file_hashed(publish, hash, file_size, new_hash),
             Message::PublishRequestResulted(nonce, r) => {
                 self.update_publish_request_resulted(nonce, r)
             }
@@ -1777,12 +1784,12 @@ impl AppState {
                         .drain(..)
                         .map(|p| {
                             let message = if let Some(hfs) = p.hash_and_file_size {
-                                Message::PublishFileHashed(
-                                    CreateOrExistingPublish::Create(p.path),
-                                    hfs.0,
-                                    hfs.1,
-                                    false, // The hash is from disk, not a new hash.
-                                )
+                                Message::PublishFileHashed {
+                                    publish: CreateOrExistingPublish::Create(p.path),
+                                    hash: hfs.0,
+                                    file_size: hfs.1,
+                                    new_hash: false, // The hash is from disk, not a new hash.
+                                }
                             } else {
                                 Message::PublishPathChosen(Some(p.path))
                             };
@@ -1898,12 +1905,12 @@ impl AppState {
             },
             move |r| match r {
                 Err(r) => Message::PublishRequestResulted(nonce, r),
-                Ok((file_size, hash)) => Message::PublishFileHashed(
-                    CreateOrExistingPublish::Existing(nonce),
+                Ok((file_size, hash)) => Message::PublishFileHashed {
+                    publish: CreateOrExistingPublish::Existing(nonce),
                     hash,
                     file_size,
-                    true, // The hash was freshly calculated.
-                ),
+                    new_hash: true, // The hash was freshly calculated.
+                },
             },
         )
     }
@@ -3283,12 +3290,12 @@ fn hash_publish_task(
         },
         move |r| match r {
             Err(r) => Message::PublishRequestResulted(nonce, r),
-            Ok((file_size, hash)) => Message::PublishFileHashed(
-                CreateOrExistingPublish::Existing(nonce),
+            Ok((file_size, hash)) => Message::PublishFileHashed {
+                publish: CreateOrExistingPublish::Existing(nonce),
                 hash,
                 file_size,
-                true, // Indicate that this hash was freshly calculated.
-            ),
+                new_hash: true, // Indicate that this hash was freshly calculated.
+            },
         },
     )
 }

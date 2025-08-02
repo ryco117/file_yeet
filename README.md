@@ -39,7 +39,7 @@ The command line interface for `file_yeet_client`
 Usage: file_yeet_client.exe [OPTIONS] [COMMAND]
 
 Commands:
-  pub   Publish a file to the server
+  pub   Publish a file to the server. Peers will download from this client directly
   sub   Subscribe to a file from the server
   help  Print this message or the help of the given subcommand(s)
 

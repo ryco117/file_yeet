@@ -10,6 +10,7 @@ use crate::core::{humanize_bytes, FileYeetCommandType, PreparedConnection, HASH_
 
 mod core;
 mod gui;
+mod logging;
 mod settings;
 #[cfg(all(target_os = "windows", not(debug_assertions)))]
 mod win_cmd;
@@ -61,7 +62,7 @@ pub struct Cli {
 /// The subcommands for `file_yeet_client`.
 #[derive(clap::Subcommand)]
 enum FileYeetCommand {
-    /// Publish a file to the server.
+    /// Publish a file to the server. Peers will download from this client directly.
     Pub { file_path: String },
 
     /// Subscribe to a file from the server.
@@ -75,79 +76,6 @@ enum FileYeetCommand {
     },
 }
 
-/// Initialize logging. Attempt to log to a file in the application folder, or stdout if it fails.
-fn logging(args: &Cli) {
-    /// Generic function to create a tracing subscriber with a layer and filter.
-    fn create<L>(
-        subscriber: tracing_subscriber::Registry,
-        layer: L,
-        filter: tracing_subscriber::filter::Targets,
-    ) where
-        L: tracing_subscriber::layer::Layer<tracing_subscriber::Registry> + Send + Sync + 'static,
-    {
-        use tracing_subscriber::prelude::*;
-        subscriber.with(layer).with(filter).init();
-    }
-
-    // Choose filters to apply to tracing statements to log.
-    let filter = if cfg!(debug_assertions) || args.verbose {
-        tracing_subscriber::filter::Targets::new()
-            .with_target(core::APP_TITLE, tracing::Level::DEBUG)
-            .with_target("crab_nat", tracing::Level::DEBUG)
-    } else {
-        tracing_subscriber::filter::Targets::new()
-            .with_target(core::APP_TITLE, tracing::Level::INFO)
-            .with_target("crab_nat", tracing::Level::INFO)
-    };
-    let subscriber = tracing_subscriber::registry();
-
-    if !args.log_to_stdout {
-        if let Some(app_folder) = settings::app_folder() {
-            // If logging to a file, disable logging with ANSI coloring.
-            let layer = tracing_subscriber::fmt::layer().with_ansi(false);
-
-            // Log to a file in the application folder.
-            let file_appender = tracing_appender::rolling::Builder::new()
-                .rotation(tracing_appender::rolling::Rotation::DAILY)
-                .filename_suffix("file_yeet.log")
-                .max_log_files(2)
-                .build(&app_folder);
-
-            if let Ok(file_appender) = file_appender {
-                if args.verbose {
-                    create(
-                        subscriber,
-                        layer.pretty().with_writer(file_appender),
-                        filter,
-                    );
-                } else {
-                    create(
-                        subscriber,
-                        layer.compact().with_writer(file_appender),
-                        filter,
-                    );
-                }
-
-                // Initialization of logging to disk was successful
-                return;
-            }
-
-            eprintln!("Failed to create a log file in the application folder");
-        } else {
-            eprintln!("Failed to find an application folder for logging");
-        }
-        eprintln!("Fallback to stdout logging");
-    }
-
-    // Default stdout logging.
-    let layer = tracing_subscriber::fmt::layer();
-    if args.verbose {
-        create(subscriber, layer.pretty(), filter);
-    } else {
-        create(subscriber, layer.compact(), filter);
-    }
-}
-
 fn main() {
     use clap::Parser as _;
 
@@ -159,7 +87,7 @@ fn main() {
     let args = Cli::parse();
 
     // Initialize logging based on the command line arguments.
-    logging(&args);
+    let _guard = logging::init(&args);
 
     // If no subcommand was provided, run the GUI.
     let Some(cmd) = args.cmd else {
