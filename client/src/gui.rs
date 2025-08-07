@@ -10,7 +10,7 @@ use std::{
 };
 
 use file_yeet_shared::{
-    BiStream, ExpectedSocketError, HashBytes, DEFAULT_PORT, GOODBYE_CODE, GOODBYE_MESSAGE,
+    BiStream, HashBytes, ReadIpPortError, DEFAULT_PORT, GOODBYE_CODE, GOODBYE_MESSAGE,
     MAX_SERVER_COMMUNICATION_SIZE,
 };
 use iced::{widget, window, Element};
@@ -93,9 +93,9 @@ pub enum TransferResult {
     #[error("Transfer succeeded")]
     Success,
 
-    /// The transfer failed: {0}.
+    /// The transfer failed. Has bool indicating whether the failure is recoverable.
     #[error("{0}")]
-    Failure(Arc<String>),
+    Failure(Arc<String>, bool),
 
     /// The transfer was cancelled.
     #[error("Transfer cancelled")]
@@ -193,7 +193,8 @@ struct Transfer {
     pub hash_hex: String,
     pub file_size: u64,
     pub peer_string: String,
-    pub path: PathBuf,
+    pub peer_socket: Option<SocketAddr>,
+    pub path: Arc<PathBuf>,
     pub progress: TransferState,
     pub cancellation_token: CancellationToken,
 }
@@ -206,6 +207,9 @@ pub enum PublishFileFailure {
 
     #[error("{0}")]
     Publish(#[from] crate::core::PublishError),
+
+    #[error("{0}")]
+    SocketRead(#[from] ReadIpPortError),
 }
 
 #[derive(Clone, Debug)]
@@ -241,17 +245,27 @@ enum PublishState {
     Publishing(Publish),
 
     /// The publish request has encountered an unrecoverable error.
-    Failure(Arc<PublishFileFailure>),
+    Failure(Arc<PublishFileFailure>, Option<(HashBytes, u64)>),
 
     /// The publish request was cancelled by the user.
-    Cancelled,
+    Cancelled(Option<(HashBytes, u64)>),
+}
+impl PublishState {
+    /// Get the hash and file size of the publish request, if available.
+    pub fn hash_and_file_size(&self) -> Option<(HashBytes, u64)> {
+        match self {
+            PublishState::Publishing(publish) => Some((publish.hash, publish.file_size)),
+            PublishState::Cancelled(hfs) | PublishState::Failure(_, hfs) => *hfs,
+            PublishState::Hashing(_) => None,
+        }
+    }
 }
 
 /// An item in the list of publishing requests.
 #[derive(Clone, Debug)]
 struct PublishItem {
     pub nonce: Nonce,
-    pub path: PathBuf,
+    pub path: Arc<PathBuf>,
     pub cancellation_token: CancellationToken,
     pub state: PublishState,
 }
@@ -260,25 +274,20 @@ impl PublishItem {
     pub fn new(path: PathBuf) -> Self {
         Self {
             nonce: rand::random(),
-            path,
+            path: Arc::new(path),
             cancellation_token: CancellationToken::new(),
             state: PublishState::Hashing(Arc::new(RwLock::new(0.))),
         }
     }
-
-    /// Upgrade a hashing state to publishing.
-    pub fn upgrade_hashing(
-        &mut self,
-        server_streams: Arc<tokio::sync::Mutex<BiStream>>,
-        hash: HashBytes,
-        file_size: u64,
-    ) {
-        self.state = PublishState::Publishing(Publish {
-            server_streams,
-            hash,
-            hash_hex: hash.to_string(),
-            file_size,
-        });
+}
+impl From<PublishItem> for SavedPublish {
+    fn from(item: PublishItem) -> Self {
+        Self::new(item.path.as_ref().clone(), item.state.hash_and_file_size())
+    }
+}
+impl From<&PublishItem> for SavedPublish {
+    fn from(item: &PublishItem) -> Self {
+        Self::new(item.path.as_ref().clone(), item.state.hash_and_file_size())
     }
 }
 
@@ -475,7 +484,7 @@ pub enum Message {
     PeerRequestedTransfer((HashBytes, PeerRequestStream)),
 
     /// A connection to a peer has been disconnected.
-    PeerDisconnected(SocketAddr),
+    PeerDisconnected(SocketAddr, usize),
 
     /// The transfer view radio buttons were changed.
     TransferViewChanged(TransferView),
@@ -486,8 +495,11 @@ pub enum Message {
     /// The publish button was clicked.
     PublishClicked,
 
-    /// The path to a file to publish was chosen or cancelled.
-    PublishPathChosen(Option<PathBuf>),
+    /// Initiate publishing of the chosen file or publish item.
+    PublishChosenItem(CreateOrExistingPublish),
+
+    /// Cancelled choosing a file path to publish.
+    PublishPathCancelled,
 
     /// Create or update a publish item with a known hash. The hash may be from disk or freshly calculated.
     PublishFileHashed {
@@ -536,6 +548,12 @@ pub enum Message {
     /// Cancel publishing a file.
     CancelPublish(Nonce),
 
+    /// Retry publishing a file.
+    RetryPublish(Nonce),
+
+    /// Remove a publish item.
+    RemovePublish(Nonce),
+
     /// Cancel or pause a transfer that is in-progress.
     CancelOrPauseTransfer(Nonce, FileYeetCommandType, CancelOrPause),
 
@@ -552,7 +570,7 @@ pub enum Message {
     TransferResulted(Nonce, TransferResult, FileYeetCommandType),
 
     /// Open the file using the system launcher for that file type.
-    OpenFile(PathBuf),
+    OpenFile(Arc<PathBuf>),
 
     /// A completed transfer is being removed from its list.
     RemoveFromTransfers(Nonce, FileYeetCommandType),
@@ -686,12 +704,12 @@ impl AppState {
             }
 
             // A peer has disconnected from the endpoint. Remove them from our map.
-            Message::PeerDisconnected(peer_addr) => {
+            Message::PeerDisconnected(peer_addr, connection_id) => {
                 if let ConnectionState::Connected(ConnectedState { peers, .. }) =
                     &mut self.connection_state
                 {
                     peers.remove(&peer_addr);
-                    ConnectionsManager::instance().blocking_remove_peer(&peer_addr);
+                    ConnectionsManager::instance().blocking_remove_peer(peer_addr, connection_id);
                 }
                 iced::Task::none()
             }
@@ -726,11 +744,19 @@ impl AppState {
                     rfd::AsyncFileDialog::new()
                         .set_title("Choose a file to publish")
                         .pick_file(),
-                    |f| Message::PublishPathChosen(f.map(PathBuf::from)),
+                    |f| {
+                        f.map_or(Message::PublishPathCancelled, |f| {
+                            Message::PublishChosenItem(CreateOrExistingPublish::Create(f.into()))
+                        })
+                    },
                 )
             }
 
-            Message::PublishPathChosen(path) => self.update_publish_path_chosen(path),
+            Message::PublishChosenItem(publish) => self.update_publish_chosen_item(publish),
+            Message::PublishPathCancelled => {
+                self.modal = false;
+                iced::Task::none()
+            }
             Message::PublishFileHashed {
                 publish,
                 hash,
@@ -760,6 +786,8 @@ impl AppState {
             Message::CopyHash(nonce) => self.update_copy_hash(nonce),
             Message::RehashPublish(nonce) => self.update_rehash_publish(nonce),
             Message::CancelPublish(nonce) => self.update_cancel_publish(nonce),
+            Message::RetryPublish(nonce) => self.update_retry_publish(nonce),
+            Message::RemovePublish(nonce) => self.update_remove_publish(nonce),
             Message::CancelOrPauseTransfer(nonce, transfer_type, cancel_or_pause) => {
                 self.update_cancel_or_pause(nonce, transfer_type, cancel_or_pause)
             }
@@ -773,7 +801,7 @@ impl AppState {
 
             // Handle a file being opened.
             Message::OpenFile(path) => {
-                open::that(path).unwrap_or_else(|e| {
+                open::that(path.as_ref()).unwrap_or_else(|e| {
                     let e = format!("Failed to open file: {e}");
                     tracing::error!("{e}");
                     self.status_message = Some(e);
@@ -791,11 +819,13 @@ impl AppState {
                 iced::Event::Window(window::Event::CloseRequested) => {
                     tracing::debug!("`CloseRequested` event received from window {window}");
 
-                    if self
-                        .main_window
-                        .expect("Main window not available at unhandled event")
-                        != window
-                        || self.safely_closing
+                    if self.main_window.map_or_else(
+                        || {
+                            tracing::error!("Main window not available at unhandled event");
+                            false
+                        },
+                        |w| w != window,
+                    ) || self.safely_closing
                     {
                         // Allow force closing if the safe exit is taking too long for the user.
                         // Also allows non-main windows to close immediately.
@@ -818,9 +848,12 @@ impl AppState {
             },
 
             // Exit the application immediately.
-            Message::ForceExit => iced::window::close(
-                self.main_window
-                    .expect("Main window not available at force exit"),
+            Message::ForceExit => self.main_window.map_or_else(
+                || {
+                    tracing::error!("Main window not available at force exit");
+                    iced::exit()
+                },
+                iced::window::close,
             ),
         }
     }
@@ -955,11 +988,6 @@ impl AppState {
                         else {
                             return None;
                         };
-                        if connection.close_reason().is_some() {
-                            // If the connection is closed, skip this peer.
-                            // TODO: Return a message to remove this connection.
-                            return None;
-                        }
 
                         let peer_addr = *peer_addr;
                         let connection = connection.clone();
@@ -969,7 +997,11 @@ impl AppState {
                                 connected_peer_request_loop(&connection, peer_addr, output).await;
 
                                 // If we needed to return from the loop, then cancel this item.
+                                let id = connection.stable_id();
                                 connection.close(GOODBYE_CODE, GOODBYE_MESSAGE.as_bytes());
+                                ConnectionsManager::instance()
+                                    .remove_peer(peer_addr, id)
+                                    .await;
                             }),
                         ))
                     });
@@ -990,7 +1022,7 @@ impl AppState {
     }
 
     /// Draw the application GUI.
-    pub fn view(&self) -> Element<Message> {
+    pub fn view(&self) -> Element<'_, Message> {
         // Get the time since the last mouse movement.
         let mouse_move_elapsed = self
             .last_mouse_move
@@ -1043,7 +1075,7 @@ impl AppState {
     }
 
     /// Draw the disconnected page with a server address input and connect button.
-    fn view_disconnected_page(&self) -> iced::Element<Message> {
+    fn view_disconnected_page(&self) -> iced::Element<'_, Message> {
         let mut server_address = widget::text_input(
             "Server address. E.g., localhost:7828",
             &self.options.server_address,
@@ -1077,7 +1109,7 @@ impl AppState {
 
         // Create a bottom section for choosing port forwarding/mapping options.
         let choose_port_mapping = widget::column!(
-            widget::row!(widget::text("Internal Port to Bind"), internal_port_text).spacing(12),
+            widget::row!("Internal Port to Bind", internal_port_text).spacing(12),
             widget::radio(
                 PortMappingSetting::None.to_label(),
                 PortMappingSetting::None,
@@ -1105,7 +1137,7 @@ impl AppState {
 
         // Create a text input for the gateway address.
         let gateway = widget::row!(
-            widget::text("Gateway address:"),
+            "Gateway address:",
             widget::text_input(
                 "Gateway address (e.g. 192.168.1.1), or leave empty",
                 self.options.gateway_address.as_deref().unwrap_or_default()
@@ -1163,6 +1195,15 @@ impl AppState {
     where
         I: IntoIterator<Item = &'a Transfer>,
     {
+        // Helper for creating standard buttons with tooltips.
+        let tooltip_button = |text: &'static str, message: Message, tooltip: &'static str| {
+            timed_tooltip(
+                widget::button(widget::text(text).size(12)).on_press(message),
+                tooltip,
+                mouse_move_elapsed,
+            )
+        };
+
         widget::column(transfers.into_iter().map(|t| {
             // Try to get a transfer rate string or None.
             let rate = match &t.progress {
@@ -1173,7 +1214,7 @@ impl AppState {
             };
 
             let progress = match &t.progress {
-                TransferState::Connecting => Element::from(widget::text("Connecting...")),
+                TransferState::Connecting => Element::from("Connecting..."),
 
                 TransferState::Consent(_) => widget::row!(
                     widget::text(format!(
@@ -1194,93 +1235,116 @@ impl AppState {
                     ..
                 } => {
                     let widgets = [
-                        widget::text("Transferring...").into(),
+                        "Transferring...".into(),
                         widget::progress_bar(0.0..=1., *p).height(24).into(),
                     ]
                     .into_iter()
                     .chain((transfer_type == FileYeetCommandType::Sub).then(|| {
-                        widget::button(widget::text("Pause").size(12))
-                            .on_press(Message::CancelOrPauseTransfer(
+                        tooltip_button(
+                            "Pause",
+                            Message::CancelOrPauseTransfer(
                                 t.nonce,
                                 transfer_type,
                                 CancelOrPause::Pause,
-                            ))
-                            .into()
+                            ),
+                            "Pause the download, it can be safely resumed",
+                        )
                     }))
-                    .chain([widget::button(widget::text("Cancel").size(12))
-                        .on_press(Message::CancelOrPauseTransfer(
+                    .chain([tooltip_button(
+                        "Cancel",
+                        Message::CancelOrPauseTransfer(
                             t.nonce,
                             transfer_type,
                             CancelOrPause::Cancel,
-                        ))
-                        .into()]);
+                        ),
+                        match transfer_type {
+                            FileYeetCommandType::Sub => "Cancel the download, abandoning progress",
+                            FileYeetCommandType::Pub => "Cancel the upload. The peer may attempt to recover the transfer later",
+                        },
+                    )]);
                     widget::row(widgets)
                         .spacing(6)
                         .align_y(iced::Alignment::Center)
                         .into()
                 }
 
-                TransferState::Paused(peer) => {
-                    let cancel = widget::button(widget::text("Cancel").size(12)).on_press(
+                TransferState::Paused(peer) => widget::row!(
+                    "Download is paused",
+                    widget::horizontal_space(),
+                    tooltip_button(
+                        "Resume",
+                        Message::ResumePausedDownload(t.nonce, *peer),
+                        "Attempt to resume the download",
+                    ),
+                    tooltip_button(
+                        "Cancel",
                         Message::CancelOrPauseTransfer(
                             t.nonce,
                             transfer_type,
                             CancelOrPause::Cancel,
                         ),
-                    );
-                    widget::row!(
-                        "Transfer is paused",
-                        widget::horizontal_space(),
-                        widget::button(widget::text("Resume").size(12))
-                            .on_press(Message::ResumePausedDownload(t.nonce, *peer)),
-                        cancel,
-                    )
-                    .spacing(6)
-                    .into()
-                }
+                        "Cancel the download, abandoning progress",
+                    ),
+                )
+                .spacing(6)
+                .into(),
 
                 TransferState::ResumingHash(progress_lock) => widget::row!(
-                    widget::text("Resuming with partial hash..."),
+                    "Resuming with partial hash...",
                     widget::progress_bar(0.0..=1., *progress_lock.blocking_read()).height(24),
-                    widget::button(widget::text("Cancel").size(12)).on_press(
+                    tooltip_button(
+                        "Cancel",
                         Message::CancelOrPauseTransfer(
                             t.nonce,
                             transfer_type,
                             CancelOrPause::Cancel,
-                        )
+                        ),
+                        "Cancel attempting to resume the download",
                     ),
                 )
                 .spacing(6)
                 .into(),
 
                 TransferState::Done(r) => {
-                    let remove = timed_tooltip(
-                        widget::button(widget::text("Remove").size(12))
-                            .on_press(Message::RemoveFromTransfers(t.nonce, transfer_type)),
+                    let remove = tooltip_button(
+                        "Remove",
+                        Message::RemoveFromTransfers(t.nonce, transfer_type),
                         "Remove from list, file is untouched",
-                        mouse_move_elapsed,
                     );
                     let result_text = widget::text(r.to_string())
                         .width(iced::Length::Fill)
                         .color_maybe(match r {
-                            TransferResult::Failure(_) => Some(ERROR_RED_COLOR),
+                            TransferResult::Failure(_, _) => Some(ERROR_RED_COLOR),
                             _ => None,
                         });
                     widget::row!(
                         result_text,
-                        if transfer_type == FileYeetCommandType::Sub
-                            && matches!(r, TransferResult::Success)
-                        {
-                            Element::<Message>::from(
-                                widget::row!(
-                                    widget::button(widget::text("Open").size(12))
-                                        .on_press(Message::OpenFile(t.path.clone())),
-                                    remove
+                        match (transfer_type, r) {
+                            (FileYeetCommandType::Sub, TransferResult::Success) => {
+                                Element::<Message>::from(
+                                    widget::row!(
+                                        tooltip_button(
+                                            "Open",
+                                            Message::OpenFile(t.path.clone()),
+                                            "Open with the system's default launcher",
+                                        ),
+                                        remove
+                                    )
+                                    .spacing(12),
                                 )
-                                .spacing(12),
-                            )
-                        } else {
-                            remove
+                            }
+                            (FileYeetCommandType::Sub, TransferResult::Failure(_, true)) => {
+                                Element::<Message>::from(
+                                    widget::row!(
+                                        widget::button(widget::text("Retry").size(12)).on_press(
+                                            Message::ResumePausedDownload(t.nonce, t.peer_socket)
+                                        ),
+                                        remove
+                                    )
+                                    .spacing(12),
+                                )
+                            }
+                            _ => remove,
                         },
                     )
                     .into()
@@ -1324,6 +1388,15 @@ impl AppState {
         publishes: &'a [PublishItem],
         mouse_move_elapsed: &Duration,
     ) -> iced::Element<'a, Message> {
+        // Helper for creating standard buttons with tooltips.
+        let tooltip_button = |text: &'static str, message: Message, tooltip: &'static str| {
+            timed_tooltip(
+                widget::button(widget::text(text).size(14)).on_press(message),
+                tooltip,
+                mouse_move_elapsed,
+            )
+        };
+
         let publish_views = publishes.iter().map(|pi| {
             let file_path_scrollable =
                 widget::scrollable(widget::text(pi.path.to_string_lossy()).size(12))
@@ -1343,8 +1416,11 @@ impl AppState {
                             .spacing(6),
                             file_path_scrollable,
                         ),
-                        widget::button(widget::text("Cancel").size(14))
-                            .on_press(Message::CancelPublish(pi.nonce)),
+                        tooltip_button(
+                            "Cancel",
+                            Message::CancelPublish(pi.nonce),
+                            "Cancel the hashing process. The publish is not removed",
+                        ),
                     ),
 
                     // Display a publish in the publishing state.
@@ -1360,37 +1436,53 @@ impl AppState {
                             "Copy hash to clipboard",
                             mouse_move_elapsed,
                         ),
-                        timed_tooltip(
-                            widget::button(widget::text("Rehash").size(14))
-                                .on_press(Message::RehashPublish(pi.nonce)),
+                        tooltip_button(
+                            "Rehash",
+                            Message::RehashPublish(pi.nonce),
                             "Rehash the file, necessary if the file has changed",
-                            mouse_move_elapsed,
                         ),
-                        timed_tooltip(
-                            widget::button(widget::text("Cancel").size(14))
-                                .on_press(Message::CancelPublish(pi.nonce)),
-                            "Stop accepting new uploads",
-                            mouse_move_elapsed,
+                        tooltip_button(
+                            "Cancel",
+                            Message::CancelPublish(pi.nonce),
+                            "Stop accepting new uploads for this file. The hash is not forgotten",
                         ),
                     ),
 
                     // Display a publish in the failure state.
-                    PublishState::Failure(e) => widget::row!(
+                    PublishState::Failure(e, _) => widget::row!(
                         widget::column!(
-                            widget::text(format!("Failed to publish: {e}")).color(ERROR_RED_COLOR),
+                            widget::text(format!("Failed to publish: {e}"))
+                                .color(ERROR_RED_COLOR)
+                                .size(12),
                             file_path_scrollable,
                         )
                         .width(iced::Length::Fill),
-                        widget::button(widget::text("Remove").size(12))
-                            .on_press(Message::CancelPublish(pi.nonce))
+                        tooltip_button(
+                            "Retry",
+                            Message::RetryPublish(pi.nonce),
+                            "Attempt to publish again",
+                        ),
+                        tooltip_button(
+                            "Remove",
+                            Message::RemovePublish(pi.nonce),
+                            "Remove the publish, forgetting the hash. The file is untouched",
+                        ),
                     ),
 
                     // Display a publish that was intentionally cancelled.
-                    PublishState::Cancelled => widget::row!(
-                        widget::column!(widget::text("Cancelled"), file_path_scrollable,)
+                    PublishState::Cancelled(_) => widget::row!(
+                        widget::column!(widget::text("Cancelled").size(12), file_path_scrollable)
                             .width(iced::Length::Fill),
-                        widget::button(widget::text("Remove").size(12))
-                            .on_press(Message::CancelPublish(pi.nonce))
+                        tooltip_button(
+                            "Retry",
+                            Message::RetryPublish(pi.nonce),
+                            "Attempt to publish again",
+                        ),
+                        tooltip_button(
+                            "Remove",
+                            Message::RemovePublish(pi.nonce),
+                            "Remove the publish, forgetting the hash. The file is untouched",
+                        ),
                     ),
                 }
                 .align_y(iced::Alignment::Center)
@@ -1448,14 +1540,14 @@ impl AppState {
         );
         let leave_server_button = timed_tooltip(
             leave_server_button,
-            "Leave the server, cancels ongoing transfers",
+            "Leave the server, stop active transfers, and save publishes and downloads",
             mouse_move_elapsed,
         );
 
         // Define a header exposing the server address we are connected to
         // and how the server sees us (our external IP address).
         let header = widget::row!(
-            widget::text("Server address:"),
+            "Server address:",
             widget::text(&self.options.server_address),
             timed_tooltip(
                 widget::button(
@@ -1469,7 +1561,7 @@ impl AppState {
             ),
             leave_server_button,
             widget::horizontal_space(),
-            widget::text("Our External Address:"),
+            "Our External Address:",
             widget::text(&connected_state.external_address.1),
         )
         .align_y(iced::alignment::Alignment::Center)
@@ -1479,8 +1571,8 @@ impl AppState {
         let download_input = widget::row!(hash_text_input, download_button).spacing(6);
 
         // Radio buttons for choosing the transfer view.
-        let transfer_view_choice = widget::row(
-            std::iter::once(widget::text("View: ").into()).chain(TRANSFER_VIEWS.iter().map(|l| {
+        let transfer_view_choice = widget::row(std::iter::once("View: ".into()).chain(
+            TRANSFER_VIEWS.iter().map(|l| {
                 widget::radio(
                     l.to_str(),
                     *l,
@@ -1490,8 +1582,8 @@ impl AppState {
                 .size(18)
                 .spacing(8)
                 .into()
-            })),
-        )
+            }),
+        ))
         .spacing(12);
 
         // Create a view of transfers.
@@ -1791,7 +1883,7 @@ impl AppState {
                                     new_hash: false, // The hash is from disk, not a new hash.
                                 }
                             } else {
-                                Message::PublishPathChosen(Some(p.path))
+                                Message::PublishChosenItem(CreateOrExistingPublish::Create(p.path))
                             };
                             iced::Task::done(message)
                         })
@@ -1852,16 +1944,13 @@ impl AppState {
         self.update_publish_peer_connect_resulted(nonce, Some(peer_request))
     }
 
-    /// Update the state after the publish button was clicked.
-    /// Begins a publish request if a file was chosen.
+    /// Begins a publish request with the chosen file, starting from determining the hash.
     #[tracing::instrument(skip(self))]
-    fn update_publish_path_chosen(&mut self, path: Option<PathBuf>) -> iced::Task<Message> {
+    fn update_publish_chosen_item(
+        &mut self,
+        publish: CreateOrExistingPublish,
+    ) -> iced::Task<Message> {
         self.modal = false;
-
-        // Ensure a path was chosen, otherwise safely cancel.
-        let Some(path) = path else {
-            return iced::Task::none();
-        };
 
         // Ensure the client is connected to a server.
         let ConnectionState::Connected(ConnectedState {
@@ -1876,17 +1965,46 @@ impl AppState {
         // Ensure the transfer view is set to publishing to see the new item.
         *transfer_view = TransferView::Publishes;
 
-        let publish = PublishItem::new(path.clone());
-        let progress = if let PublishState::Hashing(p) = &publish.state {
-            p.clone()
-        } else {
-            tracing::error!("Publish path chosen while not hashing");
-            Arc::new(RwLock::new(0.))
-        };
-        let cancellation_token = publish.cancellation_token.clone();
-        let nonce = publish.nonce;
+        let (progress, cancellation_token, nonce, path) = match publish {
+            // If a new publish is requested, create the desired `PublishItem`.
+            CreateOrExistingPublish::Create(path) => {
+                let publish = PublishItem::new(path.clone());
+                let progress = if let PublishState::Hashing(p) = &publish.state {
+                    p.clone()
+                } else {
+                    tracing::error!("Publish path chosen while not hashing");
+                    Arc::new(RwLock::new(0.))
+                };
+                let cancellation_token = publish.cancellation_token.clone();
+                let nonce = publish.nonce;
 
-        publishes.push(publish);
+                publishes.push(publish);
+                (
+                    progress,
+                    cancellation_token,
+                    nonce,
+                    publishes.last().unwrap().path.clone(),
+                )
+            }
+
+            // If an existing publish is requested, find it by nonce.
+            CreateOrExistingPublish::Existing(nonce) => {
+                let publish = publishes.iter_mut().find(|p| p.nonce == nonce);
+                if let Some(publish) = publish {
+                    let progress = Arc::new(RwLock::new(0.));
+                    publish.state = PublishState::Hashing(progress.clone());
+                    (
+                        progress,
+                        publish.cancellation_token.clone(),
+                        nonce,
+                        publish.path.clone(),
+                    )
+                } else {
+                    tracing::warn!("Publish chosen for unknown nonce {nonce}");
+                    return iced::Task::none();
+                }
+            }
+        };
 
         iced::Task::perform(
             async move {
@@ -1932,22 +2050,10 @@ impl AppState {
             return iced::Task::none();
         };
 
-        let saving_hash = file_size > 1_000_000_000 && new_hash; // If the file is larger than 1GB, save the hash to disk.
+        let saving_hash = new_hash && file_size > 1_000_000_000; // If the file is larger than 1GB, save the hash to disk.
         if saving_hash {
             // Before saving the new hash to disk, recreate `last_publishes`.
-            self.options.last_publishes = publishes
-                .iter_mut()
-                .filter_map(|publish_item| {
-                    // If the publish has been hashed, add it to the list of publishes to save now.
-                    match &publish_item.state {
-                        PublishState::Publishing(p) => Some(SavedPublish::new(
-                            publish_item.path.clone(),
-                            Some((p.hash, p.file_size)),
-                        )),
-                        _ => None,
-                    }
-                })
-                .collect();
+            self.options.last_publishes = publishes.iter().map(SavedPublish::from).collect();
         }
 
         let (nonce, cancellation_token, path) = match publish {
@@ -1971,9 +2077,12 @@ impl AppState {
 
         if saving_hash {
             tracing::info!("File is larger than 1GB, saving hash to disk early");
-            self.options
-                .last_publishes
-                .push(SavedPublish::new(path.clone(), Some((hash, file_size))));
+
+            // Append the new publish to the list of last publishes.
+            self.options.last_publishes.push(SavedPublish::new(
+                path.as_ref().clone(),
+                Some((hash, file_size)),
+            ));
             if let Err(e) = save_settings(&self.options) {
                 tracing::warn!("Failed to save settings after publish: {e}");
                 self.status_message = Some(format!("Failed to save settings: {e}"));
@@ -2026,13 +2135,18 @@ impl AppState {
                     Some(publish),
                 ) => {
                     tracing::debug!("Publish request succeeded");
-                    publish.upgrade_hashing(server_streams, hash, file_size);
+                    publish.state = PublishState::Publishing(Publish {
+                        server_streams,
+                        hash,
+                        hash_hex: hash.to_string(),
+                        file_size,
+                    });
                 }
                 (PublishRequestResult::Failure(e), Some(publish)) => {
-                    publish.state = PublishState::Failure(e);
+                    publish.state = PublishState::Failure(e, publish.state.hash_and_file_size());
                 }
                 (PublishRequestResult::Cancelled, Some(publish)) => {
-                    publish.state = PublishState::Cancelled;
+                    publish.state = PublishState::Cancelled(publish.state.hash_and_file_size());
                 }
                 (_, None) => {
                     tracing::warn!("Publish request resulted with an unknown nonce");
@@ -2156,12 +2270,14 @@ impl AppState {
         let upload_nonce = rand::random();
         let progress_lock = Arc::new(RwLock::new(0));
         let cancellation_token = CancellationToken::new();
+        let peer_socket = peer.connection.remote_address();
         uploads.push(Transfer {
             nonce: upload_nonce,
             hash: publishing.hash,
             hash_hex: publishing.hash.to_string(),
             file_size: publishing.file_size,
-            peer_string: peer.connection.remote_address().to_string(),
+            peer_string: peer_socket.to_string(),
+            peer_socket: Some(peer_socket),
             path: path.clone(),
             progress: TransferState::Transferring {
                 peer: peer.connection.clone(),
@@ -2177,12 +2293,13 @@ impl AppState {
         let file_size = publishing.file_size;
         iced::Task::perform(
             async move {
-                let file = match tokio::fs::File::open(path).await {
+                let file = match tokio::fs::File::open(path.as_ref()).await {
                     Ok(f) => f,
                     Err(e) => {
-                        return TransferResult::Failure(Arc::new(format!(
-                            "Failed to open the file: {e}"
-                        )))
+                        return TransferResult::Failure(
+                            Arc::new(format!("Failed to open the file: {e}")),
+                            false,
+                        )
                     }
                 };
 
@@ -2201,7 +2318,7 @@ impl AppState {
                         Some(&progress_lock),
                     )) => match result {
                         Ok(()) => TransferResult::Success,
-                        Err(e) => TransferResult::Failure(Arc::new(format!("Upload failed: {e}"))),
+                        Err(e) => TransferResult::Failure(Arc::new(format!("Upload failed: {e}")), false),
                     }
                 }
             },
@@ -2286,15 +2403,13 @@ impl AppState {
         if downloads
             .iter()
             .chain(uploads.iter())
-            .any(|t| t.path == path && !matches!(t.progress, TransferState::Done(_)))
+            .any(|t| path.eq(t.path.as_ref()))
         {
-            self.status_message = Some("Active transfer using this path already exists".to_owned());
+            self.status_message = Some("Transfer using this path already exists".to_owned());
             return iced::Task::none();
         }
-        if publishes.iter().any(|p| {
-            p.path == path && !matches!(p.state, PublishState::Failure(_) | PublishState::Cancelled)
-        }) {
-            self.status_message = Some("Active publish using this path already exists".to_owned());
+        if publishes.iter().any(|p| path.eq(p.path.as_ref())) {
+            self.status_message = Some("Publish using this path already exists".to_owned());
             return iced::Task::none();
         }
 
@@ -2348,7 +2463,8 @@ impl AppState {
             hash_hex: saved_download.hash.to_string(),
             file_size,
             peer_string: String::new(),
-            path: path.clone(),
+            peer_socket: None,
+            path: Arc::new(path),
             progress: TransferState::Paused(peer_socket),
             cancellation_token: CancellationToken::new(),
         });
@@ -2384,6 +2500,7 @@ impl AppState {
                     return iced::Task::none();
                 }
                 let hash_hex = faster_hex::hex_string(&hash.bytes);
+                let path = Arc::new(path);
 
                 // Create a new transfer state and connection attempt for each peer.
                 let transfers_commands_iter =
@@ -2399,6 +2516,7 @@ impl AppState {
                             hash_hex: hash_hex.clone(),
                             file_size,
                             peer_string: peer.to_string(),
+                            peer_socket: Some(peer),
                             path: path.clone(),
                             progress: TransferState::Connecting,
                             cancellation_token: cancellation_token.clone(),
@@ -2566,7 +2684,10 @@ impl AppState {
                     ) => {
                         match result {
                             Ok(()) => TransferResult::Success,
-                            Err(e) => TransferResult::Failure(Arc::new(format!("Download failed: {e}"))),
+                            Err(e) => {
+                                let is_recoverable = !matches!(e, crate::core::DownloadError::HashMismatch);
+                                TransferResult::Failure(Arc::new(format!("Download failed: {e}")), is_recoverable)
+                            }
                         }
                     }
                 }
@@ -2686,17 +2807,67 @@ impl AppState {
         if let ConnectionState::Connected(ConnectedState { publishes, .. }) =
             &mut self.connection_state
         {
-            if let Some(i) = publishes.iter().position(|p| p.nonce == nonce) {
-                // Cancel the publish task.
-                publishes[i].cancellation_token.cancel();
-
-                // Currently running hashing task, remove the publish from list.
-                if !matches!(&publishes[i].state, PublishState::Hashing(_)) {
-                    publishes.remove(i);
-                }
+            if let Some(publish) = publishes.iter_mut().find(|p| p.nonce == nonce) {
+                tracing::debug!("Cancelling the publish task");
+                publish.cancellation_token.cancel();
+                publish.state = PublishState::Cancelled(publish.state.hash_and_file_size());
+            } else {
+                tracing::warn!("No publish found to cancel");
             }
         } else {
             tracing::warn!("No connected state to cancel publish");
+        }
+        iced::Task::none()
+    }
+
+    /// Update the state to retry a publish.
+    #[tracing::instrument(skip(self))]
+    fn update_retry_publish(&mut self, nonce: Nonce) -> iced::Task<Message> {
+        let ConnectionState::Connected(ConnectedState { publishes, .. }) =
+            &mut self.connection_state
+        else {
+            tracing::warn!("No connected state to retry publish");
+            return iced::Task::none();
+        };
+        let Some(publish) = publishes.iter_mut().find(|p| p.nonce == nonce) else {
+            tracing::warn!("No publish found to retry");
+            return iced::Task::none();
+        };
+
+        // Cancel the old publish task in case it's still running, somehow.
+        publish.cancellation_token.cancel();
+        publish.cancellation_token = CancellationToken::new();
+
+        iced::Task::done(
+            if let Some((hash, file_size)) = publish.state.hash_and_file_size() {
+                Message::PublishFileHashed {
+                    publish: CreateOrExistingPublish::Existing(publish.nonce),
+                    hash,
+                    file_size,
+                    new_hash: false,
+                }
+            } else {
+                Message::PublishChosenItem(CreateOrExistingPublish::Existing(publish.nonce))
+            },
+        )
+    }
+
+    /// Update the state to remove a publish.
+    #[tracing::instrument(skip(self))]
+    fn update_remove_publish(&mut self, nonce: Nonce) -> iced::Task<Message> {
+        if let ConnectionState::Connected(ConnectedState { publishes, .. }) =
+            &mut self.connection_state
+        {
+            if let Some(i) = publishes.iter().position(|p| p.nonce == nonce) {
+                tracing::debug!("Removing publish item {i}");
+                // Cancel the publish task and remove.
+                publishes[i].cancellation_token.cancel();
+                publishes.remove(i);
+            } else {
+                tracing::warn!("No publish found to remove");
+            }
+        } else {
+            tracing::warn!("No connected state to remove publish");
         }
         iced::Task::none()
     }
@@ -2873,8 +3044,11 @@ impl AppState {
         nonce: Nonce,
         result: Result<(sha2::Sha256, u64, PeerRequestStream), Option<Arc<anyhow::Error>>>,
     ) -> iced::Task<Message> {
-        let ConnectionState::Connected(ConnectedState { downloads, .. }) =
-            &mut self.connection_state
+        let ConnectionState::Connected(ConnectedState {
+            downloads,
+            transfer_view,
+            ..
+        }) = &mut self.connection_state
         else {
             tracing::warn!("No connected state to resume partial hash");
             return iced::Task::none();
@@ -2885,6 +3059,7 @@ impl AppState {
             return iced::Task::none();
         };
 
+        *transfer_view = TransferView::Downloads;
         match result {
             // Resume the download with the partial hash
             Ok((digest, start_index, request)) => {
@@ -2906,14 +3081,15 @@ impl AppState {
                         let mut file = match tokio::fs::OpenOptions::new()
                             .write(true)
                             .append(true)
-                            .open(&path)
+                            .open(path.as_ref())
                             .await
                         {
                             Ok(f) => f,
                             Err(e) => {
-                                return TransferResult::Failure(Arc::new(format!(
-                                    "Failed to open the file: {e}"
-                                )))
+                                return TransferResult::Failure(
+                                    Arc::new(format!("Failed to open the file: {e}")),
+                                    true,
+                                )
                             }
                         };
 
@@ -2930,7 +3106,10 @@ impl AppState {
                                 Some(&progress),
                             )) => match result {
                                 Ok(()) => TransferResult::Success,
-                                Err(e) => TransferResult::Failure(Arc::new(format!("Upload failed: {e}"))),
+                                Err(e) => {
+                                    let is_recoverable = !matches!(e, crate::core::DownloadError::HashMismatch);
+                                    TransferResult::Failure(Arc::new(format!("Upload failed: {e}")), is_recoverable)
+                                },
                             }
                         }
                     },
@@ -2947,22 +3126,14 @@ impl AppState {
                     tracing::info!("Failed to connect to peer to resume partial hash");
                     Arc::new("No reachable peers".into())
                 };
-                t.progress = TransferState::Done(TransferResult::Failure(e));
-
-                self.options.last_downloads.push(SavedDownload {
-                    path: t.path.clone(),
-                    hash: t.hash,
-                    file_size: t.file_size,
-                    peer_socket: t.peer_string.parse().ok(),
-                });
-
+                t.progress = TransferState::Done(TransferResult::Failure(e, true));
                 iced::Task::none()
             }
         }
     }
 
     /// Update the state after a transfer has concluded, successfully or not.
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(skip(self, result))]
     fn update_transfer_resulted(
         &mut self,
         nonce: Nonce,
@@ -2977,7 +3148,7 @@ impl AppState {
         }) = &mut self.connection_state
         {
             // Log a warning if the transfer failed.
-            if let TransferResult::Failure(e) = &result {
+            if let TransferResult::Failure(e, _) = &result {
                 tracing::warn!("Transfer failed: {e}");
             }
 
@@ -3062,21 +3233,12 @@ impl AppState {
         {
             self.options.last_publishes = publishes
                 .drain(..)
-                .filter_map(|publish_item| {
+                .map(|publish_item| {
                     // Ensure all publish tasks are cancelled.
                     publish_item.cancellation_token.cancel();
 
                     // If the publish is valid or in progress, add it to the list of open publishes.
-                    match publish_item.state {
-                        PublishState::Publishing(p) => Some(SavedPublish::new(
-                            publish_item.path,
-                            Some((p.hash, p.file_size)),
-                        )),
-                        PublishState::Hashing(_) => {
-                            Some(SavedPublish::new(publish_item.path, None))
-                        }
-                        _ => None,
-                    }
+                    publish_item.into()
                 })
                 .collect();
 
@@ -3090,15 +3252,17 @@ impl AppState {
                     let peer_socket = match d.progress {
                         TransferState::Transferring { peer, .. } => Some(peer.remote_address()),
                         TransferState::Paused(peer) => peer,
+                        TransferState::ResumingHash(_)
+                        | TransferState::Done(TransferResult::Failure(_, true)) => None,
 
-                        // In most cases, do not save the download.
+                        // In other cases, do not save the download.
                         _ => return None,
                     };
                     Some(SavedDownload {
                         hash: d.hash,
                         file_size: d.file_size,
                         peer_socket,
-                        path: d.path,
+                        path: d.path.as_ref().clone(),
                     })
                 }));
 
@@ -3161,6 +3325,29 @@ fn text_horizontal_scrollbar() -> widget::scrollable::Direction {
             .width(8)
             .scroller_width(8),
     )
+}
+
+/// Helper to create a timed tooltip.
+fn timed_tooltip<'a, E>(
+    element: E,
+    tooltip_text: &'a str,
+    elapsed: &Duration,
+) -> Element<'a, Message>
+where
+    E: Into<Element<'a, Message>>,
+{
+    let element = element.into();
+    if elapsed.gt(&TOOLTIP_WAIT_DURATION) {
+        widget::tooltip(
+            element,
+            tooltip_text,
+            widget::tooltip::Position::FollowCursor,
+        )
+        .style(widget::container::rounded_box)
+        .into()
+    } else {
+        element
+    }
 }
 
 /// Helper to connect to peer publishing a known hash and file size.
@@ -3256,9 +3443,13 @@ async fn connected_peer_request_loop(
                 } else {
                     tracing::debug!("Peer connection closed: {e:?}");
                 }
+                let connection_id = connection.stable_id();
+                connection.close(GOODBYE_CODE, GOODBYE_MESSAGE.as_bytes());
 
                 // The peer has disconnected or the connection deteriorated.
-                if let Err(e) = output.try_send(Message::PeerDisconnected(peer_address)) {
+                if let Err(e) =
+                    output.try_send(Message::PeerDisconnected(peer_address, connection_id))
+                {
                     tracing::error!(
                         "Failed to perform internal message passing for failed peer stream: {e}"
                     );
@@ -3272,7 +3463,7 @@ async fn connected_peer_request_loop(
 /// Helper to get a task to hash a file and return the file size and hash.
 fn hash_publish_task(
     nonce: Nonce,
-    path: PathBuf,
+    path: Arc<PathBuf>,
     cancellation: CancellationToken,
     progress: Arc<RwLock<f32>>,
 ) -> iced::Task<Message> {
@@ -3283,7 +3474,7 @@ fn hash_publish_task(
                 () = cancellation.cancelled() => Err(PublishRequestResult::Cancelled),
 
                 // Get the file size and hash of the chosen file to publish.
-                r = crate::core::file_size_and_hash(&path, Some(&progress)) => r.map_err(|e| {
+                r = crate::core::file_size_and_hash(path.as_ref(), Some(&progress)) => r.map_err(|e| {
                     PublishRequestResult::Failure(Arc::new(e.into()))
                 })
             }
@@ -3339,8 +3530,8 @@ async fn peers_requesting_publish_loop(
                 Some(our_external_address),
             ) => {
                 // Handle errors appropriately based on the error type.
-                if let Err(e) = &result {
-                    match &e {
+                if let Err(e) = result {
+                    match e {
                         // Our address was sent as a peer, expected while testing.
                         ReadSubscribingPeerError::SelfAddress => {
                             tracing::debug!("Expected failure to read peer introduction: {e}");
@@ -3349,7 +3540,7 @@ async fn peers_requesting_publish_loop(
 
                         // Unexpected error, log and continue.
                         ReadSubscribingPeerError::ReadSocket(e) => {
-                            if matches!(e, ExpectedSocketError::ReadIp(
+                            if matches!(e, ReadIpPortError::ReadIp(
                                 quinn::ReadExactError::ReadError(crate::core::LOCALLY_CLOSED_READ)
                             )) {
                                 // Locally closed connection, expected.
@@ -3359,7 +3550,7 @@ async fn peers_requesting_publish_loop(
                             tracing::warn!("Failed to read peer introduction: {e}");
 
                             // Try to tell the client to cancel the publish task.
-                            if let Err(e) = output.try_send(Message::CancelPublish(nonce)) {
+                            if let Err(e) = output.try_send(Message::PublishRequestResulted(nonce, PublishRequestResult::Failure(Arc::new(e.into())))) {
                                 tracing::error!("Failed to perform internal message passing for subscription peer: {e}");
                             }
                             return;
@@ -3378,29 +3569,6 @@ async fn peers_requesting_publish_loop(
                 }
             }
         }
-    }
-}
-
-/// Helper to create a timed tooltip.
-fn timed_tooltip<'a, E>(
-    element: E,
-    tooltip_text: &'a str,
-    elapsed: &Duration,
-) -> Element<'a, Message>
-where
-    E: Into<Element<'a, Message>>,
-{
-    let element = element.into();
-    if elapsed.gt(&TOOLTIP_WAIT_DURATION) {
-        widget::tooltip(
-            element,
-            tooltip_text,
-            widget::tooltip::Position::FollowCursor,
-        )
-        .style(widget::container::rounded_box)
-        .into()
-    } else {
-        element
     }
 }
 
@@ -3473,13 +3641,14 @@ fn remove_nonce_for_peer(
             }
 
             // Close the connection.
-            // Peer cleanup will happen when `connected_peer_request_loop(..)` sees the connection is dropped.
+            let id = peer.stable_id();
             peer.close(GOODBYE_CODE, GOODBYE_MESSAGE.as_bytes());
+            ConnectionsManager::instance().blocking_remove_peer(peer_address, id);
         }
     } else if cfg!(debug_assertions) {
-        tracing::debug!("Peer {peer_address} not found in peers map");
+        tracing::warn!("Peer {peer_address} not found in peers map");
     } else {
-        tracing::debug!("Peer not found in peers map");
+        tracing::warn!("Peer not found in peers map");
     }
 }
 

@@ -38,12 +38,12 @@ pub struct Cli {
     #[arg(short, long)]
     internal_port: Option<NonZeroU16>,
 
-    /// The IP address of local gateway to use when attempting the Port Control Protocol.
+    /// IP address of the local gateway to use when attempting to use the port mapping protocols.
     /// If not specified, a default gateway will be searched for.
     #[arg(short, long)]
     gateway: Option<String>,
 
-    /// When enabled the client will attempt NAT-PMP and PCP port mapping protocols.
+    /// When enabled the client will attempt port mapping protocols PCP and NAT-PMP.
     #[arg(short, long)]
     nat_map: bool,
 
@@ -87,7 +87,8 @@ fn main() {
     let args = Cli::parse();
 
     // Initialize logging based on the command line arguments.
-    let _guard = logging::init(&args);
+    #[allow(unused_variables)]
+    let log_to_stdout = logging::init(&args);
 
     // If no subcommand was provided, run the GUI.
     let Some(cmd) = args.cmd else {
@@ -95,7 +96,7 @@ fn main() {
         // NOTE: The "real" solution is to use `windows_subsystem = "windows"`,
         //       but this makes even `--help` not possible, among other undesirable behavior.
         #[cfg(all(target_os = "windows", not(debug_assertions)))]
-        if !args.verbose {
+        if !log_to_stdout {
             tracing::info!("Freeing Windows console for GUI");
             win_cmd::free_allocated_console();
         }
@@ -127,7 +128,13 @@ fn main() {
     let mut bb = bytes::BytesMut::with_capacity(MAX_SERVER_COMMUNICATION_SIZE);
 
     // Begin an asynchronous runtime outside of the GUI event loop to handle the command line request.
-    let async_runtime = tokio::runtime::Runtime::new().unwrap();
+    let async_runtime = match tokio::runtime::Runtime::new() {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("Failed to create the async runtime: {e}");
+            return;
+        }
+    };
     async_runtime.block_on(async move {
         // Connect to the specified file_yeet server.
         let prepared_connection = core::prepare_server_connection(
@@ -531,7 +538,7 @@ async fn publish_loop(
                     }
 
                     // Close the connection to the peer.
-                    core::ConnectionsManager::instance().remove_peer(&peer_connection.remote_address()).await;
+                    core::ConnectionsManager::instance().remove_peer(peer_connection.remote_address(), peer_connection.stable_id()).await;
                 } => {}
             }
         });

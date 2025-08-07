@@ -18,7 +18,7 @@ futures-channel = "0.3"
 futures-util = "0.3"
 human_bytes = { version = "0.4", features = ["fast"] }
 iced = { version = "0.13", features = ["tokio"] }
-netdev = "0.36"
+netdev = "0.37"
 open = "5.3"
 quinn = "0.11"
 rand = "0.9"

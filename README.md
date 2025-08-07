@@ -49,13 +49,13 @@ Options:
   -p, --server-port <SERVER_PORT>
           The server port to connect to [default: 7828]
   -x, --external-port-override <EXTERNAL_PORT_OVERRIDE>
-          Override the port seen by the server to communicate a custom external port to peers. Useful when manually port forwarding
+          Override the port seen by the server to communicate a custom external port to peers. Useful when manually port forwarding. Takes precedence over the `nat_map` option
   -i, --internal-port <INTERNAL_PORT>
           Require the client to bind to a specific local port. Useful when manually port forwarding
   -g, --gateway <GATEWAY>
-          The IP address of local gateway to use when attempting the Port Control Protocol. If not specified, a default gateway will be searched for
+          IP address of the local gateway to use when attempting to use the port mapping protocols. If not specified, a default gateway will be searched for
   -n, --nat-map
-          When enabled the client will attempt NAT-PMP and PCP port mapping protocols
+          When enabled the client will attempt port mapping protocols PCP and NAT-PMP
   -v, --verbose
           Enable verbose debug logging
   -l, --log-to-stdout

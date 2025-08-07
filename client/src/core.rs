@@ -8,7 +8,7 @@ use std::{
 };
 
 use bytes::BufMut as _;
-use file_yeet_shared::{BiStream, ExpectedSocketError, HashBytes, SocketAddrHelper, GOODBYE_CODE};
+use file_yeet_shared::{BiStream, HashBytes, ReadIpPortError, SocketAddrHelper, GOODBYE_CODE};
 use futures_util::TryFutureExt;
 use rustls::pki_types::CertificateDer;
 use sha2::Digest as _;
@@ -35,7 +35,7 @@ pub const PEER_LISTEN_TIMEOUT: Duration = Duration::from_secs(3);
 pub const PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// Define a sane number of maximum retries.
-pub const MAX_PEER_CONNECTION_RETRIES: usize = 3;
+pub const MAX_PEER_CONNECTION_RETRIES: usize = 20;
 
 /// Define the maximum size of a payload for peer communication.
 /// QUIC may choose to fragment the payload when sending raw packets, but this isn't a concern.
@@ -191,7 +191,11 @@ pub async fn prepare_server_connection(
                         .map(|ip| IpAddr::V6(*ip))
                         .or_else(|| gateway.ipv4.first().map(|ip| IpAddr::V4(*ip)))
                 }
-                .expect("Gateway has no associated IP address")
+                .ok_or_else(|| {
+                    PrepareConnectionError::UnknownGatewayAddress(
+                        "Gateway has no associated IP address".to_owned(),
+                    )
+                })?
             };
 
             match try_port_mapping(gateway, local_address).await {
@@ -400,7 +404,7 @@ pub enum SocketPingError {
 
     /// Failed to read response text.
     #[error("Failed to read ping response text: {0}")]
-    ResponseText(#[from] ExpectedSocketError),
+    ResponseText(#[from] ReadIpPortError),
 
     /// Failed to parse the response socket address.
     #[error("Failed to parse the response address: {0}")]
@@ -535,7 +539,7 @@ pub async fn publish(
 pub enum ReadSubscribingPeerError {
     /// Failed to get valid socket address from stream.
     #[error("Failed to read valid peer address from stream: {0}")]
-    ReadSocket(#[from] ExpectedSocketError),
+    ReadSocket(#[from] ReadIpPortError),
 
     /// The server sent our address back to us.
     #[error("The server sent our address back to us")]
@@ -581,7 +585,7 @@ pub enum SubscribeError {
 
     /// Failed to read response from the server.
     #[error("Failed to read response from the server: {0}")]
-    ReadResponse(#[from] ExpectedSocketError),
+    ReadResponse(#[from] ReadIpPortError),
 
     /// Failed to parse a peer address from the server response.
     #[error("Failed to parse a peer address from the server response: {0}")]
@@ -705,6 +709,7 @@ pub async fn udp_holepunch(
 }
 
 /// Try to finalize a peer connection attempt by turning it into a bi-directional stream.
+//  TODO: Implement proper error handling instead of logging.
 #[tracing::instrument(skip(connection, expected_hash))]
 pub async fn peer_connection_into_stream(
     connection: &quinn::Connection,
@@ -717,14 +722,16 @@ pub async fn peer_connection_into_stream(
             let mut r = connection.accept_bi().await;
             if let Ok(s) = &mut r {
                 let mut requested_hash = HashBytes::default();
-                s.1.read_exact(&mut requested_hash.bytes).await.ok()?;
+                if let Err(e) = s.1.read_exact(&mut requested_hash.bytes).await {
+                    tracing::warn!("Failed to read hash from peer: {e}");
+                    return None;
+                }
 
                 // Ensure the requested hash matches the expected file hash.
                 if requested_hash != expected_hash {
                     tracing::warn!("Peer requested a file with an unexpected hash");
                     return None;
                 }
-
                 tracing::info!("New peer stream accepted");
             }
             r
@@ -734,7 +741,10 @@ pub async fn peer_connection_into_stream(
             let mut r = connection.open_bi().await;
             match &mut r {
                 Ok(s) => {
-                    s.0.write_all(&expected_hash.bytes).await.ok()?;
+                    if let Err(e) = s.0.write_all(&expected_hash.bytes).await {
+                        tracing::warn!("Failed to write to peer stream: {e}");
+                        return None;
+                    }
                     tracing::info!("New peer stream opened");
                 }
                 Err(e) => tracing::warn!("Failed to open a peer stream: {e}"),
@@ -1197,25 +1207,38 @@ impl ConnectionsManager {
             match map.entry(peer_address) {
                 // This peer has already been mapped, determine the state.
                 std::collections::hash_map::Entry::Occupied(mut e) => {
-                    match e.get_mut() {
+                    let rx = match e.get_mut() {
                         // If the peer is already connected, return the connection.
                         IncomingPeerState::Connected(c) => {
-                            if cfg!(debug_assertions) {
-                                tracing::debug!(
-                                    "Awaited peer {peer_address} connection is already established"
-                                );
+                            // Check if the connection is still alive.
+                            if let Some(r) = c.close_reason() {
+                                if cfg!(debug_assertions) {
+                                    tracing::warn!(
+                                        "Peer connection {peer_address} is already closed: {r}"
+                                    );
+                                } else {
+                                    tracing::warn!("Peer connection is already closed: {r}");
+                                }
+                                None
                             } else {
-                                tracing::debug!("Awaited peer connection is already established");
+                                if cfg!(debug_assertions) {
+                                    tracing::debug!(
+                                        "Awaited peer connection {peer_address} is already established"
+                                    );
+                                } else {
+                                    tracing::debug!(
+                                        "Awaited peer connection is already established"
+                                    );
+                                }
+                                return Some(c.clone());
                             }
-
-                            return Some(c.clone());
                         }
 
                         // Otherwise, append another receiver to the list.
                         IncomingPeerState::Awaiting(v) => {
                             if cfg!(debug_assertions) {
                                 tracing::debug!(
-                                    "Joining wait at index {} for peer {peer_address} connection",
+                                    "Joining wait at index {} for peer connection {peer_address}",
                                     v.len()
                                 );
                             } else {
@@ -1229,14 +1252,31 @@ impl ConnectionsManager {
                             v.push(tx);
 
                             // Return the receive channel for awaiting.
-                            rx
+                            Some(rx)
                         }
+                    };
+
+                    if let Some(rx) = rx {
+                        rx
+                    } else {
+                        if cfg!(debug_assertions) {
+                            tracing::debug!("Creating wait for peer connection {peer_address}");
+                        } else {
+                            tracing::debug!("Creating wait for peer connection");
+                        }
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        e.insert(IncomingPeerState::Awaiting(vec![tx]));
+                        rx
                     }
                 }
 
                 // No mapping exists for this peer address, create one.
                 std::collections::hash_map::Entry::Vacant(e) => {
-                    tracing::debug!("Creating wait for peer connection");
+                    if cfg!(debug_assertions) {
+                        tracing::debug!("Creating wait for peer connection {peer_address}");
+                    } else {
+                        tracing::debug!("Creating wait for peer connection");
+                    }
 
                     let (tx, rx) = tokio::sync::oneshot::channel();
                     e.insert(IncomingPeerState::Awaiting(vec![tx]));
@@ -1262,7 +1302,7 @@ impl ConnectionsManager {
     /// Accept a peer connection and hand-off to any threads awaiting the connection.
     /// If a connection is mapped for the peer, it is replaced with the new connection.
     #[tracing::instrument(skip_all)]
-    pub async fn accept_peer(&self, connection: quinn::Connection) {
+    async fn accept_peer(&self, connection: quinn::Connection) {
         let mut map = self.map.write().await;
         let peer_address = connection.remote_address();
         match map.entry(peer_address) {
@@ -1296,23 +1336,43 @@ impl ConnectionsManager {
         }
     }
 
-    /// Remove a peer from the manager, with synchronous lock behavior.
+    /// Remove a specific peer connection from the manager, with synchronous lock behavior.
     #[tracing::instrument(skip_all)]
-    pub fn blocking_remove_peer(&mut self, peer_address: &SocketAddr) {
-        if self.map.blocking_write().remove(peer_address).is_none() {
-            tracing::warn!("Connection manager removed a non-existent peer");
-        } else {
-            tracing::debug!("Connection manager removed peer");
+    pub fn blocking_remove_peer(&mut self, peer_address: SocketAddr, connection_id: usize) {
+        // Remove entry for peer if the stable IDs match.
+        match self.map.blocking_write().entry(peer_address) {
+            std::collections::hash_map::Entry::Occupied(e) => {
+                if let IncomingPeerState::Connected(c) = e.get() {
+                    if c.stable_id() == connection_id {
+                        e.remove();
+                        tracing::info!("Connection manager removed peer");
+                    }
+                }
+            }
+
+            std::collections::hash_map::Entry::Vacant(_) => {
+                tracing::warn!("Connection manager asked to remove a non-existent peer");
+            }
         }
     }
 
-    /// Remove a peer from the manager, with asynchronous lock behavior.
+    /// Remove a specific peer connection from the manager, with asynchronous lock behavior.
     #[tracing::instrument(skip(self))]
-    pub async fn remove_peer(&mut self, peer_address: &SocketAddr) {
-        if self.map.write().await.remove(peer_address).is_none() {
-            tracing::warn!("Connection manager removed a non-existent peer");
-        } else {
-            tracing::debug!("Connection manager removed peer");
+    pub async fn remove_peer(&mut self, peer_address: SocketAddr, connection_id: usize) {
+        // Remove entry for peer if the stable IDs match.
+        match self.map.write().await.entry(peer_address) {
+            std::collections::hash_map::Entry::Occupied(e) => {
+                if let IncomingPeerState::Connected(c) = e.get() {
+                    if c.stable_id() == connection_id {
+                        e.remove();
+                        tracing::info!("Connection manager removed peer");
+                    }
+                }
+            }
+
+            std::collections::hash_map::Entry::Vacant(_) => {
+                tracing::warn!("Connection manager asked to remove a non-existent peer");
+            }
         }
     }
 
@@ -1460,15 +1520,13 @@ fn configure_peer_verification() -> quinn::ClientConfig {
 
     // Set custom keep alive policies.
     let mut transport_config = quinn::TransportConfig::default();
-    transport_config.max_idle_timeout(Some(
-        Duration::from_secs(file_yeet_shared::QUIC_TIMEOUT_SECONDS)
-            .try_into()
-            .expect("Failed to convert `Duration` to `IdleTimeout`"),
-    ));
+    transport_config.max_idle_timeout(Some(quinn::IdleTimeout::from(quinn::VarInt::from_u32(
+        file_yeet_shared::QUIC_TIMEOUT_MILLIS,
+    ))));
 
     // Send keep alive packets at a fraction of the idle timeout.
-    transport_config.keep_alive_interval(Some(Duration::from_secs(
-        file_yeet_shared::QUIC_TIMEOUT_SECONDS / 6,
+    transport_config.keep_alive_interval(Some(Duration::from_millis(
+        file_yeet_shared::QUIC_TIMEOUT_MILLIS as u64 / 6,
     )));
     client_config.transport_config(Arc::new(transport_config));
 

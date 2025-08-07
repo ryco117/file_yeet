@@ -1,36 +1,58 @@
 const FILE_YEET_LOG_SUFFIX: &str = "file_yeet.log";
 
+const MAX_LOG_FILE_COUNT: std::num::NonZeroUsize =
+    std::num::NonZeroUsize::new(2).expect("MAX_LOG_FILE_COUNT must be a non-zero value");
+
 /// Delete old log files in the application folder.
 fn delete_old_logs(app_folder: &std::path::Path) {
-    match std::fs::read_dir(app_folder) {
-        Ok(entries) => {
-            for entry in entries {
-                match entry {
-                    Ok(entry) => {
-                        if entry
-                            .file_name()
-                            .to_string_lossy()
-                            .ends_with(FILE_YEET_LOG_SUFFIX)
-                        {
-                            if let Err(e) = std::fs::remove_file(entry.path()) {
-                                eprintln!("Failed to remove log file: {e}");
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("Failed to read entry in application folder: {e}");
-                    }
-                }
-            }
-        }
+    let entries = match std::fs::read_dir(app_folder) {
+        Ok(entries) => entries,
         Err(e) => {
             eprintln!("Failed to read application folder: {e}");
+            return;
+        }
+    };
+
+    let mut log_files: Vec<_> = entries
+        .into_iter()
+        .filter_map(|entry| {
+            match entry {
+                Ok(entry) => {
+                    if entry
+                        .file_name()
+                        .to_string_lossy()
+                        .ends_with(FILE_YEET_LOG_SUFFIX)
+                    {
+                        return Some(entry.path());
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Failed to read entry in application folder: {e}");
+                }
+            }
+            None
+        })
+        .collect();
+
+    if log_files.len() <= MAX_LOG_FILE_COUNT.get() {
+        // If the number of log files is less than or equal to the maximum, no need to delete.
+        return;
+    }
+
+    // Sort the log files by name so the most recent files are at the start of the list.
+    log_files.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+
+    // Remove the oldest log files, keeping only the most recent ones.
+    for path in &log_files[MAX_LOG_FILE_COUNT.get()..] {
+        if let Err(e) = std::fs::remove_file(path) {
+            eprintln!("Failed to remove log file: {e}");
         }
     }
 }
 
 /// Initialize logging. Attempt to log to a file in the application folder, or stdout if it fails.
-pub fn init(args: &crate::Cli) -> Option<tracing_appender::non_blocking::WorkerGuard> {
+/// Returns whether logging is using stdout.
+pub fn init(args: &crate::Cli) -> bool {
     /// Generic function to create a tracing subscriber with a layer and filter.
     fn create<L>(
         subscriber: tracing_subscriber::Registry,
@@ -67,12 +89,10 @@ pub fn init(args: &crate::Cli) -> Option<tracing_appender::non_blocking::WorkerG
             let file_appender = tracing_appender::rolling::Builder::new()
                 .rotation(tracing_appender::rolling::Rotation::DAILY)
                 .filename_suffix(FILE_YEET_LOG_SUFFIX)
-                .max_log_files(2)
+                .max_log_files(MAX_LOG_FILE_COUNT.get())
                 .build(&app_folder);
 
             if let Ok(file_appender) = file_appender {
-                let (file_appender, guard) = tracing_appender::non_blocking(file_appender);
-
                 if args.verbose {
                     create(
                         subscriber,
@@ -88,7 +108,7 @@ pub fn init(args: &crate::Cli) -> Option<tracing_appender::non_blocking::WorkerG
                 }
 
                 // Initialization of logging to disk was successful
-                return Some(guard);
+                return false;
             }
 
             eprintln!("Failed to create a log file in the application folder");
@@ -106,5 +126,6 @@ pub fn init(args: &crate::Cli) -> Option<tracing_appender::non_blocking::WorkerG
         create(subscriber, layer.compact(), filter);
     }
 
-    None
+    // Logging with stdout.
+    true
 }

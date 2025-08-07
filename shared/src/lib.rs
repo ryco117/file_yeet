@@ -17,9 +17,9 @@ pub const MAX_SERVER_COMMUNICATION_SIZE: usize = 1024;
 /// Using SHA-256 for the hash; i.e., a 256 bit / 8 byte hash.
 pub const HASH_BYTE_COUNT: usize = 256 / 8;
 
-/// The maximum number of seconds of inactivity before a QUIC connection is closed.
+/// The maximum number of milliseconds of inactivity before a QUIC connection is closed.
 /// Same for both the server and the client.
-pub const QUIC_TIMEOUT_SECONDS: u64 = 120;
+pub const QUIC_TIMEOUT_MILLIS: u32 = 120_000;
 
 /// Code sent on a graceful disconnect.
 pub const GOODBYE_CODE: quinn::VarInt = quinn::VarInt::from_u32(0);
@@ -222,9 +222,9 @@ pub fn write_ip_and_port(bb: &mut bytes::BytesMut, ip: IpAddr, port: u16) {
     write_ipv6_and_port(bb, ipv6_mapped(ip), port);
 }
 
-/// Errors that may occur when attempting to read a UTF-8 string from a connection.
+/// Errors that may occur when attempting to read a socket address from a connection.
 #[derive(Debug, thiserror::Error)]
-pub enum ExpectedSocketError {
+pub enum ReadIpPortError {
     /// Failed to read the IP address from the stream.
     #[error("Failed to read IP: {0}")]
     ReadIp(#[from] quinn::ReadExactError),
@@ -243,7 +243,7 @@ pub enum ExpectedSocketError {
 /// Fails if the IP address is empty, or the address and port cannot be read from the stream.
 pub async fn read_ip_and_port(
     stream: &mut quinn::RecvStream,
-) -> Result<(IpAddr, u16), ExpectedSocketError> {
+) -> Result<(IpAddr, u16), ReadIpPortError> {
     use tokio::io::AsyncReadExt as _;
 
     // Read the requested IP address from the stream.
@@ -252,13 +252,13 @@ pub async fn read_ip_and_port(
     let mapped_ipv6 = Ipv6Addr::from(ip_octets);
 
     if mapped_ipv6.is_unspecified() {
-        return Err(ExpectedSocketError::UnspecifiedAddress);
+        return Err(ReadIpPortError::UnspecifiedAddress);
     }
 
     // Use mapped IPv6 addresses for a fixed length IP address without version ambiguity.
     let ip = if let Some(ipv4) = mapped_ipv6.to_ipv4_mapped() {
         if ipv4.is_unspecified() {
-            return Err(ExpectedSocketError::UnspecifiedAddress);
+            return Err(ReadIpPortError::UnspecifiedAddress);
         }
 
         IpAddr::V4(ipv4)
@@ -279,11 +279,9 @@ pub async fn read_ip_and_port(
 pub fn server_transport_config() -> Arc<quinn::TransportConfig> {
     // Set custom keep alive policies.
     let mut transport_config = quinn::TransportConfig::default();
-    transport_config.max_idle_timeout(Some(
-        Duration::from_secs(QUIC_TIMEOUT_SECONDS)
-            .try_into()
-            .unwrap(),
-    ));
+    transport_config.max_idle_timeout(Some(quinn::IdleTimeout::from(quinn::VarInt::from_u32(
+        QUIC_TIMEOUT_MILLIS,
+    ))));
     transport_config.keep_alive_interval(Some(Duration::from_secs(30)));
     Arc::new(transport_config)
 }

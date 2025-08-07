@@ -110,7 +110,6 @@ pub fn load_settings() -> Result<AppSettings, std::io::Error> {
     } else {
         // Create the settings file and directory.
         std::fs::create_dir_all(p.parent().unwrap())?;
-        std::fs::write(p, "")?;
         Ok(AppSettings::default())
     }
 }
