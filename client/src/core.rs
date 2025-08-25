@@ -1046,7 +1046,7 @@ pub async fn file_size_and_hash(
 
 /// Errors that may occur when uploading a file to a peer.
 #[derive(Debug, thiserror::Error)]
-pub enum UploadError {
+pub enum ReadPubRangeError {
     /// Failed to read file index data and got a `ReadError`.
     #[error("Failed to read file index data: {0}")]
     ReadFileIndexFailedWithError(quinn::ReadError),
@@ -1055,14 +1055,54 @@ pub enum UploadError {
     #[error("Failed to read file index data: {0}")]
     ReadFileIndexFailedWithKind(std::io::ErrorKind),
 
-    /// The peer requested an invalid range.
+    /// Peer requested an invalid range, exceeds file size.
     #[error("Peer requested an invalid range, exceeds file size")]
     InvalidRange,
 
-    /// The peer requested an invalid range.
+    /// Peer requested an invalid range, 64-bit overflow 🫠.
     #[error("Peer requested an invalid range, 64-bit overflow 🫠")]
     RangeOverflow,
+}
 
+/// Read the upload range from the peer.
+/// Guarantees the start index and range length can be safely used or returns an error.
+#[tracing::instrument(skip(peer_streams))]
+pub async fn read_publish_range(
+    peer_streams: &mut BiStream,
+    file_size: u64,
+) -> Result<(u64, u64), ReadPubRangeError> {
+    // Read the peer's desired upload range.
+    let start_index = peer_streams.recv.read_u64().await.map_err(|e| {
+        let kind = e.kind();
+        if let Ok(e) = e.downcast::<quinn::ReadError>() {
+            ReadPubRangeError::ReadFileIndexFailedWithError(e)
+        } else {
+            ReadPubRangeError::ReadFileIndexFailedWithKind(kind)
+        }
+    })?;
+    let upload_length = peer_streams.recv.read_u64().await.map_err(|e| {
+        let kind = e.kind();
+        if let Ok(e) = e.downcast::<quinn::ReadError>() {
+            ReadPubRangeError::ReadFileIndexFailedWithError(e)
+        } else {
+            ReadPubRangeError::ReadFileIndexFailedWithKind(kind)
+        }
+    })?;
+
+    // Sanity check the upload range.
+    let end_index = match start_index.checked_add(upload_length) {
+        Some(end) if end > file_size => Err(ReadPubRangeError::InvalidRange),
+        None => Err(ReadPubRangeError::RangeOverflow),
+        Some(end) => Ok(end),
+    }?;
+    tracing::debug!("Peer requested upload range: {start_index}..{end_index} bytes");
+
+    Ok((start_index, upload_length))
+}
+
+/// Errors that may occur when uploading a file to a peer.
+#[derive(Debug, thiserror::Error)]
+pub enum UploadError {
     /// File access encountered an error.
     #[error("File access encountered an error: {0}")]
     FileAccess(#[from] FileAccessError),
@@ -1080,41 +1120,11 @@ pub enum UploadError {
 #[tracing::instrument(skip(peer_streams, reader, byte_progress))]
 pub async fn upload_to_peer(
     peer_streams: &mut BiStream,
-    file_size: u64,
+    start_index: u64,
+    upload_length: u64,
     mut reader: tokio::io::BufReader<tokio::fs::File>,
     byte_progress: Option<&RwLock<u64>>,
 ) -> Result<(), UploadError> {
-    // Read the peer's desired upload range.
-    let start_index = peer_streams.recv.read_u64().await.map_err(|e| {
-        let kind = e.kind();
-        if let Ok(e) = e.downcast::<quinn::ReadError>() {
-            UploadError::ReadFileIndexFailedWithError(e)
-        } else {
-            UploadError::ReadFileIndexFailedWithKind(kind)
-        }
-    })?;
-    let upload_length = peer_streams.recv.read_u64().await.map_err(|e| {
-        let kind = e.kind();
-        if let Ok(e) = e.downcast::<quinn::ReadError>() {
-            UploadError::ReadFileIndexFailedWithError(e)
-        } else {
-            UploadError::ReadFileIndexFailedWithKind(kind)
-        }
-    })?;
-
-    if upload_length == 0 {
-        // The peer doesn't want any data from us.
-        return Ok(());
-    }
-
-    // Sanity check the upload range.
-    let end_index = match start_index.checked_add(upload_length) {
-        Some(end) if end > file_size => Err(UploadError::InvalidRange),
-        None => Err(UploadError::RangeOverflow),
-        Some(end) => Ok(end),
-    }?;
-    tracing::debug!("Peer requested upload range: {start_index}..{end_index} bytes");
-
     // Ensure that the file reader is at the starting index for the upload.
     reader
         .seek(std::io::SeekFrom::Start(start_index))

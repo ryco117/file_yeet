@@ -521,6 +521,7 @@ async fn publish_loop(
                         return;
                     };
 
+                    // Open the file to publish with read access.
                     let file = match tokio::fs::File::open(file_path).await {
                         Ok(f) => f,
                         Err(e) => {
@@ -529,11 +530,20 @@ async fn publish_loop(
                         }
                     };
 
+                    // Determine the range from the file that the peer wants.
+                    let (start_index, upload_length) = match core::read_publish_range(&mut peer_streams, file_size).await {
+                        Ok(range) => range,
+                        Err(e) => {
+                            tracing::warn!("Failed to read peer upload range: {e}");
+                            return;
+                        }
+                    };
+
                     // Prepare a reader for the file to upload.
                     let reader = tokio::io::BufReader::new(file);
 
                     // Try to upload the file to the peer connection.
-                    if let Err(e) = Box::pin(core::upload_to_peer(&mut peer_streams, file_size, reader, None)).await {
+                    if let Err(e) = Box::pin(core::upload_to_peer(&mut peer_streams, start_index, upload_length, reader, None)).await {
                         tracing::warn!("Failed to upload to peer: {e}");
                     }
 

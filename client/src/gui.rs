@@ -2303,17 +2303,28 @@ impl AppState {
                     }
                 };
 
-                // Prepare a reader for the file to upload.
-                let reader = tokio::io::BufReader::new(file);
-
                 // Try to upload the file to the peer connection.
                 let mut streams = peer.bistream.lock().await;
+
+                let (start_index, upload_length) = match crate::core::read_publish_range(&mut streams, file_size).await {
+                    Ok(range) => range,
+                    Err(e) => {
+                        return TransferResult::Failure(
+                            Arc::new(format!("Failed to read peer upload range: {e}")),
+                            false,
+                        );
+                    }
+                };
+
+                // Prepare a reader for the file to upload.
+                let reader = tokio::io::BufReader::new(file);
 
                 tokio::select! {
                     () = cancellation_token.cancelled() => TransferResult::Cancelled,
                     result = Box::pin(crate::core::upload_to_peer(
                         &mut streams,
-                        file_size,
+                        start_index,
+                        upload_length,
                         reader,
                         Some(&progress_lock),
                     )) => match result {
