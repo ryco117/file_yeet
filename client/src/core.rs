@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{hash_map, HashMap},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
     num::NonZeroU16,
     path::Path,
@@ -1317,7 +1317,7 @@ impl ConnectionsManager {
         let peer_address = connection.remote_address();
         match map.entry(peer_address) {
             // Update the entry and handle any waiting threads.
-            std::collections::hash_map::Entry::Occupied(mut e) => {
+            hash_map::Entry::Occupied(mut e) => {
                 let old = e.insert(IncomingPeerState::Connected(connection.clone()));
 
                 // Let all waiting threads know that the peer has connected.
@@ -1334,7 +1334,7 @@ impl ConnectionsManager {
             }
 
             // Create a new entry for the peer connection.
-            std::collections::hash_map::Entry::Vacant(e) => {
+            hash_map::Entry::Vacant(e) => {
                 e.insert(IncomingPeerState::Connected(connection));
             }
         }
@@ -1351,7 +1351,7 @@ impl ConnectionsManager {
     pub fn blocking_remove_peer(&mut self, peer_address: SocketAddr, connection_id: usize) {
         // Remove entry for peer if the stable IDs match.
         match self.map.blocking_write().entry(peer_address) {
-            std::collections::hash_map::Entry::Occupied(e) => {
+            hash_map::Entry::Occupied(e) => {
                 if let IncomingPeerState::Connected(c) = e.get() {
                     if c.stable_id() == connection_id {
                         e.remove();
@@ -1360,7 +1360,7 @@ impl ConnectionsManager {
                 }
             }
 
-            std::collections::hash_map::Entry::Vacant(_) => {
+            hash_map::Entry::Vacant(_) => {
                 tracing::warn!("Connection manager asked to remove a non-existent peer");
             }
         }
@@ -1371,7 +1371,7 @@ impl ConnectionsManager {
     pub async fn remove_peer(&mut self, peer_address: SocketAddr, connection_id: usize) {
         // Remove entry for peer if the stable IDs match.
         match self.map.write().await.entry(peer_address) {
-            std::collections::hash_map::Entry::Occupied(e) => {
+            hash_map::Entry::Occupied(e) => {
                 if let IncomingPeerState::Connected(c) = e.get() {
                     if c.stable_id() == connection_id {
                         e.remove();
@@ -1380,7 +1380,7 @@ impl ConnectionsManager {
                 }
             }
 
-            std::collections::hash_map::Entry::Vacant(_) => {
+            hash_map::Entry::Vacant(_) => {
                 tracing::warn!("Connection manager asked to remove a non-existent peer");
             }
         }
@@ -1435,12 +1435,32 @@ impl ConnectionsManager {
     /// Get the connection state of a peer.
     /// # Panics
     /// Cannot be used in async contexts. Will panic if used in an async runtime.
-    pub fn get_connection_sync(&self, peer_address: &SocketAddr) -> Option<quinn::Connection> {
-        if let Some(IncomingPeerState::Connected(c)) = self.map.blocking_read().get(peer_address) {
-            Some(c.clone())
-        } else {
-            None
+    pub fn get_connection_sync(&self, peer_address: SocketAddr) -> Option<quinn::Connection> {
+        if let hash_map::Entry::Occupied(e) = self.map.blocking_write().entry(peer_address) {
+            if let IncomingPeerState::Connected(c) = e.get() {
+                // Check if the connection is still alive.
+                if let Some(r) = c.close_reason() {
+                    if cfg!(debug_assertions) {
+                        tracing::warn!("Peer connection {peer_address} is already closed: {r}");
+                    } else {
+                        tracing::warn!("Peer connection is already closed: {r}");
+                    }
+                    e.remove();
+                } else {
+                    if cfg!(debug_assertions) {
+                        tracing::debug!(
+                            "Synchronous get for peer connection {peer_address} is already established"
+                        );
+                    } else {
+                        tracing::debug!(
+                            "Synchronous get for peer connection is already established"
+                        );
+                    }
+                    return Some(c.clone());
+                }
+            }
         }
+        None
     }
 
     /// Get the connection state of a peer.

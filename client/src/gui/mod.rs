@@ -20,14 +20,24 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     core::{
         humanize_bytes, peer_connection_into_stream, udp_holepunch, ConnectionsManager,
-        FileAccessError, FileYeetCommandType, PortMappingConfig, PrepareConnectionError,
-        PreparedConnection, ReadSubscribingPeerError, SubscribeError, HASH_EXT_REGEX,
-        MAX_PEER_COMMUNICATION_SIZE, PEER_CONNECT_TIMEOUT, SERVER_CONNECTION_TIMEOUT,
+        FileYeetCommandType, PortMappingConfig, PrepareConnectionError, PreparedConnection,
+        ReadSubscribingPeerError, SubscribeError, HASH_EXT_REGEX, MAX_PEER_COMMUNICATION_SIZE,
+        PEER_CONNECT_TIMEOUT, SERVER_CONNECTION_TIMEOUT,
+    },
+    gui::{
+        publish::{draw_publishes, Publish, PublishItem, PublishRequestResult, PublishState},
+        transfers::{
+            update_download_result, update_upload_result, DownloadState, DownloadTransfer,
+            Transfer, TransferBase, TransferResult, TransferSnapshot, UploadState, UploadTransfer,
+        },
     },
     settings::{
         load_settings, save_settings, AppSettings, PortMappingSetting, SavedDownload, SavedPublish,
     },
 };
+
+mod publish;
+mod transfers;
 
 /// The string corresponding to a regex pattern for matching valid IPv6 addresses.
 const IPV6_REGEX_STR: &str = r"(?:(?:[0-9a-fA-F]{1,4}:){7,7}[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,7}:|(?:[0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,5}(?::[0-9a-fA-F]{1,4}){1,2}|(?:[0-9a-fA-F]{1,4}:){1,4}(?::[0-9a-fA-F]{1,4}){1,3}|(?:[0-9a-fA-F]{1,4}:){1,3}(?::[0-9a-fA-F]{1,4}){1,4}|(?:[0-9a-fA-F]{1,4}:){1,2}(?::[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:(?:(?::[0-9a-fA-F]{1,4}){1,6})|:(?:(?::[0-9a-fA-F]{1,4}){1,7}|:)|fe80:(?::[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}|::(?:ffff(?::0{1,4}){0,1}:){0,1}(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3,3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)|(?:[0-9a-fA-F]{1,4}:){1,4}:(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3,3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?))";
@@ -52,10 +62,7 @@ const MAX_SHUTDOWN_WAIT: Duration = Duration::from_secs(3);
 const ERROR_RED_COLOR: iced::Color = iced::Color::from_rgb(1., 0.35, 0.45);
 
 /// Font capable of rendering emojis.
-pub static EMOJI_FONT: &[u8] = include_bytes!("../NotoEmoji-Regular.ttf");
-
-/// The rate at which transfer speed text is updated.
-const TRANSFER_SPEED_UPDATE_INTERVAL: Duration = Duration::from_millis(400);
+pub static EMOJI_FONT: &[u8] = include_bytes!("../../NotoEmoji-Regular.ttf");
 
 /// The delay of mouse inactivity before showing tooltips.
 const TOOLTIP_WAIT_DURATION: Duration = Duration::from_millis(400);
@@ -86,209 +93,11 @@ impl From<(quinn::Connection, BiStream)> for PeerRequestStream {
 /// Nonce used to identifying items locally.
 type Nonce = u64;
 
-/// The result of a file transfer with a peer.
-#[derive(Clone, Debug, thiserror::Error)]
-pub enum TransferResult {
-    /// The transfer succeeded.
-    #[error("Transfer succeeded")]
-    Success,
-
-    /// The transfer failed. Has bool indicating whether the failure is recoverable.
-    #[error("{0}")]
-    Failure(Arc<String>, bool),
-
-    /// The transfer was cancelled.
-    #[error("Transfer cancelled")]
-    Cancelled,
-}
-
-/// The progress of a file transfer at a moment in time.
-#[derive(Clone, Debug)]
-struct TransferSnapshot {
-    instant: Instant,
-    bytes_transferred: u64,
-    human_readable: String,
-}
-impl TransferSnapshot {
-    /// Create a new snapshot of the transfer progress.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            instant: Instant::now(),
-            bytes_transferred: 0,
-            human_readable: String::new(),
-        }
-    }
-
-    /// Update the snapshot with the current progress.
-    pub fn update(&mut self, bytes_transferred: u64) {
-        let byte_difference = bytes_transferred.checked_sub(self.bytes_transferred);
-        self.bytes_transferred = bytes_transferred;
-
-        let now = Instant::now();
-        let duration = (now - self.instant).as_secs_f64();
-        self.instant = now;
-
-        if let (Some(byte_difference), true) = (byte_difference, duration > 0.) {
-            let bytes_per_second = human_bytes::human_bytes(byte_difference as f64 / duration);
-            self.human_readable = format!("{bytes_per_second}/s");
-        } else {
-            tracing::warn!(
-                "Transfer snapshot given invalid parameters: {duration}, {byte_difference:?}"
-            );
-        }
-    }
-}
-
-/// The state of a file transfer with a peer.
-//  TODO: Separate progress enum for uploads and downloads. Consider using a trait if there is a
-//        use case for sharing certain aspects.
-#[derive(Debug)]
-enum TransferState {
-    /// The transfer is awaiting a connection attempt. Only used for downloads.
-    Connecting,
-
-    /// The transfer is awaiting user confirmation. Only used for downloads.
-    Consent(PeerRequestStream),
-
-    /// The transfer is in progress.
-    Transferring {
-        peer: quinn::Connection,
-        progress_lock: Arc<RwLock<u64>>,
-        progress_animation: f32,
-        snapshot: TransferSnapshot,
-    },
-
-    /// The transfer has been paused. Only used for downloads.
-    Paused(Option<SocketAddr>),
-
-    /// Resuming a download by hashing the partial file. Only used for downloads.
-    ResumingHash(Arc<RwLock<f32>>),
-
-    /// The transfer has completed.
-    Done(TransferResult),
-}
-impl TransferState {
-    /// If the progress state contains a peer connection, return it.
-    /// Otherwise, return `None`.
-    pub fn connection(&self) -> Option<&quinn::Connection> {
-        match self {
-            // Connection in these states.
-            TransferState::Consent(PeerRequestStream { connection, .. })
-            | TransferState::Transferring {
-                peer: connection, ..
-            } => Some(connection),
-
-            // No connection in remaining states.
-            _ => None,
-        }
-    }
-}
-
-/// A file transfer with a peer in any state.
-#[derive(Debug)]
-struct Transfer {
-    pub nonce: Nonce,
-    pub hash: HashBytes,
-    pub hash_hex: String,
-    pub file_size: u64,
-    pub peer_string: String,
-    pub peer_socket: Option<SocketAddr>,
-    pub path: Arc<PathBuf>,
-    pub progress: TransferState,
-    pub cancellation_token: CancellationToken,
-}
-
-/// The result of a file publish request.
-#[derive(Debug, thiserror::Error)]
-pub enum PublishFileFailure {
-    #[error("{0}")]
-    FileAccess(#[from] FileAccessError),
-
-    #[error("{0}")]
-    Publish(#[from] crate::core::PublishError),
-
-    #[error("{0}")]
-    SocketRead(#[from] ReadIpPortError),
-}
-
-#[derive(Clone, Debug)]
-pub enum PublishRequestResult {
-    Success(IncomingPublishSession),
-    Failure(Arc<PublishFileFailure>),
-    Cancelled,
-}
-
-/// A file actively being published to the server.
-#[derive(Clone, Debug)]
-struct Publish {
-    pub server_streams: Arc<tokio::sync::Mutex<BiStream>>,
-    pub hash: HashBytes,
-    pub hash_hex: String,
-    pub file_size: u64,
-}
-
 /// The information to create a new publish item, or the nonce of an existing one.
 #[derive(Clone, Debug)]
 pub enum CreateOrExistingPublish {
     Create(PathBuf),
     Existing(Nonce),
-}
-
-/// The state of a file publish request.
-#[derive(Clone, Debug)]
-enum PublishState {
-    /// The file is being hashed, with progress given in the range [0., 1.].
-    Hashing(Arc<RwLock<f32>>),
-
-    /// The publish request is active.
-    Publishing(Publish),
-
-    /// The publish request has encountered an unrecoverable error.
-    Failure(Arc<PublishFileFailure>, Option<(HashBytes, u64)>),
-
-    /// The publish request was cancelled by the user.
-    Cancelled(Option<(HashBytes, u64)>),
-}
-impl PublishState {
-    /// Get the hash and file size of the publish request, if available.
-    pub fn hash_and_file_size(&self) -> Option<(HashBytes, u64)> {
-        match self {
-            PublishState::Publishing(publish) => Some((publish.hash, publish.file_size)),
-            PublishState::Cancelled(hfs) | PublishState::Failure(_, hfs) => *hfs,
-            PublishState::Hashing(_) => None,
-        }
-    }
-}
-
-/// An item in the list of publishing requests.
-#[derive(Clone, Debug)]
-struct PublishItem {
-    pub nonce: Nonce,
-    pub path: Arc<PathBuf>,
-    pub cancellation_token: CancellationToken,
-    pub state: PublishState,
-}
-impl PublishItem {
-    /// Make a new publish item in the hashing state.
-    pub fn new(path: PathBuf) -> Self {
-        Self {
-            nonce: rand::random(),
-            path: Arc::new(path),
-            cancellation_token: CancellationToken::new(),
-            state: PublishState::Hashing(Arc::new(RwLock::new(0.))),
-        }
-    }
-}
-impl From<PublishItem> for SavedPublish {
-    fn from(item: PublishItem) -> Self {
-        Self::new(item.path.as_ref().clone(), item.state.hash_and_file_size())
-    }
-}
-impl From<&PublishItem> for SavedPublish {
-    fn from(item: &PublishItem) -> Self {
-        Self::new(item.path.as_ref().clone(), item.state.hash_and_file_size())
-    }
 }
 
 /// The result of a subscribe request.
@@ -363,10 +172,10 @@ struct ConnectedState {
     peers: HashMap<SocketAddr, HashSet<Nonce>>,
 
     /// List of download requests to peers.
-    downloads: Vec<Transfer>,
+    downloads: Vec<DownloadTransfer>,
 
     /// List of file uploads to peers.
-    uploads: Vec<Transfer>,
+    uploads: Vec<UploadTransfer>,
 
     /// List of file publish requests to the server.
     publishes: Vec<PublishItem>,
@@ -1187,314 +996,16 @@ impl AppState {
     }
 
     /// Draw the transfer view for the main connected page.
-    fn draw_transfers<'a, I>(
+    fn draw_transfers<'a, I, T: Transfer + 'a>(
         transfers: I,
-        transfer_type: FileYeetCommandType,
         mouse_move_elapsed: &Duration,
     ) -> iced::Element<'a, Message>
     where
-        I: IntoIterator<Item = &'a Transfer>,
+        I: IntoIterator<Item = &'a T>,
     {
-        // Helper for creating standard buttons with tooltips.
-        let tooltip_button = |text: &'static str, message: Message, tooltip: &'static str| {
-            timed_tooltip(
-                widget::button(widget::text(text).size(12)).on_press(message),
-                tooltip,
-                mouse_move_elapsed,
-            )
-        };
-
-        widget::column(transfers.into_iter().map(|t| {
-            // Try to get a transfer rate string or None.
-            let rate = match &t.progress {
-                TransferState::Transferring { snapshot, .. } => {
-                    Some(snapshot.human_readable.clone())
-                }
-                _ => None,
-            };
-
-            let progress = match &t.progress {
-                TransferState::Connecting => Element::from("Connecting..."),
-
-                TransferState::Consent(_) => widget::row!(
-                    widget::text(format!(
-                        "Accept download of size {}",
-                        humanize_bytes(t.file_size)
-                    ))
-                    .width(iced::Length::Fill),
-                    widget::button(widget::text("Accept").size(12))
-                        .on_press(Message::AcceptDownload(t.nonce)),
-                    widget::button(widget::text("Reject").size(12))
-                        .on_press(Message::RejectDownload(t.nonce)),
-                )
-                .spacing(12)
-                .into(),
-
-                TransferState::Transferring {
-                    progress_animation: p,
-                    ..
-                } => {
-                    let widgets = [
-                        "Transferring...".into(),
-                        widget::progress_bar(0.0..=1., *p).height(24).into(),
-                    ]
-                    .into_iter()
-                    .chain((transfer_type == FileYeetCommandType::Sub).then(|| {
-                        tooltip_button(
-                            "Pause",
-                            Message::CancelOrPauseTransfer(
-                                t.nonce,
-                                transfer_type,
-                                CancelOrPause::Pause,
-                            ),
-                            "Pause the download, it can be safely resumed",
-                        )
-                    }))
-                    .chain([tooltip_button(
-                        "Cancel",
-                        Message::CancelOrPauseTransfer(
-                            t.nonce,
-                            transfer_type,
-                            CancelOrPause::Cancel,
-                        ),
-                        match transfer_type {
-                            FileYeetCommandType::Sub => "Cancel the download, abandoning progress",
-                            FileYeetCommandType::Pub => "Cancel the upload. The peer may attempt to recover the transfer later",
-                        },
-                    )]);
-                    widget::row(widgets)
-                        .spacing(6)
-                        .align_y(iced::Alignment::Center)
-                        .into()
-                }
-
-                TransferState::Paused(peer) => widget::row!(
-                    "Download is paused",
-                    widget::horizontal_space(),
-                    tooltip_button(
-                        "Resume",
-                        Message::ResumePausedDownload(t.nonce, *peer),
-                        "Attempt to resume the download",
-                    ),
-                    tooltip_button(
-                        "Cancel",
-                        Message::CancelOrPauseTransfer(
-                            t.nonce,
-                            transfer_type,
-                            CancelOrPause::Cancel,
-                        ),
-                        "Cancel the download, abandoning progress",
-                    ),
-                )
-                .spacing(6)
-                .into(),
-
-                TransferState::ResumingHash(progress_lock) => widget::row!(
-                    "Resuming with partial hash...",
-                    widget::progress_bar(0.0..=1., *progress_lock.blocking_read()).height(24),
-                    tooltip_button(
-                        "Cancel",
-                        Message::CancelOrPauseTransfer(
-                            t.nonce,
-                            transfer_type,
-                            CancelOrPause::Cancel,
-                        ),
-                        "Cancel attempting to resume the download",
-                    ),
-                )
-                .spacing(6)
-                .into(),
-
-                TransferState::Done(r) => {
-                    let remove = tooltip_button(
-                        "Remove",
-                        Message::RemoveFromTransfers(t.nonce, transfer_type),
-                        "Remove from list, file is untouched",
-                    );
-                    let result_text = widget::text(r.to_string())
-                        .width(iced::Length::Fill)
-                        .color_maybe(match r {
-                            TransferResult::Failure(_, _) => Some(ERROR_RED_COLOR),
-                            _ => None,
-                        });
-                    widget::row!(
-                        result_text,
-                        match (transfer_type, r) {
-                            (FileYeetCommandType::Sub, TransferResult::Success) => {
-                                Element::<Message>::from(
-                                    widget::row!(
-                                        tooltip_button(
-                                            "Open",
-                                            Message::OpenFile(t.path.clone()),
-                                            "Open with the system's default launcher",
-                                        ),
-                                        remove
-                                    )
-                                    .spacing(12),
-                                )
-                            }
-                            (FileYeetCommandType::Sub, TransferResult::Failure(_, true)) => {
-                                Element::<Message>::from(
-                                    widget::row!(
-                                        widget::button(widget::text("Retry").size(12)).on_press(
-                                            Message::ResumePausedDownload(t.nonce, t.peer_socket)
-                                        ),
-                                        remove
-                                    )
-                                    .spacing(12),
-                                )
-                            }
-                            _ => remove,
-                        },
-                    )
-                    .into()
-                }
-            };
-
-            widget::container(widget::column!(
-                progress,
-                widget::row!(
-                    widget::text(&t.hash_hex).size(12),
-                    widget::horizontal_space(),
-                    rate.map_or_else(
-                        || widget::horizontal_space().into(),
-                        |r| Element::from(widget::text(r).size(12)),
-                    ),
-                ),
-                widget::row!(
-                    widget::text(&t.peer_string).size(12),
-                    widget::scrollable(
-                        widget::text(t.path.to_string_lossy())
-                            .size(12)
-                            .align_x(iced::Alignment::End),
-                    )
-                    .direction(text_horizontal_scrollbar())
-                    .width(iced::Length::Fill)
-                    .height(26),
-                )
-                .spacing(6),
-            ))
-            .style(widget::container::dark)
-            .width(iced::Length::Fill)
-            .padding([6, 12]) // Extra padding on the right because of optional scrollbar.
+        widget::column(transfers.into_iter().map(|t| t.draw(mouse_move_elapsed)))
+            .spacing(6)
             .into()
-        }))
-        .spacing(6)
-        .into()
-    }
-
-    /// Draw the publishes view for the main connected page.
-    fn draw_pubs<'a>(
-        publishes: &'a [PublishItem],
-        mouse_move_elapsed: &Duration,
-    ) -> iced::Element<'a, Message> {
-        // Helper for creating standard buttons with tooltips.
-        let tooltip_button = |text: &'static str, message: Message, tooltip: &'static str| {
-            timed_tooltip(
-                widget::button(widget::text(text).size(14)).on_press(message),
-                tooltip,
-                mouse_move_elapsed,
-            )
-        };
-
-        let publish_views = publishes.iter().map(|pi| {
-            let file_path_scrollable =
-                widget::scrollable(widget::text(pi.path.to_string_lossy()).size(12))
-                    .direction(text_horizontal_scrollbar())
-                    .width(iced::Length::Fill)
-                    .height(26);
-            widget::container(
-                match &pi.state {
-                    // Display a publish in the hashing state.
-                    PublishState::Hashing(progress) => widget::row!(
-                        widget::column!(
-                            widget::row!(
-                                widget::text("Hashing...").size(12),
-                                widget::progress_bar(0.0..=1., *progress.blocking_read())
-                                    .height(12),
-                            )
-                            .spacing(6),
-                            file_path_scrollable,
-                        ),
-                        tooltip_button(
-                            "Cancel",
-                            Message::CancelPublish(pi.nonce),
-                            "Cancel the hashing process. The publish is not removed",
-                        ),
-                    ),
-
-                    // Display a publish in the publishing state.
-                    PublishState::Publishing(p) => widget::row!(
-                        widget::column!(widget::text(&p.hash_hex).size(12), file_path_scrollable,),
-                        timed_tooltip(
-                            widget::button(
-                                widget::text("📋")
-                                    .size(14)
-                                    .font(iced::Font::with_name("Noto Emoji"))
-                            )
-                            .on_press(Message::CopyHash(pi.nonce)),
-                            "Copy hash to clipboard",
-                            mouse_move_elapsed,
-                        ),
-                        tooltip_button(
-                            "Rehash",
-                            Message::RehashPublish(pi.nonce),
-                            "Rehash the file, necessary if the file has changed",
-                        ),
-                        tooltip_button(
-                            "Cancel",
-                            Message::CancelPublish(pi.nonce),
-                            "Stop accepting new uploads for this file. The hash is not forgotten",
-                        ),
-                    ),
-
-                    // Display a publish in the failure state.
-                    PublishState::Failure(e, _) => widget::row!(
-                        widget::column!(
-                            widget::text(format!("Failed to publish: {e}"))
-                                .color(ERROR_RED_COLOR)
-                                .size(12),
-                            file_path_scrollable,
-                        )
-                        .width(iced::Length::Fill),
-                        tooltip_button(
-                            "Retry",
-                            Message::RetryPublish(pi.nonce),
-                            "Attempt to publish again",
-                        ),
-                        tooltip_button(
-                            "Remove",
-                            Message::RemovePublish(pi.nonce),
-                            "Remove the publish, forgetting the hash. The file is untouched",
-                        ),
-                    ),
-
-                    // Display a publish that was intentionally cancelled.
-                    PublishState::Cancelled(_) => widget::row!(
-                        widget::column!(widget::text("Cancelled").size(12), file_path_scrollable)
-                            .width(iced::Length::Fill),
-                        tooltip_button(
-                            "Retry",
-                            Message::RetryPublish(pi.nonce),
-                            "Attempt to publish again",
-                        ),
-                        tooltip_button(
-                            "Remove",
-                            Message::RemovePublish(pi.nonce),
-                            "Remove the publish, forgetting the hash. The file is untouched",
-                        ),
-                    ),
-                }
-                .align_y(iced::Alignment::Center)
-                .spacing(12),
-            )
-            .width(iced::Length::Fill)
-            .style(widget::container::dark)
-            .padding([6, 12]) // Extra padding on the right because of optional scrollbar.
-            .into()
-        });
-
-        widget::column(publish_views).spacing(6).into()
     }
 
     /// Draw the main application controls when connected to a server.
@@ -1598,26 +1109,18 @@ impl AppState {
                     (true, true) => iced::widget::Space::new(0, 0).into(),
 
                     // Only uploads are empty, show publishes.
-                    (false, true) => {
-                        Self::draw_pubs(&connected_state.publishes, mouse_move_elapsed)
-                    }
+                    (false, true) => draw_publishes(&connected_state.publishes, mouse_move_elapsed),
 
                     // Only publishes are empty, show uploads.
-                    (true, false) => Self::draw_transfers(
-                        &connected_state.uploads,
-                        FileYeetCommandType::Pub,
-                        mouse_move_elapsed,
-                    ),
+                    (true, false) => {
+                        Self::draw_transfers(&connected_state.uploads, mouse_move_elapsed)
+                    }
 
                     // Show both publishes and uploads. Separate them with a line.
                     (false, false) => widget::column!(
-                        Self::draw_pubs(&connected_state.publishes, mouse_move_elapsed),
+                        draw_publishes(&connected_state.publishes, mouse_move_elapsed),
                         horizontal_line(),
-                        Self::draw_transfers(
-                            &connected_state.uploads,
-                            FileYeetCommandType::Pub,
-                            mouse_move_elapsed
-                        ),
+                        Self::draw_transfers(&connected_state.uploads, mouse_move_elapsed),
                     )
                     .spacing(12)
                     .into(),
@@ -1625,11 +1128,9 @@ impl AppState {
             }
 
             // Create a list of download attempts.
-            TransferView::Downloads => Self::draw_transfers(
-                &connected_state.downloads,
-                FileYeetCommandType::Sub,
-                mouse_move_elapsed,
-            ),
+            TransferView::Downloads => {
+                Self::draw_transfers(&connected_state.downloads, mouse_move_elapsed)
+            }
         };
 
         widget::container(
@@ -1816,28 +1317,12 @@ impl AppState {
             ConnectionState::Connected(ConnectedState {
                 downloads, uploads, ..
             }) => {
-                for t in downloads.iter_mut().chain(uploads.iter_mut()) {
-                    if let TransferState::Transferring {
-                        progress_lock,
-                        progress_animation,
-                        snapshot,
-                        ..
-                    } = &mut t.progress
-                    {
-                        // Update the progress bar with the most recent value.
-                        let bytes_transferred = *progress_lock.blocking_read();
-                        *progress_animation = bytes_transferred as f32 / t.file_size as f32;
-
-                        // Update the transfer speed in human readable units.
-                        if snapshot
-                            .instant
-                            .elapsed()
-                            .gt(&TRANSFER_SPEED_UPDATE_INTERVAL)
-                        {
-                            snapshot.update(bytes_transferred);
-                        }
-                    }
-                }
+                downloads
+                    .iter_mut()
+                    .for_each(DownloadTransfer::update_animation);
+                uploads
+                    .iter_mut()
+                    .for_each(UploadTransfer::update_animation);
             }
 
             // Do nothing in other states.
@@ -2140,6 +1625,7 @@ impl AppState {
                         hash,
                         hash_hex: hash.to_string(),
                         file_size,
+                        human_readable_size: humanize_bytes(file_size),
                     });
                 }
                 (PublishRequestResult::Failure(e), Some(publish)) => {
@@ -2193,22 +1679,22 @@ impl AppState {
                     tracing::debug!("Received peer for publish {}", &publish.hash);
                 }
 
-                let data =
-                    if let Some(c) = ConnectionsManager::instance().get_connection_sync(&peer) {
-                        if cfg!(debug_assertions) {
-                            tracing::debug!("Reusing connection to peer {peer}");
-                        } else {
-                            tracing::debug!("Reusing connection to peer");
-                        }
-                        PeerConnectionOrTarget::Connection(c)
+                let data = if let Some(c) = ConnectionsManager::instance().get_connection_sync(peer)
+                {
+                    if cfg!(debug_assertions) {
+                        tracing::debug!("Reusing connection to peer {peer}");
                     } else {
-                        if cfg!(debug_assertions) {
-                            tracing::debug!("Creating new connection to peer {peer}");
-                        } else {
-                            tracing::debug!("Creating new connection to peer");
-                        }
-                        PeerConnectionOrTarget::Target(endpoint.clone(), peer)
-                    };
+                        tracing::debug!("Reusing connection to peer");
+                    }
+                    PeerConnectionOrTarget::Connection(c)
+                } else {
+                    if cfg!(debug_assertions) {
+                        tracing::debug!("Creating new connection to peer {peer}");
+                    } else {
+                        tracing::debug!("Creating new connection to peer");
+                    }
+                    PeerConnectionOrTarget::Target(endpoint.clone(), peer)
+                };
                 let hash = publish.hash;
                 iced::Task::perform(
                     try_peer_connection(data, hash, FileYeetCommandType::Pub),
@@ -2271,21 +1757,23 @@ impl AppState {
         let progress_lock = Arc::new(RwLock::new(0));
         let cancellation_token = CancellationToken::new();
         let peer_socket = peer.connection.remote_address();
-        uploads.push(Transfer {
-            nonce: upload_nonce,
-            hash: publishing.hash,
-            hash_hex: publishing.hash.to_string(),
-            file_size: publishing.file_size,
-            peer_string: peer_socket.to_string(),
-            peer_socket: Some(peer_socket),
-            path: path.clone(),
-            progress: TransferState::Transferring {
+        uploads.push(UploadTransfer {
+            base: TransferBase {
+                nonce: upload_nonce,
+                hash: publishing.hash,
+                hash_hex: publishing.hash.to_string(),
+                file_size: publishing.file_size,
+                peer_string: peer_socket.to_string(),
+                peer_socket: Some(peer_socket),
+                path: path.clone(),
+                cancellation_token: cancellation_token.clone(),
+            },
+            progress: UploadState::Transferring {
                 peer: peer.connection.clone(),
                 progress_lock: progress_lock.clone(),
                 progress_animation: 0.,
                 snapshot: TransferSnapshot::new(),
             },
-            cancellation_token: cancellation_token.clone(),
         });
 
         insert_nonce_for_peer(peer.connection.remote_address(), peers, upload_nonce);
@@ -2306,15 +1794,16 @@ impl AppState {
                 // Try to upload the file to the peer connection.
                 let mut streams = peer.bistream.lock().await;
 
-                let (start_index, upload_length) = match crate::core::read_publish_range(&mut streams, file_size).await {
-                    Ok(range) => range,
-                    Err(e) => {
-                        return TransferResult::Failure(
-                            Arc::new(format!("Failed to read peer upload range: {e}")),
-                            false,
-                        );
-                    }
-                };
+                let (start_index, upload_length) =
+                    match crate::core::read_publish_range(&mut streams, file_size).await {
+                        Ok(range) => range,
+                        Err(e) => {
+                            return TransferResult::Failure(
+                                Arc::new(format!("Failed to read peer upload range: {e}")),
+                                false,
+                            );
+                        }
+                    };
 
                 // Prepare a reader for the file to upload.
                 let reader = tokio::io::BufReader::new(file);
@@ -2413,7 +1902,8 @@ impl AppState {
         // TODO: Use a `HashSet` to more efficiently track active file paths.
         if downloads
             .iter()
-            .chain(uploads.iter())
+            .map(DownloadTransfer::base)
+            .chain(uploads.iter().map(UploadTransfer::base))
             .any(|t| path.eq(t.path.as_ref()))
         {
             self.status_message = Some("Transfer using this path already exists".to_owned());
@@ -2468,16 +1958,18 @@ impl AppState {
             path,
         } = saved_download;
         let nonce = rand::random();
-        downloads.push(Transfer {
-            nonce,
-            hash,
-            hash_hex: saved_download.hash.to_string(),
-            file_size,
-            peer_string: String::new(),
-            peer_socket: None,
-            path: Arc::new(path),
-            progress: TransferState::Paused(peer_socket),
-            cancellation_token: CancellationToken::new(),
+        downloads.push(DownloadTransfer {
+            base: TransferBase {
+                nonce,
+                hash,
+                hash_hex: saved_download.hash.to_string(),
+                file_size,
+                peer_string: String::new(),
+                peer_socket: None,
+                path: Arc::new(path),
+                cancellation_token: CancellationToken::new(),
+            },
+            progress: DownloadState::Paused(peer_socket),
         });
 
         iced::Task::done(Message::ResumePausedDownload(nonce, peer_socket))
@@ -2520,24 +2012,26 @@ impl AppState {
                         let nonce = rand::random();
                         let cancellation_token = CancellationToken::new();
 
-                        // New transfer state for this request.
-                        let transfer = Transfer {
-                            nonce,
-                            hash,
-                            hash_hex: hash_hex.clone(),
-                            file_size,
-                            peer_string: peer.to_string(),
-                            peer_socket: Some(peer),
-                            path: path.clone(),
-                            progress: TransferState::Connecting,
-                            cancellation_token: cancellation_token.clone(),
+                        // New download state for this request.
+                        let transfer = DownloadTransfer {
+                            base: TransferBase {
+                                nonce,
+                                hash,
+                                hash_hex: hash_hex.clone(),
+                                file_size,
+                                peer_string: peer.to_string(),
+                                peer_socket: Some(peer),
+                                path: path.clone(),
+                                cancellation_token: cancellation_token.clone(),
+                            },
+                            progress: DownloadState::Connecting,
                         };
 
                         // New connection attempt for this peer with result command identified by the nonce.
                         let task = {
                             // Create a new connection or open a stream on an existing one.
                             let peer = if let Some(c) =
-                                ConnectionsManager::instance().get_connection_sync(&peer)
+                                ConnectionsManager::instance().get_connection_sync(peer)
                             {
                                 if cfg!(debug_assertions) {
                                     tracing::debug!("Reusing connection to peer {peer}");
@@ -2574,7 +2068,7 @@ impl AppState {
 
                 // Create a new transfer for each peer.
                 let (mut new_transfers, connect_commands): (
-                    Vec<Transfer>,
+                    Vec<DownloadTransfer>,
                     Vec<iced::Task<Message>>,
                 ) = transfers_commands_iter.unzip();
 
@@ -2608,7 +2102,7 @@ impl AppState {
         let Some((index, transfer)) = downloads
             .iter_mut()
             .enumerate()
-            .find(|(_, t)| t.nonce == nonce)
+            .find(|(_, t)| t.base.nonce == nonce)
         else {
             tracing::warn!("Subscribe connect resulted for unknown nonce");
             return iced::Task::none();
@@ -2617,7 +2111,7 @@ impl AppState {
         // Update the state of the transfer with the result.
         if let Some(peer_request) = result {
             insert_nonce_for_peer(peer_request.connection.remote_address(), peers, nonce);
-            transfer.progress = TransferState::Consent(peer_request);
+            transfer.progress = DownloadState::Consent(peer_request);
         } else {
             // Remove unreachable peers from view.
             downloads.remove(index);
@@ -2636,13 +2130,13 @@ impl AppState {
         };
 
         // Get the current transfer status.
-        let Some(transfer) = downloads.iter_mut().find(|t| t.nonce == nonce) else {
+        let Some(transfer) = downloads.iter_mut().find(|t| t.base.nonce == nonce) else {
             tracing::warn!("No transfer found to accept download");
             return iced::Task::none();
         };
-        let hash = transfer.hash;
-        let file_size = transfer.file_size;
-        let peer_streams = if let TransferState::Consent(p) = &mut transfer.progress {
+        let hash = transfer.base.hash;
+        let file_size = transfer.base.file_size;
+        let peer_streams = if let DownloadState::Consent(p) = &mut transfer.progress {
             p.clone()
         } else {
             tracing::warn!("Transfer is not in consent state");
@@ -2651,28 +2145,28 @@ impl AppState {
 
         // Begin the transfer.
         let byte_progress = Arc::new(RwLock::new(0));
-        transfer.progress = TransferState::Transferring {
+        transfer.progress = DownloadState::Transferring {
             peer: peer_streams.connection.clone(),
             progress_lock: byte_progress.clone(),
             progress_animation: 0.,
             snapshot: TransferSnapshot::new(),
         };
-        let output_path = transfer.path.clone();
-        let cancellation_token = transfer.cancellation_token.clone();
-        let path = transfer.path.clone();
+        let output_path = transfer.base.path.clone();
+        let cancellation_token = transfer.base.cancellation_token.clone();
+        let path = transfer.base.path.clone();
 
         // Remove all downloads to the same path when accepting this one.
         downloads.retain(|d| {
-            if d.path != path
+            if d.base.path != path
                 || !matches!(
                     d.progress,
-                    TransferState::Consent(_) | TransferState::Connecting
+                    DownloadState::Consent(_) | DownloadState::Connecting
                 )
-                || d.nonce == nonce
+                || d.base.nonce == nonce
             {
                 true
             } else {
-                d.cancellation_token.cancel();
+                d.base.cancellation_token.cancel();
                 false
             }
         });
@@ -2719,7 +2213,7 @@ impl AppState {
         };
 
         let download = {
-            let Some(i) = downloads.iter().position(|d| d.nonce == nonce) else {
+            let Some(i) = downloads.iter().position(|d| d.base.nonce == nonce) else {
                 tracing::warn!("No download found to reject");
                 return iced::Task::none();
             };
@@ -2730,7 +2224,7 @@ impl AppState {
 
         // Cancel any ongoing download tasks.
         // There shouldn't be any, but it doesn't hurt and prevents such tasks from being created.
-        download.cancellation_token.cancel();
+        download.base.cancellation_token.cancel();
 
         // Remove the nonce from the peer's transactions.
         if let Some(connection) = download.progress.connection() {
@@ -2739,8 +2233,8 @@ impl AppState {
 
         // Log download rejection based on the current progress state.
         match &download.progress {
-            TransferState::Consent(_) => {}
-            TransferState::Transferring { .. } => {
+            DownloadState::Consent(_) => {}
+            DownloadState::Transferring { .. } => {
                 tracing::error!("Rejecting download that is transferring, this should not happen");
             }
             _ => tracing::warn!("Rejecting download that is not in expected state"),
@@ -2748,7 +2242,7 @@ impl AppState {
 
         // Attempt a graceful rejection of the download request in the background.
         iced::Task::future(async move {
-            let TransferState::Consent(r) = download.progress else {
+            let DownloadState::Consent(r) = download.progress else {
                 return;
             };
             let mut bi_stream_lock = r.bistream.lock().await;
@@ -2902,37 +2396,66 @@ impl AppState {
             return iced::Task::none();
         };
 
-        let transfers = match transfer_type {
-            FileYeetCommandType::Sub => downloads,
-            FileYeetCommandType::Pub => uploads,
+        let result = match transfer_type {
+            FileYeetCommandType::Sub => {
+                downloads
+                    .iter_mut()
+                    .find(|t| t.base.nonce == nonce)
+                    .map(|t| {
+                        // Cancel the download's tasks.
+                        t.base.cancellation_token.cancel();
+
+                        match cancel_or_pause {
+                            CancelOrPause::Cancel => {
+                                tracing::debug!("Cancelled download {}", t.base.hash_hex);
+
+                                // If the transfer was connected to a peer, remove the nonce from transactions
+                                if let Some(connection) = t.progress.connection() {
+                                    remove_nonce_for_peer(connection, peers, nonce);
+                                }
+
+                                // Mark the download as cancelled.
+                                t.progress = DownloadState::Done(TransferResult::Cancelled);
+                            }
+                            CancelOrPause::Pause => {
+                                tracing::debug!("Paused download {}", t.base.hash_hex);
+                                let peer = t
+                                    .progress
+                                    .connection()
+                                    .map(quinn::Connection::remote_address);
+                                t.progress = DownloadState::Paused(peer);
+                            }
+                        }
+                    })
+            }
+            FileYeetCommandType::Pub => {
+                uploads.iter_mut().find(|t| t.base.nonce == nonce).map(|t| {
+                    // Cancel the upload's tasks.
+                    t.base.cancellation_token.cancel();
+
+                    match cancel_or_pause {
+                        CancelOrPause::Cancel => {
+                            tracing::debug!("Cancelled upload {}", t.base.hash_hex);
+
+                            // If the transfer was connected to a peer, remove the nonce from transactions
+                            if let Some(connection) = t.progress.connection() {
+                                remove_nonce_for_peer(connection, peers, nonce);
+                            }
+
+                            // Mark the upload as cancelled.
+                            t.progress = UploadState::Done(TransferResult::Cancelled);
+                        }
+                        CancelOrPause::Pause => {
+                            tracing::error!(
+                                "Unexpected attempt to pause an upload, only cancel is expected"
+                            );
+                        }
+                    }
+                })
+            }
         };
-        let Some(t) = transfers.iter_mut().find(|t| t.nonce == nonce) else {
+        if result.is_none() {
             tracing::warn!("No transfer found to cancel or pause for nonce");
-            return iced::Task::none();
-        };
-        // Cancel the transfer tasks.
-        t.cancellation_token.cancel();
-
-        match cancel_or_pause {
-            CancelOrPause::Cancel => {
-                tracing::debug!("Cancelled transfer {}", t.hash_hex);
-
-                // If the transfer was connected to a peer, remove the nonce from transactions
-                if let Some(connection) = t.progress.connection() {
-                    remove_nonce_for_peer(connection, peers, nonce);
-                }
-
-                // Mark the transfer as cancelled.
-                t.progress = TransferState::Done(TransferResult::Cancelled);
-            }
-            CancelOrPause::Pause => {
-                tracing::debug!("Paused transfer {}", t.hash_hex);
-                let peer = t
-                    .progress
-                    .connection()
-                    .map(quinn::Connection::remote_address);
-                t.progress = TransferState::Paused(peer);
-            }
         }
         iced::Task::none()
     }
@@ -2949,6 +2472,7 @@ impl AppState {
             server,
             external_address,
             downloads,
+            transfer_view,
             ..
         }) = &mut self.connection_state
         else {
@@ -2956,21 +2480,22 @@ impl AppState {
             return iced::Task::none();
         };
 
-        let Some(t) = downloads.iter_mut().find(|t| t.nonce == nonce) else {
+        let Some(t) = downloads.iter_mut().find(|t| t.base.nonce == nonce) else {
             tracing::warn!("No download found to resume for nonce");
             return iced::Task::none();
         };
         let endpoint = endpoint.clone();
         let server = server.clone();
         let external_address = external_address.0;
-        let path = t.path.clone();
-        let hash = t.hash;
-        let final_file_size = t.file_size;
+        let path = t.base.path.clone();
+        let hash = t.base.hash;
+        let final_file_size = t.base.file_size;
 
         let progress_lock = Arc::new(RwLock::new(0.));
-        t.progress = TransferState::ResumingHash(progress_lock.clone());
-        t.cancellation_token = CancellationToken::new();
-        let cancellation_token = t.cancellation_token.clone();
+        t.progress = DownloadState::ResumingHash(progress_lock.clone());
+        t.base.cancellation_token = CancellationToken::new();
+        let cancellation_token = t.base.cancellation_token.clone();
+        *transfer_view = TransferView::Downloads;
 
         // Create a future to resume the download.
         let resume_future = async move {
@@ -3055,37 +2580,33 @@ impl AppState {
         nonce: Nonce,
         result: Result<(sha2::Sha256, u64, PeerRequestStream), Option<Arc<anyhow::Error>>>,
     ) -> iced::Task<Message> {
-        let ConnectionState::Connected(ConnectedState {
-            downloads,
-            transfer_view,
-            ..
-        }) = &mut self.connection_state
+        let ConnectionState::Connected(ConnectedState { downloads, .. }) =
+            &mut self.connection_state
         else {
             tracing::warn!("No connected state to resume partial hash");
             return iced::Task::none();
         };
 
-        let Some(t) = downloads.iter_mut().find(|t| t.nonce == nonce) else {
+        let Some(t) = downloads.iter_mut().find(|t| t.base.nonce == nonce) else {
             tracing::warn!("No download found to resume partial hash for nonce");
             return iced::Task::none();
         };
 
-        *transfer_view = TransferView::Downloads;
         match result {
             // Resume the download with the partial hash
             Ok((digest, start_index, request)) => {
                 let progress = Arc::new(RwLock::new(start_index));
-                let progress_animation = start_index as f32 / t.file_size as f32;
-                t.progress = TransferState::Transferring {
+                let progress_animation = start_index as f32 / t.base.file_size as f32;
+                t.progress = DownloadState::Transferring {
                     peer: request.connection.clone(),
                     progress_lock: progress.clone(),
                     progress_animation,
                     snapshot: TransferSnapshot::new(),
                 };
-                let cancellation_token = t.cancellation_token.clone();
-                let path = t.path.clone();
-                let hash = t.hash;
-                let file_size = t.file_size;
+                let cancellation_token = t.base.cancellation_token.clone();
+                let path = t.base.path.clone();
+                let hash = t.base.hash;
+                let file_size = t.base.file_size;
 
                 iced::Task::perform(
                     async move {
@@ -3137,7 +2658,7 @@ impl AppState {
                     tracing::info!("Failed to connect to peer to resume partial hash");
                     Arc::new("No reachable peers".into())
                 };
-                t.progress = TransferState::Done(TransferResult::Failure(e, true));
+                t.progress = DownloadState::Done(TransferResult::Failure(e, true));
                 iced::Task::none()
             }
         }
@@ -3163,43 +2684,21 @@ impl AppState {
                 tracing::warn!("Transfer failed: {e}");
             }
 
-            let mut transfers = match transfer_type {
-                FileYeetCommandType::Sub => downloads.iter_mut(),
-                FileYeetCommandType::Pub => uploads.iter_mut(),
-            };
-
-            if let Some(t) = transfers.find(|t| t.nonce == nonce) {
-                // Handle a paused transfer.
-                if let TransferState::Paused(_) = &t.progress {
-                    // If the transfer result is cancelled, ignore it.
-                    // This is expected if the transfer was paused.
-                    if matches!(result, TransferResult::Cancelled) {
-                        tracing::debug!(
-                            "Transfer was paused and then cancelled, expected race condition"
-                        );
-                        return iced::Task::none();
+            match transfer_type {
+                FileYeetCommandType::Sub => {
+                    if let Some(t) = downloads.iter_mut().find(|t| t.base.nonce == nonce) {
+                        update_download_result(&mut t.progress, result, peers, nonce);
+                    } else {
+                        tracing::warn!("No download found to update result for nonce");
                     }
                 }
-
-                // Handle a transfer that is already done.
-                if let TransferState::Done(done) = &t.progress {
-                    // If we are cancelling twice, ignore the second cancellation.
-                    // Otherwise, this is an unexpected double-result.
-                    if !matches!(result, TransferResult::Cancelled)
-                        || !matches!(done, TransferResult::Cancelled)
-                    {
-                        tracing::warn!("Transfer already marked as done {done}");
+                FileYeetCommandType::Pub => {
+                    if let Some(t) = uploads.iter_mut().find(|t| t.base.nonce == nonce) {
+                        update_upload_result(&mut t.progress, result, peers, nonce);
+                    } else {
+                        tracing::warn!("No upload found to update result for nonce");
                     }
-                    return iced::Task::none();
                 }
-
-                // If the transfer was connected to a peer, remove the nonce from transactions.
-                if let Some(connection) = t.progress.connection() {
-                    remove_nonce_for_peer(connection, peers, nonce);
-                }
-
-                // Mark the transfer as done.
-                t.progress = TransferState::Done(result);
             }
         } else {
             tracing::warn!("No connected state to update transfer result");
@@ -3214,16 +2713,19 @@ impl AppState {
         nonce: Nonce,
         transfer_type: FileYeetCommandType,
     ) -> iced::Task<Message> {
+        fn remove_transfer<T: Transfer>(transfers: &mut Vec<T>, nonce: Nonce) {
+            if let Some(i) = transfers.iter().position(|t| t.base().nonce == nonce) {
+                transfers.remove(i);
+            }
+        }
+
         if let ConnectionState::Connected(ConnectedState {
             downloads, uploads, ..
         }) = &mut self.connection_state
         {
-            let transfers = match transfer_type {
-                FileYeetCommandType::Sub => downloads,
-                FileYeetCommandType::Pub => uploads,
-            };
-            if let Some(i) = transfers.iter().position(|t| t.nonce == nonce) {
-                transfers.remove(i);
+            match transfer_type {
+                FileYeetCommandType::Sub => remove_transfer(downloads, nonce),
+                FileYeetCommandType::Pub => remove_transfer(uploads, nonce),
             }
         } else {
             tracing::warn!("No connected state to remove transfer");
@@ -3257,23 +2759,23 @@ impl AppState {
                 .last_downloads
                 .extend(downloads.drain(..).filter_map(|d| {
                     // If the download is in progress, cancel it.
-                    d.cancellation_token.cancel();
+                    d.base.cancellation_token.cancel();
 
                     // Ensure all downloads that were in-progress are saved.
                     let peer_socket = match d.progress {
-                        TransferState::Transferring { peer, .. } => Some(peer.remote_address()),
-                        TransferState::Paused(peer) => peer,
-                        TransferState::ResumingHash(_)
-                        | TransferState::Done(TransferResult::Failure(_, true)) => None,
+                        DownloadState::Transferring { peer, .. } => Some(peer.remote_address()),
+                        DownloadState::Paused(peer) => peer,
+                        DownloadState::ResumingHash(_)
+                        | DownloadState::Done(TransferResult::Failure(_, true)) => None,
 
                         // In other cases, do not save the download.
                         _ => return None,
                     };
                     Some(SavedDownload {
-                        hash: d.hash,
-                        file_size: d.file_size,
+                        hash: d.base.hash,
+                        file_size: d.base.file_size,
                         peer_socket,
-                        path: d.path.as_ref().clone(),
+                        path: d.base.path.as_ref().clone(),
                     })
                 }));
 
