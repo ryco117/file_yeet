@@ -1,8 +1,8 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{hash_map, HashMap, HashSet},
     ffi::OsStr,
     net::SocketAddr,
-    num::NonZeroU16,
+    num::{NonZeroU16, NonZeroU64},
     ops::Div as _,
     path::PathBuf,
     sync::Arc,
@@ -1757,6 +1757,7 @@ impl AppState {
         let progress_lock = Arc::new(RwLock::new(0));
         let cancellation_token = CancellationToken::new();
         let peer_socket = peer.connection.remote_address();
+        let requested_size = Arc::new(RwLock::new(None));
         uploads.push(UploadTransfer {
             base: TransferBase {
                 nonce: upload_nonce,
@@ -1772,6 +1773,7 @@ impl AppState {
                 peer: peer.connection.clone(),
                 progress_lock: progress_lock.clone(),
                 progress_animation: 0.,
+                requested_size: requested_size.clone(),
                 snapshot: TransferSnapshot::new(),
             },
         });
@@ -1804,6 +1806,12 @@ impl AppState {
                             );
                         }
                     };
+                if let Some(l) = NonZeroU64::new(upload_length) {
+                    requested_size.write().await.replace(l);
+                } else {
+                    tracing::info!("The requested upload size is zero, skipping upload");
+                    return TransferResult::Success;
+                }
 
                 // Prepare a reader for the file to upload.
                 let reader = tokio::io::BufReader::new(file);
@@ -2378,6 +2386,7 @@ impl AppState {
     }
 
     /// Update the state after a transfer was cancelled or paused.
+    //  TODO: Separate into dedicated functions for cancelling and pausing transfers.
     #[tracing::instrument(skip(self))]
     fn update_cancel_or_pause(
         &mut self,
@@ -2580,8 +2589,9 @@ impl AppState {
         nonce: Nonce,
         result: Result<(sha2::Sha256, u64, PeerRequestStream), Option<Arc<anyhow::Error>>>,
     ) -> iced::Task<Message> {
-        let ConnectionState::Connected(ConnectedState { downloads, .. }) =
-            &mut self.connection_state
+        let ConnectionState::Connected(ConnectedState {
+            peers, downloads, ..
+        }) = &mut self.connection_state
         else {
             tracing::warn!("No connected state to resume partial hash");
             return iced::Task::none();
@@ -2607,6 +2617,9 @@ impl AppState {
                 let path = t.base.path.clone();
                 let hash = t.base.hash;
                 let file_size = t.base.file_size;
+
+                // Insert nonce for resumed download. May already exist if resumed from this session.
+                insert_nonce_for_peer(request.connection.remote_address(), peers, nonce);
 
                 iced::Task::perform(
                     async move {
@@ -2919,7 +2932,6 @@ enum PeerConnectionOrTarget {
     Target(quinn::Endpoint, SocketAddr),
 }
 
-/// A loop to await the server to send peers requesting the specified publish.
 /// An asynchronous loop to await new requests from a peer connection.
 #[tracing::instrument(skip_all)]
 async fn connected_peer_request_loop(
@@ -3116,11 +3128,11 @@ fn insert_nonce_for_peer(
     nonce: Nonce,
 ) {
     match peers.entry(peer_address) {
-        std::collections::hash_map::Entry::Vacant(e) => {
+        hash_map::Entry::Vacant(e) => {
             // Add the peer into our map of known peer addresses.
             e.insert(HashSet::from([nonce]));
         }
-        std::collections::hash_map::Entry::Occupied(mut e) => {
+        hash_map::Entry::Occupied(mut e) => {
             // Add the transfer nonce to the peer's set of known transfer nonces.
             e.get_mut().insert(nonce);
         }
@@ -3135,7 +3147,7 @@ fn remove_nonce_for_peer(
     nonce: Nonce,
 ) {
     let peer_address = peer.remote_address();
-    if let std::collections::hash_map::Entry::Occupied(mut e) = peers.entry(peer_address) {
+    if let hash_map::Entry::Occupied(mut e) = peers.entry(peer_address) {
         let nonces = e.get_mut();
         if !nonces.remove(&nonce) {
             if cfg!(debug_assertions) {
@@ -3153,10 +3165,8 @@ fn remove_nonce_for_peer(
                 tracing::debug!("Closing peer connection");
             }
 
-            // Close the connection.
-            let id = peer.stable_id();
-            peer.close(GOODBYE_CODE, GOODBYE_MESSAGE.as_bytes());
-            ConnectionsManager::instance().blocking_remove_peer(peer_address, id);
+            // Remove the connection from the manager.
+            ConnectionsManager::instance().blocking_remove_peer(peer_address, peer.stable_id());
         }
     } else if cfg!(debug_assertions) {
         tracing::warn!("Peer {peer_address} not found in peers map");

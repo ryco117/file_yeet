@@ -9,7 +9,7 @@ use std::{
 use bytes::BufMut as _;
 use clap::Parser;
 use file_yeet_shared::{
-    BiStream, ClientApiRequest, HashBytes, SocketAddrHelper, GOODBYE_CODE,
+    BiStream, ClientApiRequest, HashBytes, SocketAddrHelper, GOODBYE_CODE, GOODBYE_MESSAGE,
     MAX_SERVER_COMMUNICATION_SIZE,
 };
 use rand::seq::SliceRandom;
@@ -140,8 +140,8 @@ async fn main() {
     // Cancel the server's tasks.
     global_cancellation_token.cancel();
 
-    // Close the QUIC endpoint with the DEADBEEF status.
-    local_end.close(quinn::VarInt::from_u32(0xDEAD_BEEF), &[]);
+    // Close the QUIC endpoint with the goodbye status.
+    local_end.close(GOODBYE_CODE, GOODBYE_MESSAGE.as_bytes());
 
     // Close the tracker after no more tasks should be spawned.
     task_master.close();

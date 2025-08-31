@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     net::SocketAddr,
+    num::NonZeroU64,
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
@@ -127,6 +128,7 @@ pub enum UploadState {
         peer: quinn::Connection,
         progress_lock: Arc<RwLock<u64>>,
         progress_animation: f32,
+        requested_size: Arc<RwLock<Option<NonZeroU64>>>,
         snapshot: TransferSnapshot,
     },
 
@@ -395,13 +397,16 @@ impl Transfer for UploadTransfer {
         if let UploadState::Transferring {
             progress_lock,
             progress_animation,
+            requested_size,
             snapshot,
             ..
         } = &mut self.progress
         {
-            // Update the progress bar with the most recent value.
             let bytes_transferred = *progress_lock.blocking_read();
-            *progress_animation = bytes_transferred as f32 / self.base.file_size as f32;
+            if let Some(requested_size) = *requested_size.blocking_read() {
+                // Update the progress bar with the most recent value.
+                *progress_animation = bytes_transferred as f32 / requested_size.get() as f32;
+            }
 
             // Update the transfer speed in human readable units.
             if snapshot

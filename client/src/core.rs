@@ -1216,7 +1216,7 @@ impl ConnectionsManager {
             let mut map = self.map.write().await;
             match map.entry(peer_address) {
                 // This peer has already been mapped, determine the state.
-                std::collections::hash_map::Entry::Occupied(mut e) => {
+                hash_map::Entry::Occupied(mut e) => {
                     let rx = match e.get_mut() {
                         // If the peer is already connected, return the connection.
                         IncomingPeerState::Connected(c) => {
@@ -1281,7 +1281,7 @@ impl ConnectionsManager {
                 }
 
                 // No mapping exists for this peer address, create one.
-                std::collections::hash_map::Entry::Vacant(e) => {
+                hash_map::Entry::Vacant(e) => {
                     if cfg!(debug_assertions) {
                         tracing::debug!("Creating wait for peer connection {peer_address}");
                     } else {
@@ -1417,7 +1417,7 @@ impl ConnectionsManager {
                 }
             };
 
-            // Notify any thread waiting for this connection if available, otherwise store it.
+            // Notify any thread waiting for this connection if available, and store it.
             manager.accept_peer(connection).await;
         }
 
