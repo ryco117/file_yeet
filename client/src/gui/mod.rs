@@ -27,8 +27,9 @@ use crate::{
     gui::{
         publish::{draw_publishes, Publish, PublishItem, PublishRequestResult, PublishState},
         transfers::{
-            update_download_result, update_upload_result, DownloadState, DownloadTransfer,
-            Transfer, TransferBase, TransferResult, TransferSnapshot, UploadState, UploadTransfer,
+            update_download_result, update_upload_result, DownloadResult, DownloadState,
+            DownloadTransfer, Transfer, TransferBase, TransferSnapshot, UploadResult, UploadState,
+            UploadTransfer,
         },
     },
     settings::{
@@ -376,7 +377,10 @@ pub enum Message {
     ),
 
     /// The result of a download attempt.
-    TransferResulted(Nonce, TransferResult, FileYeetCommandType),
+    DownloadTransferResulted(Nonce, DownloadResult),
+
+    /// The result of an upload attempt.
+    UploadTransferResulted(Nonce, UploadResult),
 
     /// Open the file using the system launcher for that file type.
     OpenFile(Arc<PathBuf>),
@@ -604,9 +608,8 @@ impl AppState {
             Message::ResumeFromPartialHashFile(nonce, result) => {
                 self.update_resume_partial_hash(nonce, result)
             }
-            Message::TransferResulted(nonce, r, transfer_type) => {
-                self.update_transfer_resulted(nonce, r, transfer_type)
-            }
+            Message::DownloadTransferResulted(nonce, r) => self.update_download_resulted(nonce, r),
+            Message::UploadTransferResulted(nonce, r) => self.update_upload_resulted(nonce, r),
 
             // Handle a file being opened.
             Message::OpenFile(path) => {
@@ -1786,10 +1789,9 @@ impl AppState {
                 let file = match tokio::fs::File::open(path.as_ref()).await {
                     Ok(f) => f,
                     Err(e) => {
-                        return TransferResult::Failure(
-                            Arc::new(format!("Failed to open the file: {e}")),
-                            false,
-                        )
+                        return UploadResult::Failure(Arc::new(format!(
+                            "Failed to open the file: {e}"
+                        )))
                     }
                 };
 
@@ -1800,24 +1802,23 @@ impl AppState {
                     match crate::core::read_publish_range(&mut streams, file_size).await {
                         Ok(range) => range,
                         Err(e) => {
-                            return TransferResult::Failure(
-                                Arc::new(format!("Failed to read peer upload range: {e}")),
-                                false,
-                            );
+                            return UploadResult::Failure(Arc::new(format!(
+                                "Failed to read peer upload range: {e}"
+                            )));
                         }
                     };
                 if let Some(l) = NonZeroU64::new(upload_length) {
                     requested_size.write().await.replace(l);
                 } else {
                     tracing::info!("The requested upload size is zero, skipping upload");
-                    return TransferResult::Success;
+                    return UploadResult::Success;
                 }
 
                 // Prepare a reader for the file to upload.
                 let reader = tokio::io::BufReader::new(file);
 
                 tokio::select! {
-                    () = cancellation_token.cancelled() => TransferResult::Cancelled,
+                    () = cancellation_token.cancelled() => UploadResult::Cancelled,
                     result = Box::pin(crate::core::upload_to_peer(
                         &mut streams,
                         start_index,
@@ -1825,12 +1826,12 @@ impl AppState {
                         reader,
                         Some(&progress_lock),
                     )) => match result {
-                        Ok(()) => TransferResult::Success,
-                        Err(e) => TransferResult::Failure(Arc::new(format!("Upload failed: {e}")), false),
+                        Ok(()) => UploadResult::Success,
+                        Err(e) => UploadResult::Failure(Arc::new(format!("Upload failed: {e}"))),
                     }
                 }
             },
-            move |r| Message::TransferResulted(upload_nonce, r, FileYeetCommandType::Pub),
+            move |r| Message::UploadTransferResulted(upload_nonce, r),
         )
     }
 
@@ -2185,7 +2186,7 @@ impl AppState {
 
                 tokio::select! {
                     // Let the transfer be cancelled. This is not an error if cancelled.
-                    () = cancellation_token.cancelled() => TransferResult::Cancelled,
+                    () = cancellation_token.cancelled() => DownloadResult::Cancelled,
 
                     // Await the file to be downloaded.
                     result = crate::core::download_from_peer(
@@ -2196,16 +2197,16 @@ impl AppState {
                         Some(&byte_progress),
                     ) => {
                         match result {
-                            Ok(()) => TransferResult::Success,
+                            Ok(()) => DownloadResult::Success,
                             Err(e) => {
                                 let is_recoverable = !matches!(e, crate::core::DownloadError::HashMismatch);
-                                TransferResult::Failure(Arc::new(format!("Download failed: {e}")), is_recoverable)
+                                DownloadResult::Failure(Arc::new(format!("Download failed: {e}")), is_recoverable)
                             }
                         }
                     }
                 }
             },
-            move |r| Message::TransferResulted(nonce, r, FileYeetCommandType::Sub),
+            move |r| Message::DownloadTransferResulted(nonce, r),
         )
     }
 
@@ -2424,7 +2425,7 @@ impl AppState {
                                 }
 
                                 // Mark the download as cancelled.
-                                t.progress = DownloadState::Done(TransferResult::Cancelled);
+                                t.progress = DownloadState::Done(DownloadResult::Cancelled);
                             }
                             CancelOrPause::Pause => {
                                 tracing::debug!("Paused download {}", t.base.hash_hex);
@@ -2452,7 +2453,7 @@ impl AppState {
                             }
 
                             // Mark the upload as cancelled.
-                            t.progress = UploadState::Done(TransferResult::Cancelled);
+                            t.progress = UploadState::Done(UploadResult::Cancelled);
                         }
                         CancelOrPause::Pause => {
                             tracing::error!(
@@ -2631,7 +2632,7 @@ impl AppState {
                         {
                             Ok(f) => f,
                             Err(e) => {
-                                return TransferResult::Failure(
+                                return DownloadResult::Failure(
                                     Arc::new(format!("Failed to open the file: {e}")),
                                     true,
                                 )
@@ -2641,7 +2642,7 @@ impl AppState {
                         // Try to upload the file to the peer connection.
                         let mut request = request.bistream.lock().await;
                         tokio::select! {
-                            () = cancellation_token.cancelled() => TransferResult::Cancelled,
+                            () = cancellation_token.cancelled() => DownloadResult::Cancelled,
 
                             result = Box::pin(crate::core::download_partial_from_peer(
                                 hash,
@@ -2650,15 +2651,15 @@ impl AppState {
                                 crate::core::DownloadOffsetState::new(start_index..file_size, Some(digest)),
                                 Some(&progress),
                             )) => match result {
-                                Ok(()) => TransferResult::Success,
+                                Ok(()) => DownloadResult::Success,
                                 Err(e) => {
                                     let is_recoverable = !matches!(e, crate::core::DownloadError::HashMismatch);
-                                    TransferResult::Failure(Arc::new(format!("Upload failed: {e}")), is_recoverable)
+                                    DownloadResult::Failure(Arc::new(format!("Upload failed: {e}")), is_recoverable)
                                 },
                             }
                         }
                     },
-                    move |r| Message::TransferResulted(nonce, r, FileYeetCommandType::Sub),
+                    move |r| Message::DownloadTransferResulted(nonce, r),
                 )
             }
 
@@ -2671,47 +2672,58 @@ impl AppState {
                     tracing::info!("Failed to connect to peer to resume partial hash");
                     Arc::new("No reachable peers".into())
                 };
-                t.progress = DownloadState::Done(TransferResult::Failure(e, true));
+                t.progress = DownloadState::Done(DownloadResult::Failure(e, true));
                 iced::Task::none()
             }
         }
     }
 
-    /// Update the state after a transfer has concluded, successfully or not.
+    /// Update the state after a download transfer has concluded, successfully or not.
     #[tracing::instrument(skip(self, result))]
-    fn update_transfer_resulted(
+    fn update_download_resulted(
         &mut self,
         nonce: Nonce,
-        result: TransferResult,
-        transfer_type: FileYeetCommandType,
+        result: DownloadResult,
     ) -> iced::Task<Message> {
         if let ConnectionState::Connected(ConnectedState {
-            peers,
-            downloads,
-            uploads,
-            ..
+            peers, downloads, ..
         }) = &mut self.connection_state
         {
             // Log a warning if the transfer failed.
-            if let TransferResult::Failure(e, _) = &result {
+            if let DownloadResult::Failure(e, _) = &result {
                 tracing::warn!("Transfer failed: {e}");
             }
 
-            match transfer_type {
-                FileYeetCommandType::Sub => {
-                    if let Some(t) = downloads.iter_mut().find(|t| t.base.nonce == nonce) {
-                        update_download_result(&mut t.progress, result, peers, nonce);
-                    } else {
-                        tracing::warn!("No download found to update result for nonce");
-                    }
-                }
-                FileYeetCommandType::Pub => {
-                    if let Some(t) = uploads.iter_mut().find(|t| t.base.nonce == nonce) {
-                        update_upload_result(&mut t.progress, result, peers, nonce);
-                    } else {
-                        tracing::warn!("No upload found to update result for nonce");
-                    }
-                }
+            if let Some(t) = downloads.iter_mut().find(|t| t.base.nonce == nonce) {
+                update_download_result(&mut t.progress, result, peers, nonce);
+            } else {
+                tracing::warn!("No download found to update result for nonce");
+            }
+        } else {
+            tracing::warn!("No connected state to update transfer result");
+        }
+        iced::Task::none()
+    }
+
+    /// Update the state after an upload transfer has concluded, successfully or not.
+    #[tracing::instrument(skip(self, result))]
+    fn update_upload_resulted(
+        &mut self,
+        nonce: Nonce,
+        result: UploadResult,
+    ) -> iced::Task<Message> {
+        if let ConnectionState::Connected(ConnectedState { peers, uploads, .. }) =
+            &mut self.connection_state
+        {
+            // Log a warning if the transfer failed.
+            if let UploadResult::Failure(e) = &result {
+                tracing::warn!("Transfer failed: {e}");
+            }
+
+            if let Some(t) = uploads.iter_mut().find(|t| t.base.nonce == nonce) {
+                update_upload_result(&mut t.progress, result, peers, nonce);
+            } else {
+                tracing::warn!("No upload found to update result for nonce");
             }
         } else {
             tracing::warn!("No connected state to update transfer result");
@@ -2779,7 +2791,7 @@ impl AppState {
                         DownloadState::Transferring { peer, .. } => Some(peer.remote_address()),
                         DownloadState::Paused(peer) => peer,
                         DownloadState::ResumingHash(_)
-                        | DownloadState::Done(TransferResult::Failure(_, true)) => None,
+                        | DownloadState::Done(DownloadResult::Failure(_, true)) => None,
 
                         // In other cases, do not save the download.
                         _ => return None,

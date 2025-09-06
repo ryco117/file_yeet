@@ -23,9 +23,9 @@ use crate::{
 /// The rate at which transfer speed text is updated.
 const TRANSFER_SPEED_UPDATE_INTERVAL: Duration = Duration::from_millis(400);
 
-/// The result of a file transfer with a peer.
+/// The result of a file download with a peer.
 #[derive(Clone, Debug, thiserror::Error)]
-pub enum TransferResult {
+pub enum DownloadResult {
     /// The transfer succeeded.
     #[error("Transfer succeeded")]
     Success,
@@ -33,6 +33,22 @@ pub enum TransferResult {
     /// The transfer failed. Has bool indicating whether the failure is recoverable.
     #[error("{0}")]
     Failure(Arc<String>, bool),
+
+    /// The transfer was cancelled.
+    #[error("Transfer cancelled")]
+    Cancelled,
+}
+
+/// The result of a file upload with a peer.
+#[derive(Clone, Debug, thiserror::Error)]
+pub enum UploadResult {
+    /// The transfer succeeded.
+    #[error("Transfer succeeded")]
+    Success,
+
+    /// The transfer failed.
+    #[error("{0}")]
+    Failure(Arc<String>),
 
     /// The transfer was cancelled.
     #[error("Transfer cancelled")]
@@ -101,7 +117,7 @@ pub enum DownloadState {
     ResumingHash(Arc<RwLock<f32>>),
 
     /// The transfer has completed.
-    Done(TransferResult),
+    Done(DownloadResult),
 }
 impl DownloadState {
     /// If the progress state contains a peer connection, return it.
@@ -133,7 +149,7 @@ pub enum UploadState {
     },
 
     /// The transfer has completed.
-    Done(TransferResult),
+    Done(UploadResult),
 }
 impl UploadState {
     /// If the progress state contains a peer connection, return it.
@@ -313,13 +329,13 @@ impl Transfer for DownloadTransfer {
                 let result_text = widget::text(r.to_string())
                     .width(iced::Length::Fill)
                     .color_maybe(match r {
-                        TransferResult::Failure(_, _) => Some(ERROR_RED_COLOR),
+                        DownloadResult::Failure(_, _) => Some(ERROR_RED_COLOR),
                         _ => None,
                     });
                 widget::row!(
                     result_text,
                     match r {
-                        TransferResult::Success => {
+                        DownloadResult::Success => {
                             Element::<Message>::from(
                                 widget::row!(
                                     tooltip_button(
@@ -332,7 +348,7 @@ impl Transfer for DownloadTransfer {
                                 .spacing(12),
                             )
                         }
-                        TransferResult::Failure(_, true) => {
+                        DownloadResult::Failure(_, true) => {
                             Element::<Message>::from(
                                 widget::row!(
                                     widget::button(widget::text("Retry").size(12)).on_press(
@@ -463,7 +479,7 @@ impl Transfer for UploadTransfer {
                 let result_text = widget::text(r.to_string())
                     .width(iced::Length::Fill)
                     .color_maybe(match r {
-                        TransferResult::Failure(_, _) => Some(ERROR_RED_COLOR),
+                        UploadResult::Failure(_) => Some(ERROR_RED_COLOR),
                         _ => None,
                     });
                 widget::row!(result_text, remove,)
@@ -503,7 +519,7 @@ impl Transfer for UploadTransfer {
 /// Complete a download with the given result.
 pub fn update_download_result(
     progress: &mut DownloadState,
-    result: TransferResult,
+    result: DownloadResult,
     peers: &mut HashMap<SocketAddr, HashSet<Nonce>>,
     nonce: Nonce,
 ) {
@@ -512,8 +528,8 @@ pub fn update_download_result(
         DownloadState::Paused(_) => {
             // If the transfer result is cancelled, ignore it.
             // This is expected if the transfer was paused.
-            if matches!(result, TransferResult::Cancelled) {
-                tracing::debug!("Transfer was paused and then cancelled, expected race condition");
+            if matches!(result, DownloadResult::Cancelled) {
+                tracing::debug!("Download was paused and then cancelled, expected race condition");
                 return;
             }
         }
@@ -522,10 +538,10 @@ pub fn update_download_result(
         DownloadState::Done(done) => {
             // If we are cancelling twice, ignore the second cancellation.
             // Otherwise, this is an unexpected double-result.
-            if !matches!(result, TransferResult::Cancelled)
-                || !matches!(done, TransferResult::Cancelled)
+            if !matches!(result, DownloadResult::Cancelled)
+                || !matches!(done, DownloadResult::Cancelled)
             {
-                tracing::warn!("Transfer already marked as done {done}");
+                tracing::warn!("Download already marked as done {done}");
             }
             return;
         }
@@ -533,7 +549,7 @@ pub fn update_download_result(
         _ => {}
     }
 
-    // If the transfer was connected to a peer, remove the nonce from transactions.
+    // If the download was connected to a peer, remove the nonce from transactions.
     if let Some(connection) = progress.connection() {
         remove_nonce_for_peer(connection, peers, nonce);
     }
@@ -545,7 +561,7 @@ pub fn update_download_result(
 /// Complete an upload with the given result.
 pub fn update_upload_result(
     progress: &mut UploadState,
-    result: TransferResult,
+    result: UploadResult,
     peers: &mut HashMap<SocketAddr, HashSet<Nonce>>,
     nonce: Nonce,
 ) {
@@ -553,15 +569,13 @@ pub fn update_upload_result(
     if let UploadState::Done(done) = progress {
         // If we are cancelling twice, ignore the second cancellation.
         // Otherwise, this is an unexpected double-result.
-        if !matches!(result, TransferResult::Cancelled)
-            || !matches!(done, TransferResult::Cancelled)
-        {
-            tracing::warn!("Transfer already marked as done {done}");
+        if !matches!(result, UploadResult::Cancelled) || !matches!(done, UploadResult::Cancelled) {
+            tracing::warn!("Upload already marked as done {done}");
         }
         return;
     }
 
-    // If the transfer was connected to a peer, remove the nonce from transactions.
+    // If the upload was connected to a peer, remove the nonce from transactions.
     if let Some(connection) = progress.connection() {
         remove_nonce_for_peer(connection, peers, nonce);
     }
