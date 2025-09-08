@@ -1,5 +1,5 @@
 # Use a basic Rust image as a base
-FROM rust:1.75.0-alpine
+FROM rust:1.89.0-alpine
 
 # Copy the source code into the container
 WORKDIR /usr/src/file_yeet
