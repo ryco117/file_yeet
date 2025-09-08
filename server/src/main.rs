@@ -484,11 +484,11 @@ async fn handle_publish(
         }
     }
     /// A loop to handle messages to be sent to a client publishing a file hash.
-    #[tracing::instrument(skip(quic_send, rx, _hash))]
+    #[tracing::instrument(skip(quic_send, rx))]
     async fn handle_publish_inner(
         mut quic_send: quinn::SendStream,
         mut rx: mpsc::Receiver<(Ipv6Addr, u16)>,
-        _hash: HashBytes,
+        hash: HashBytes,
     ) {
         tracing::info!("Starting publish task for client");
         let mut bb = bytes::BytesMut::with_capacity(MAX_SERVER_COMMUNICATION_SIZE);
