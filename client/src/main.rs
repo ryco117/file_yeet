@@ -29,7 +29,7 @@ pub struct Cli {
 
     /// Override the port seen by the server to communicate a custom external port to peers.
     /// Useful when manually port forwarding.
-    /// Takes precedence over the `nat_map` option.
+    /// Takes precedence over the `--nat-map` option.
     #[arg(short = 'x', long)]
     external_port_override: Option<NonZeroU16>,
 

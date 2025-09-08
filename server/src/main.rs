@@ -484,10 +484,11 @@ async fn handle_publish(
         }
     }
     /// A loop to handle messages to be sent to a client publishing a file hash.
-    #[tracing::instrument(skip(quic_send, rx))]
+    #[tracing::instrument(skip(quic_send, rx, _hash))]
     async fn handle_publish_inner(
         mut quic_send: quinn::SendStream,
         mut rx: mpsc::Receiver<(Ipv6Addr, u16)>,
+        _hash: HashBytes,
     ) {
         tracing::info!("Starting publish task for client");
         let mut bb = bytes::BytesMut::with_capacity(MAX_SERVER_COMMUNICATION_SIZE);
@@ -562,7 +563,7 @@ async fn handle_publish(
             _ = client_streams.recv.read_exact(&mut client_cancel_scratch) => {}
 
             // Handle the client's file-publishing task.
-            () = handle_publish_inner(client_streams.send, rx) => {}
+            () = handle_publish_inner(client_streams.send, rx, hash) => {}
         }
 
         // Remove any reference there may be to this publish task.
@@ -617,9 +618,11 @@ async fn handle_subscribe(
     let mut bb = bytes::BytesMut::with_capacity(MAX_SERVER_COMMUNICATION_SIZE);
     bb.put_u16(0);
 
-    // Take a random sample of the publishers to send to the client.
-    // TODO: If client_list has more than `MAX_PUBLISHES_SENT` items, random sampling should be used before the `take` call.
+    // Get the first `MAX_PUBLISHES_SENT` publishers from the list.
+    // These are the oldest publishers that have not been removed.
     let mut peer_publish_list: Vec<_> = client_list.values().take(MAX_PUBLISHES_SENT).collect();
+
+    // Shuffle the publishers so peers aren't encouraged to all use the same client.
     slice_shuffle(&mut peer_publish_list);
 
     let mut n: u16 = 0;
