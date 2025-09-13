@@ -97,7 +97,7 @@ type Nonce = u64;
 /// The information to create a new publish item, or the nonce of an existing one.
 #[derive(Clone, Debug)]
 pub enum CreateOrExistingPublish {
-    Create(PathBuf),
+    Create(Arc<PathBuf>),
     Existing(Nonce),
 }
 
@@ -293,9 +293,6 @@ pub enum Message {
     /// A peer has requested a new transfer from an existing connection.
     PeerRequestedTransfer((HashBytes, PeerRequestStream)),
 
-    /// A connection to a peer has been disconnected.
-    PeerDisconnected(SocketAddr, usize),
-
     /// The transfer view radio buttons were changed.
     TransferViewChanged(TransferView),
 
@@ -404,7 +401,10 @@ impl AppState {
         // Get base settings from the settings file, or default.
         // If there is an error, show the error message and use default settings.
         let mut settings = load_settings().unwrap_or_else(|e| {
-            status_message = Some(format!("Failed to load settings: {e}"));
+            log_status_change::<LogErrorStatus>(
+                &mut status_message,
+                format!("Failed to load settings: {e}"),
+            );
             AppSettings::default()
         });
 
@@ -516,17 +516,6 @@ impl AppState {
                 self.update_peer_requested_transfer(hash, peer_request)
             }
 
-            // A peer has disconnected from the endpoint. Remove them from our map.
-            Message::PeerDisconnected(peer_addr, connection_id) => {
-                if let ConnectionState::Connected(ConnectedState { peers, .. }) =
-                    &mut self.connection_state
-                {
-                    peers.remove(&peer_addr);
-                    ConnectionsManager::instance().blocking_remove_peer(peer_addr, connection_id);
-                }
-                iced::Task::none()
-            }
-
             // The transfer view radio buttons were changed.
             Message::TransferViewChanged(view) => {
                 if let ConnectionState::Connected(connected_state) = &mut self.connection_state {
@@ -559,7 +548,9 @@ impl AppState {
                         .pick_file(),
                     |f| {
                         f.map_or(Message::PublishPathCancelled, |f| {
-                            Message::PublishChosenItem(CreateOrExistingPublish::Create(f.into()))
+                            Message::PublishChosenItem(CreateOrExistingPublish::Create(Arc::new(
+                                f.into(),
+                            )))
                         })
                     },
                 )
@@ -614,9 +605,10 @@ impl AppState {
             // Handle a file being opened.
             Message::OpenFile(path) => {
                 open::that(path.as_ref()).unwrap_or_else(|e| {
-                    let e = format!("Failed to open file: {e}");
-                    tracing::error!("{e}");
-                    self.status_message = Some(e);
+                    log_status_change::<LogErrorStatus>(
+                        &mut self.status_message,
+                        format!("Failed to open file: {e}"),
+                    );
                 });
                 iced::Task::none()
             }
@@ -1169,12 +1161,14 @@ impl AppState {
                     .options
                     .port_forwarding_text
                     .trim()
-                    .parse::<NonZeroU16>()
-                    .ok();
-                if o.is_none() {
-                    self.status_message = Some(INVALID_PORT_FORWARD.to_owned());
+                    .parse::<NonZeroU16>();
+                if let Err(e) = &o {
+                    log_status_change::<LogWarnStatus>(
+                        &mut self.status_message,
+                        format!("{INVALID_PORT_FORWARD}: {e}"),
+                    );
                 }
-                o
+                o.ok()
             }),
             PortMappingSetting::TryPcpNatPmp => {
                 self.status_message = None;
@@ -1188,17 +1182,23 @@ impl AppState {
     fn update_port_forward_text(&mut self, text: String) -> iced::Task<Message> {
         self.options.port_forwarding_text = text;
         if let PortMappingSetting::PortForwarding(port) = &mut self.options.port_mapping {
-            if let Ok(p) = self
+            match self
                 .options
                 .port_forwarding_text
                 .trim()
                 .parse::<NonZeroU16>()
             {
-                *port = Some(p);
-                self.status_message = None;
-            } else {
-                *port = None;
-                self.status_message = Some(INVALID_PORT_FORWARD.to_owned());
+                Ok(p) => {
+                    *port = Some(p);
+                    self.status_message = None;
+                }
+                Err(e) => {
+                    *port = None;
+                    log_status_change::<LogWarnStatus>(
+                        &mut self.status_message,
+                        format!("{INVALID_PORT_FORWARD}: {e}"),
+                    );
+                }
             }
         }
         iced::Task::none()
@@ -1215,6 +1215,7 @@ impl AppState {
     }
 
     /// Update the state after the connect button was clicked.
+    #[tracing::instrument(skip_all)]
     fn update_connect_clicked(&mut self) -> iced::Task<Message> {
         // Clear the status message before starting the connection attempt.
         self.status_message = None;
@@ -1255,7 +1256,10 @@ impl AppState {
 
         // If the server address is invalid, display an error message and return.
         let Some((server_address, port)) = regex_match else {
-            self.status_message = Some("Invalid server address".to_owned());
+            log_status_change::<LogWarnStatus>(
+                &mut self.status_message,
+                "Invalid server address".to_owned(),
+            );
             return iced::Task::none();
         };
 
@@ -1267,7 +1271,10 @@ impl AppState {
             } else if let Ok(n) = text.parse::<NonZeroU16>() {
                 Some(n)
             } else {
-                self.status_message = Some("Invalid internal port".to_owned());
+                log_status_change::<LogWarnStatus>(
+                    &mut self.status_message,
+                    "Invalid internal port".to_owned(),
+                );
                 return iced::Task::none();
             }
         };
@@ -1365,13 +1372,15 @@ impl AppState {
                         .map(|p| {
                             let message = if let Some(hfs) = p.hash_and_file_size {
                                 Message::PublishFileHashed {
-                                    publish: CreateOrExistingPublish::Create(p.path),
+                                    publish: CreateOrExistingPublish::Create(Arc::new(p.path)),
                                     hash: hfs.0,
                                     file_size: hfs.1,
                                     new_hash: false, // The hash is from disk, not a new hash.
                                 }
                             } else {
-                                Message::PublishChosenItem(CreateOrExistingPublish::Create(p.path))
+                                Message::PublishChosenItem(CreateOrExistingPublish::Create(
+                                    Arc::new(p.path),
+                                ))
                             };
                             iced::Task::done(message)
                         })
@@ -1385,7 +1394,10 @@ impl AppState {
                 }
             }
             Err(e) => {
-                self.status_message = Some(format!("Error connecting: {e}"));
+                log_status_change::<LogErrorStatus>(
+                    &mut self.status_message,
+                    format!("Error connecting: {e}"),
+                );
                 self.connection_state = ConnectionState::Disconnected;
             }
         }
@@ -1456,23 +1468,23 @@ impl AppState {
         let (progress, cancellation_token, nonce, path) = match publish {
             // If a new publish is requested, create the desired `PublishItem`.
             CreateOrExistingPublish::Create(path) => {
-                let publish = PublishItem::new(path.clone());
-                let progress = if let PublishState::Hashing(p) = &publish.state {
-                    p.clone()
-                } else {
-                    tracing::error!("Publish path chosen while not hashing");
-                    Arc::new(RwLock::new(0.))
-                };
+                // Ensure the file path is not already being published.
+                if publishes.iter().any(|p| p.path == path) {
+                    log_status_change::<LogWarnStatus>(
+                        &mut self.status_message,
+                        "File is already being published".to_owned(),
+                    );
+                    return iced::Task::none();
+                }
+
+                // Create a new publish item with necessary state.
+                let progress = Arc::new(RwLock::new(0.));
+                let publish = PublishItem::new(path.clone(), progress.clone());
                 let cancellation_token = publish.cancellation_token.clone();
                 let nonce = publish.nonce;
 
                 publishes.push(publish);
-                (
-                    progress,
-                    cancellation_token,
-                    nonce,
-                    publishes.last().unwrap().path.clone(),
-                )
+                (progress, cancellation_token, nonce, path)
             }
 
             // If an existing publish is requested, find it by nonce.
@@ -1539,6 +1551,7 @@ impl AppState {
         };
 
         let saving_hash = new_hash && file_size > 1_000_000_000; // If the file is larger than 1GB, save the hash to disk.
+        let mut create_publish = false;
         if saving_hash {
             // Before saving the new hash to disk, recreate `last_publishes`.
             self.options.last_publishes = publishes.iter().map(SavedPublish::from).collect();
@@ -1546,7 +1559,8 @@ impl AppState {
 
         let (nonce, cancellation_token, path) = match publish {
             CreateOrExistingPublish::Create(path) => {
-                let publish = PublishItem::new(path);
+                create_publish = true;
+                let publish = PublishItem::new(path, Arc::new(RwLock::new(1.)));
                 let nonce = publish.nonce;
                 let cancellation_token = publish.cancellation_token.clone();
                 publishes.push(publish);
@@ -1566,14 +1580,18 @@ impl AppState {
         if saving_hash {
             tracing::info!("File is larger than 1GB, saving hash to disk early");
 
-            // Append the new publish to the list of last publishes.
-            self.options.last_publishes.push(SavedPublish::new(
-                path.as_ref().clone(),
-                Some((hash, file_size)),
-            ));
+            if create_publish {
+                // Append the new publish to the list of last publishes.
+                self.options.last_publishes.push(SavedPublish::new(
+                    path.as_ref().clone(),
+                    Some((hash, file_size)),
+                ));
+            }
             if let Err(e) = save_settings(&self.options) {
-                tracing::warn!("Failed to save settings after publish: {e}");
-                self.status_message = Some(format!("Failed to save settings: {e}"));
+                log_status_change::<LogErrorStatus>(
+                    &mut self.status_message,
+                    format!("Failed to save settings: {e}"),
+                );
             } else {
                 tracing::debug!("Settings saved after hashing file");
             }
@@ -1897,7 +1915,6 @@ impl AppState {
             server,
             external_address,
             downloads,
-            uploads,
             publishes,
             transfer_view,
             ..
@@ -1907,28 +1924,30 @@ impl AppState {
             return iced::Task::none();
         };
 
-        // Ensure there are no active transfers using this path.
-        // TODO: Use a `HashSet` to more efficiently track active file paths.
-        if downloads
-            .iter()
-            .map(DownloadTransfer::base)
-            .chain(uploads.iter().map(UploadTransfer::base))
-            .any(|t| path.eq(t.path.as_ref()))
-        {
-            self.status_message = Some("Transfer using this path already exists".to_owned());
+        // Ensure there are no downloads or publishes using this path.
+        // TODO: Use `HashSet`s to more efficiently track these file paths.
+        if downloads.iter().any(|d| path.eq(d.base.path.as_ref())) {
+            log_status_change::<LogWarnStatus>(
+                &mut self.status_message,
+                "Download using this path already exists".to_owned(),
+            );
             return iced::Task::none();
         }
         if publishes.iter().any(|p| path.eq(p.path.as_ref())) {
-            self.status_message = Some("Publish using this path already exists".to_owned());
+            log_status_change::<LogWarnStatus>(
+                &mut self.status_message,
+                "Publish using this path already exists".to_owned(),
+            );
             return iced::Task::none();
         }
 
         // Ensure the hash is valid.
         let mut hash = HashBytes::default();
         if let Err(e) = faster_hex::hex_decode(hash_hex.as_bytes(), &mut hash.bytes) {
-            let error = format!("Failed to decode matched hash: {e}");
-            tracing::error!("{error}");
-            self.status_message = Some(error);
+            log_status_change::<LogErrorStatus>(
+                &mut self.status_message,
+                format!("Failed to decode matched hash: {e}"),
+            );
             return iced::Task::none();
         }
 
@@ -1942,7 +1961,9 @@ impl AppState {
                 let mut bb = bytes::BytesMut::with_capacity(MAX_PEER_COMMUNICATION_SIZE);
                 crate::core::subscribe(&server, &mut bb, hash, Some(external_address))
                     .await
-                    .map(|peers| IncomingSubscribePeers::new(peers, path, hash))
+                    .map(|publishing_peers| {
+                        IncomingSubscribePeers::new(publishing_peers, path, hash)
+                    })
                     .map_err(Arc::new)
             },
             Message::SubscribePeersResult,
@@ -2008,7 +2029,10 @@ impl AppState {
 
                 if peers_with_size.is_empty() {
                     // Let the user know why nothing else is happening.
-                    self.status_message = Some("No peers available".to_owned());
+                    log_status_change::<LogWarnStatus>(
+                        &mut self.status_message,
+                        "No peers available".to_owned(),
+                    );
                     return iced::Task::none();
                 }
                 let hash_hex = faster_hex::hex_string(&hash.bytes);
@@ -2086,7 +2110,10 @@ impl AppState {
                 iced::Task::batch(connect_commands)
             }
             Err(e) => {
-                self.status_message = Some(format!("Error subscribing to the server: {e}"));
+                log_status_change::<LogErrorStatus>(
+                    &mut self.status_message,
+                    format!("Error subscribing to the server: {e}"),
+                );
                 iced::Task::none()
             }
         }
@@ -2856,6 +2883,31 @@ impl AppState {
     }
 }
 
+/// A trait to log status messages at different levels.
+/// This avoids needing to `match` an enum each log status call.
+trait LogStatusLevel {
+    fn log_status(status: &str);
+}
+struct LogErrorStatus;
+impl LogStatusLevel for LogErrorStatus {
+    fn log_status(status: &str) {
+        tracing::error!("{status}");
+    }
+}
+struct LogWarnStatus;
+impl LogStatusLevel for LogWarnStatus {
+    fn log_status(status: &str) {
+        tracing::warn!("{status}");
+    }
+}
+
+/// Helper to log an error that we assign to the status message.
+/// This helper assumes that the error string is non-empty.
+fn log_status_change<L: LogStatusLevel>(status_message: &mut Option<String>, status: String) {
+    L::log_status(&status);
+    *status_message = Some(status);
+}
+
 /// Helper to get a consistent horizontal scrollbar for text overflow.
 fn text_horizontal_scrollbar() -> widget::scrollable::Direction {
     widget::scrollable::Direction::Horizontal(
@@ -2980,17 +3032,6 @@ async fn connected_peer_request_loop(
                 } else {
                     tracing::debug!("Peer connection closed: {e:?}");
                 }
-                let connection_id = connection.stable_id();
-                connection.close(GOODBYE_CODE, GOODBYE_MESSAGE.as_bytes());
-
-                // The peer has disconnected or the connection deteriorated.
-                if let Err(e) =
-                    output.try_send(Message::PeerDisconnected(peer_address, connection_id))
-                {
-                    tracing::error!(
-                        "Failed to perform internal message passing for failed peer stream: {e}"
-                    );
-                }
                 return;
             }
         }
@@ -2998,6 +3039,7 @@ async fn connected_peer_request_loop(
 }
 
 /// Helper to get a task to hash a file and return the file size and hash.
+#[tracing::instrument(skip(cancellation, progress))]
 fn hash_publish_task(
     nonce: Nonce,
     path: Arc<PathBuf>,
@@ -3112,6 +3154,7 @@ async fn peers_requesting_publish_loop(
 /// Try to establish a peer connection for a command type.
 /// Either starts from an existing connection or attempts to holepunch.
 //  TODO: Consider returning a `Result` instead of an `Option` to handle errors.
+#[tracing::instrument(skip(peer))]
 async fn try_peer_connection(
     peer: PeerConnectionOrTarget,
     hash: HashBytes,
@@ -3194,4 +3237,4 @@ enum CloseType {
     Application,
 }
 
-const INVALID_PORT_FORWARD: &str = "Invalid port forward. Defaults to no port mappings.";
+const INVALID_PORT_FORWARD: &str = "Invalid port forward. Defaults to no port mappings";

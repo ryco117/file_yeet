@@ -195,19 +195,16 @@ fn main() {
         task_master.spawn(core::ConnectionsManager::manage_incoming_loop(
             prepared_connection.endpoint.clone(),
         ));
+        let manager = Manager {
+            task_tracker: &mut task_master,
+            cancellation_token: cancellation_token.clone(),
+        };
 
         // Determine if we are going to make a publish or subscribe request.
         match cmd {
             // Try to hash and publish the file to the rendezvous server.
             FileYeetCommand::Pub { file_path } => {
-                if let Err(e) = publish_command(
-                    &prepared_connection,
-                    bb,
-                    file_path,
-                    &mut task_master,
-                    cancellation_token,
-                )
-                .await
+                if let Err(e) = publish_command(&prepared_connection, bb, file_path, manager).await
                 {
                     tracing::error!("Failed to publish the file: {e}");
                 }
@@ -215,15 +212,8 @@ fn main() {
 
             // Try to get the file hash from the rendezvous server and peers.
             FileYeetCommand::Sub { hash_ext, output } => {
-                if let Err(e) = subscribe_command(
-                    &prepared_connection,
-                    bb,
-                    hash_ext,
-                    output,
-                    &mut task_master,
-                    cancellation_token.clone(),
-                )
-                .await
+                if let Err(e) =
+                    subscribe_command(&prepared_connection, bb, hash_ext, output, manager).await
                 {
                     tracing::error!("Failed to download the file: {e}");
                 }
@@ -258,14 +248,18 @@ fn main() {
     });
 }
 
+struct Manager<'a> {
+    pub task_tracker: &'a mut TaskTracker,
+    pub cancellation_token: CancellationToken,
+}
+
 /// Handle the CLI command to publish a file.
 #[tracing::instrument(skip_all)]
 async fn publish_command(
     prepared_connection: &PreparedConnection,
     bb: bytes::BytesMut,
     file_path: String,
-    task_master: &mut TaskTracker,
-    cancellation_token: CancellationToken,
+    manager: Manager<'_>,
 ) -> anyhow::Result<()> {
     let file_path = std::path::Path::new(&file_path);
     let (file_size, hash) = match core::file_size_and_hash(file_path, None).await {
@@ -287,6 +281,7 @@ async fn publish_command(
         server_connection,
         ..
     } = prepared_connection;
+    let cancellation_token = manager.cancellation_token.clone();
 
     // Allow the publish loop to be cancelled by a Ctrl-C signal.
     tokio::select! {
@@ -294,7 +289,7 @@ async fn publish_command(
             tracing::info!("Ctrl-C detected, cancelling the publish");
             cancellation_token.cancel();
         }
-        r = publish_loop(endpoint, server_connection, bb, hash, file_size, file_path, cancellation_token.clone(), task_master) => return r
+        r = publish_loop(endpoint, server_connection, bb, hash, file_size, file_path, manager) => return r
     }
 
     Ok(())
@@ -307,8 +302,7 @@ async fn subscribe_command(
     mut bb: bytes::BytesMut,
     hash_ext: String,
     output_path: Option<String>,
-    task_master: &mut TaskTracker,
-    cancellation_token: CancellationToken,
+    manager: Manager<'_>,
 ) -> anyhow::Result<()> {
     // Parse the hash and optional extension with regex.
     let (hash_hex, ext) = match HASH_EXT_REGEX.captures(&hash_ext) {
@@ -339,8 +333,6 @@ async fn subscribe_command(
         // If an extension hint was provided, use it as the default extension.
         if let Some(ext) = ext {
             if output.extension().is_none() {
-                //  TODO: Wait for `add_extension` to be stabilized.
-                //  https://github.com/rust-lang/rust/issues/127292
                 output.set_extension(ext);
             }
         }
@@ -388,7 +380,7 @@ async fn subscribe_command(
                 }
 
                 // Try to gracefully reject the download in the background.
-                task_master.spawn(async move {
+                manager.task_tracker.spawn(async move {
                     // Reject the download gracefully.
                     if let Ok(()) = core::reject_download_request(&mut b).await {
                         // Close the connection because we won't download from this peer.
@@ -414,7 +406,7 @@ async fn subscribe_command(
     // Create a background task to update the download progress visually.
     let progress = Arc::new(tokio::sync::RwLock::new(0));
     let progress_clone = progress.clone();
-    task_master.spawn(async move {
+    manager.task_tracker.spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
         let mut last_instant = interval.tick().await;
         let mut last_progress = 0;
@@ -422,10 +414,10 @@ async fn subscribe_command(
         let full_progress = "██████████";
 
         println!();
-        while !cancellation_token.is_cancelled() {
+        while !manager.cancellation_token.is_cancelled() {
             // Wait for the next interval tick and get the current time.
             let now = interval.tick().await;
-            if cancellation_token.is_cancelled() {
+            if manager.cancellation_token.is_cancelled() {
                 break;
             }
 
@@ -477,8 +469,7 @@ async fn publish_loop(
     hash: HashBytes,
     file_size: u64,
     file_path: &Path,
-    cancellation_token: CancellationToken,
-    task_master: &mut TaskTracker,
+    manager: Manager<'_>,
 ) -> anyhow::Result<()> {
     // Create a bi-directional stream to the server.
     let mut server_streams: BiStream =
@@ -498,10 +489,10 @@ async fn publish_loop(
                 }
             };
 
-        let cancellation_token = cancellation_token.clone();
+        let cancellation_token = manager.cancellation_token.clone();
         let endpoint = endpoint.clone();
         let file_path = file_path.to_path_buf();
-        task_master.spawn(async move {
+        manager.task_tracker.spawn(async move {
             tokio::select! {
                 // Ensure the publish tasks are cancellable.
                 () = cancellation_token.cancelled() => {}

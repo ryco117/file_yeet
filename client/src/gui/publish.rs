@@ -81,12 +81,12 @@ pub struct PublishItem {
 }
 impl PublishItem {
     /// Make a new publish item in the hashing state.
-    pub fn new(path: PathBuf) -> Self {
+    pub fn new(path: Arc<PathBuf>, progress_lock: Arc<RwLock<f32>>) -> Self {
         Self {
             nonce: rand::random(),
-            path: Arc::new(path),
+            path,
             cancellation_token: CancellationToken::new(),
-            state: PublishState::Hashing(Arc::new(RwLock::new(0.))),
+            state: PublishState::Hashing(progress_lock),
         }
     }
 }

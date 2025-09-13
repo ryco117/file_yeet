@@ -15,8 +15,8 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     core::{humanize_bytes, FileYeetCommandType},
     gui::{
-        remove_nonce_for_peer, text_horizontal_scrollbar, timed_tooltip, CancelOrPause, Message,
-        Nonce, PeerRequestStream, ERROR_RED_COLOR,
+        remove_nonce_for_peer, text_horizontal_scrollbar, timed_tooltip, CancelOrPause,
+        CreateOrExistingPublish, Message, Nonce, PeerRequestStream, ERROR_RED_COLOR,
     },
 };
 
@@ -336,6 +336,18 @@ impl Transfer for DownloadTransfer {
                     result_text,
                     match r {
                         DownloadResult::Success => {
+                            let publish_button = tooltip_button(
+                                "Publish",
+                                Message::PublishFileHashed {
+                                    publish: CreateOrExistingPublish::Create(
+                                        self.base.path.clone(),
+                                    ),
+                                    hash: self.base.hash,
+                                    file_size: self.base.file_size,
+                                    new_hash: true,
+                                },
+                                "Publish the file without re-hashing",
+                            );
                             Element::<Message>::from(
                                 widget::row!(
                                     tooltip_button(
@@ -343,7 +355,8 @@ impl Transfer for DownloadTransfer {
                                         Message::OpenFile(self.base.path.clone()),
                                         "Open with the system's default launcher",
                                     ),
-                                    remove
+                                    publish_button,
+                                    remove,
                                 )
                                 .spacing(12),
                             )

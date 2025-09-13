@@ -1,7 +1,7 @@
 use std::{
     collections::{hash_map, HashMap},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
-    num::NonZeroU16,
+    num::{NonZeroU16, NonZeroUsize},
     path::Path,
     sync::Arc,
     time::Duration,
@@ -35,7 +35,7 @@ pub const PEER_LISTEN_TIMEOUT: Duration = Duration::from_secs(3);
 pub const PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// Define a sane number of maximum retries.
-pub const MAX_PEER_CONNECTION_RETRIES: usize = 20;
+pub const MAX_PEER_CONNECTION_ATTEMPTS: NonZeroUsize = NonZeroUsize::new(10).unwrap();
 
 /// Define the maximum size of a payload for peer communication.
 /// QUIC may choose to fragment the payload when sending raw packets, but this isn't a concern.
@@ -765,16 +765,18 @@ async fn connect_to_peer(
     endpoint: quinn::Endpoint,
     peer_address: SocketAddr,
 ) -> Option<quinn::Connection> {
-    // Set a sane number of connection retries.
-    let mut connect_attempts = MAX_PEER_CONNECTION_RETRIES + 1;
+    // Set a sane number of connection attempts
+    let mut connect_attempt = 0;
 
     // Ensure we have retries left and there isn't already a peer `Connection` to use.
-    while connect_attempts > 0 {
+    while connect_attempt < MAX_PEER_CONNECTION_ATTEMPTS.get() {
+        let connect_attempt_print = connect_attempt + 1;
         if cfg!(debug_assertions) {
-            tracing::debug!("Connection attempt to peer at {peer_address}");
+            tracing::debug!(
+                "Connection attempt #{connect_attempt_print} to peer at {peer_address}"
+            );
         } else {
-            // TODO: Use some kind of nonce to track connection attempts to the same peer.
-            tracing::debug!("Connection attempt to peer");
+            tracing::debug!("Connection attempt #{connect_attempt_print} to peer");
         }
 
         match endpoint.connect(peer_address, "peer") {
@@ -783,7 +785,7 @@ async fn connect_to_peer(
                     Ok(c) => c,
                     Err(e) => {
                         tracing::warn!("Failed to connect to peer: {e}");
-                        connect_attempts -= 1;
+                        connect_attempt += 1;
                         continue;
                     }
                 };
@@ -1347,7 +1349,7 @@ impl ConnectionsManager {
     }
 
     /// Remove a specific peer connection from the manager, with synchronous lock behavior.
-    #[tracing::instrument(skip_all)]
+    #[tracing::instrument(skip(self, peer_address))]
     pub fn blocking_remove_peer(&mut self, peer_address: SocketAddr, connection_id: usize) {
         // Remove entry for peer if the stable IDs match.
         match self.map.blocking_write().entry(peer_address) {
@@ -1356,6 +1358,10 @@ impl ConnectionsManager {
                     if c.stable_id() == connection_id {
                         e.remove();
                         tracing::info!("Connection manager removed peer");
+                    } else {
+                        tracing::debug!(
+                            "Connection manager found peer, but stable IDs did not match"
+                        );
                     }
                 }
             }
@@ -1367,7 +1373,7 @@ impl ConnectionsManager {
     }
 
     /// Remove a specific peer connection from the manager, with asynchronous lock behavior.
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(skip(self, peer_address))]
     pub async fn remove_peer(&mut self, peer_address: SocketAddr, connection_id: usize) {
         // Remove entry for peer if the stable IDs match.
         match self.map.write().await.entry(peer_address) {
@@ -1376,6 +1382,10 @@ impl ConnectionsManager {
                     if c.stable_id() == connection_id {
                         e.remove();
                         tracing::info!("Connection manager removed peer");
+                    } else {
+                        tracing::debug!(
+                            "Connection manager found peer, but stable IDs did not match"
+                        );
                     }
                 }
             }
