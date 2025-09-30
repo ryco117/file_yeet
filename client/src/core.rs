@@ -356,6 +356,7 @@ pub async fn renew_port_mapping(
         mapping_changed = true;
     }
 
+    tracing::debug!("Port mapping renewal succeeded");
     Ok(mapping_changed)
 }
 
@@ -709,7 +710,6 @@ pub async fn udp_holepunch(
 }
 
 /// Try to finalize a peer connection attempt by turning it into a bi-directional stream.
-//  TODO: Implement proper error handling instead of logging.
 #[tracing::instrument(skip(connection, expected_hash))]
 pub async fn peer_connection_into_stream(
     connection: &quinn::Connection,

@@ -665,6 +665,8 @@ impl AppState {
     /// Listen for events that should be translated into messages.
     #[tracing::instrument(skip(self))]
     pub fn subscription(&self) -> iced::Subscription<Message> {
+        use tracing::Instrument;
+
         // Listen for runtime events that iced did not handle internally. Used for safe exit handling.
         fn unhandled_events() -> iced::Subscription<Message> {
             iced::event::listen_with(|event, status, window| match status {
@@ -707,39 +709,43 @@ impl AppState {
                 let port_mapping = self.port_mapping.clone().into_iter().map(|mut mapping| {
                     iced::Subscription::run_with_id(
                         1,
-                        iced::stream::channel(2, move |mut output| async move {
-                            let mut last_lifetime = mapping.lifetime() as u64;
-                            let mut interval =
-                                crate::core::new_renewal_interval(last_lifetime).await;
-                            loop {
-                                // Ensure a reasonable wait time before each renewal attempt.
-                                interval.tick().await;
+                        iced::stream::channel(2, move |mut output| {
+                            async move {
+                                let mut last_lifetime = mapping.lifetime() as u64;
+                                let mut interval =
+                                    crate::core::new_renewal_interval(last_lifetime).await;
+                                loop {
+                                    // Ensure a reasonable wait time before each renewal attempt.
+                                    interval.tick().await;
 
-                                match crate::core::renew_port_mapping(&mut mapping).await {
-                                    Ok(changed) if changed => {
-                                        if let Err(e) = output.try_send(
-                                            Message::PortMappingUpdated(Some(mapping.clone())),
-                                        ) {
-                                            let e = e.into_send_error();
-                                            tracing::error!(
-                                                "Failed to send port mapping update: {e}"
-                                            );
-                                        }
+                                    match crate::core::renew_port_mapping(&mut mapping).await {
+                                        Ok(changed) if changed => {
+                                            if let Err(e) = output.try_send(
+                                                Message::PortMappingUpdated(Some(mapping.clone())),
+                                            ) {
+                                                let e = e.into_send_error();
+                                                tracing::error!(
+                                                    "Failed to send port mapping update: {e}"
+                                                );
+                                            }
 
-                                        // Update interval if the lifetime has changed.
-                                        let lifetime = mapping.lifetime() as u64;
-                                        if lifetime != last_lifetime {
-                                            last_lifetime = lifetime;
-                                            interval =
-                                                crate::core::new_renewal_interval(lifetime).await;
+                                            // Update interval if the lifetime has changed.
+                                            let lifetime = mapping.lifetime() as u64;
+                                            if lifetime != last_lifetime {
+                                                last_lifetime = lifetime;
+                                                interval =
+                                                    crate::core::new_renewal_interval(lifetime)
+                                                        .await;
+                                            }
                                         }
+                                        Err(e) => {
+                                            tracing::warn!("Failed to renew port mapping: {e}");
+                                        }
+                                        _ => {}
                                     }
-                                    Err(e) => {
-                                        tracing::warn!("Failed to renew port mapping: {e}");
-                                    }
-                                    _ => {}
                                 }
                             }
+                            .instrument(tracing::info_span!("Port mapping renewal loop"))
                         }),
                     )
                 });
