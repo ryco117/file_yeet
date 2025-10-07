@@ -471,21 +471,25 @@ impl AppState {
     }
 
     /// Update the application state based on a message.
+    #[tracing::instrument(skip_all)]
     pub fn update(&mut self, message: Message) -> iced::Task<Message> {
         match message {
             // Set the ID of the main window.
             Message::MainWindowId(id) => {
+                tracing::debug!("Main window ID set to {id:?}");
                 self.main_window = id;
                 iced::Task::none()
             }
 
             // Handle the server address being changed.
             Message::ServerAddressChanged(address) => {
+                tracing::debug!("Server address changed to {address}");
                 self.options.server_address = address;
                 iced::Task::none()
             }
 
             Message::InternalPortTextChanged(text) => {
+                tracing::debug!("Internal port text changed to {text}");
                 self.options.internal_port_text = text;
                 iced::Task::none()
             }
@@ -500,12 +504,16 @@ impl AppState {
             Message::PortMappingUpdated(mapping) => self.update_port_mapping(mapping),
 
             // Copy the connected server address to the clipboard.
-            Message::CopyServer => iced::clipboard::write(self.options.server_address.clone()),
+            Message::CopyServer => {
+                tracing::debug!("Copying server address to clipboard");
+                iced::clipboard::write(self.options.server_address.clone())
+            }
 
             Message::SafelyLeaveServer => self.safely_close(CloseType::Connections),
 
             // All async actions to leave a server have completed.
             Message::LeftServer => {
+                tracing::debug!("Left server, now disconnected");
                 self.safely_closing = false;
                 self.connection_state = ConnectionState::Disconnected;
                 iced::Task::none()
@@ -519,23 +527,32 @@ impl AppState {
             // The transfer view radio buttons were changed.
             Message::TransferViewChanged(view) => {
                 if let ConnectionState::Connected(connected_state) = &mut self.connection_state {
+                    tracing::debug!("Transfer view changed to {view:?}");
                     connected_state.transfer_view = view;
+                } else {
+                    tracing::warn!("Transfer view changed to {view:?} while not connected");
                 }
                 iced::Task::none()
             }
 
             // Handle the hash input being changed.
             Message::HashInputChanged(hash) => {
+                tracing::debug!("Hash input changed to {hash}");
                 if let ConnectionState::Connected(ConnectedState { hash_input, .. }) =
                     &mut self.connection_state
                 {
+                    tracing::debug!("Hash input changed to {hash}");
                     *hash_input = hash;
+                } else {
+                    tracing::warn!("Hash input changed to {hash} while not connected");
                 }
                 iced::Task::none()
             }
 
             // Handle the publish button being clicked by picking a file to publish.
             Message::PublishClicked => {
+                tracing::debug!("Publish button clicked");
+
                 // Clear the status message before starting the publish attempt.
                 self.status_message = None;
 
@@ -558,6 +575,7 @@ impl AppState {
 
             Message::PublishChosenItem(publish) => self.update_publish_chosen_item(publish),
             Message::PublishPathCancelled => {
+                tracing::debug!("Publish choice cancelled");
                 self.modal = false;
                 iced::Task::none()
             }
@@ -602,8 +620,9 @@ impl AppState {
             Message::DownloadTransferResulted(nonce, r) => self.update_download_resulted(nonce, r),
             Message::UploadTransferResulted(nonce, r) => self.update_upload_resulted(nonce, r),
 
-            // Handle a file being opened.
+            // Handle the `Open` button being pressed.
             Message::OpenFile(path) => {
+                tracing::debug!("Opening file: {}", path.to_string_lossy());
                 open::that(path.as_ref()).unwrap_or_else(|e| {
                     log_status_change::<LogErrorStatus>(
                         &mut self.status_message,
@@ -652,13 +671,16 @@ impl AppState {
             },
 
             // Exit the application immediately.
-            Message::ForceExit => self.main_window.map_or_else(
-                || {
-                    tracing::error!("Main window not available at force exit");
-                    iced::exit()
-                },
-                iced::window::close,
-            ),
+            Message::ForceExit => {
+                tracing::debug!("Force exit requested");
+                self.main_window.map_or_else(
+                    || {
+                        tracing::error!("Main window not available at force exit");
+                        iced::exit()
+                    },
+                    iced::window::close,
+                )
+            }
         }
     }
 
@@ -803,15 +825,19 @@ impl AppState {
                         let connection = connection.clone();
                         Some(iced::Subscription::run_with_id(
                             peer_addr,
-                            iced::stream::channel(8, async move |output| {
-                                connected_peer_request_loop(&connection, peer_addr, output).await;
+                            iced::stream::channel(8, move |output| {
+                                async move {
+                                    connected_peer_request_loop(&connection, peer_addr, output)
+                                        .await;
 
-                                // If we needed to return from the loop, then cancel this item.
-                                let id = connection.stable_id();
-                                connection.close(GOODBYE_CODE, GOODBYE_MESSAGE.as_bytes());
-                                ConnectionsManager::instance()
-                                    .remove_peer(peer_addr, id)
-                                    .await;
+                                    // If we needed to return from the loop, then cancel this item.
+                                    let id = connection.stable_id();
+                                    connection.close(GOODBYE_CODE, GOODBYE_MESSAGE.as_bytes());
+                                    ConnectionsManager::instance()
+                                        .remove_peer(peer_addr, id)
+                                        .await;
+                                }
+                                .instrument(tracing::info_span!("Connected peer request loop"))
                             }),
                         ))
                     });
@@ -1156,7 +1182,9 @@ impl AppState {
     }
 
     /// Handle the port mapping radio button being changed.
+    #[tracing::instrument(skip(self))]
     fn update_port_radio_changed(&mut self, selection: PortMappingSetting) -> iced::Task<Message> {
+        tracing::debug!("Port radio UI changed");
         self.options.port_mapping = match selection {
             PortMappingSetting::None => {
                 self.status_message = None;
@@ -1185,7 +1213,9 @@ impl AppState {
     }
 
     /// Update the state after the port forward text field was changed.
+    #[tracing::instrument(skip(self))]
     fn update_port_forward_text(&mut self, text: String) -> iced::Task<Message> {
+        tracing::debug!("Port forward text UI changed");
         self.options.port_forwarding_text = text;
         if let PortMappingSetting::PortForwarding(port) = &mut self.options.port_mapping {
             match self
@@ -1211,7 +1241,9 @@ impl AppState {
     }
 
     /// Update the state after the gateway text field was changed.
+    #[tracing::instrument(skip(self))]
     fn update_gateway_text(&mut self, text: String) -> iced::Task<Message> {
+        tracing::debug!("Gateway text UI changed");
         if text.trim().is_empty() {
             self.options.gateway_address = None;
         } else {
@@ -1223,6 +1255,8 @@ impl AppState {
     /// Update the state after the connect button was clicked.
     #[tracing::instrument(skip_all)]
     fn update_connect_clicked(&mut self) -> iced::Task<Message> {
+        tracing::debug!("Connect button clicked");
+
         // Clear the status message before starting the connection attempt.
         self.status_message = None;
 
@@ -1324,6 +1358,7 @@ impl AppState {
     }
 
     /// Update the state after a tick when animations are occurring.
+    #[tracing::instrument(skip_all)]
     fn update_animation_tick(&mut self) -> iced::Task<Message> {
         match &mut self.connection_state {
             // Update the spinner when connecting/stalling.
@@ -1417,6 +1452,7 @@ impl AppState {
         port_mapping: Option<crab_nat::PortMapping>,
     ) -> iced::Task<Message> {
         if let Some(port_mapping) = port_mapping {
+            tracing::debug!("Port mapping updated: {port_mapping:?}");
             self.port_mapping = Some(port_mapping);
         } else {
             tracing::warn!("Port mapping renewal failed");
@@ -1447,6 +1483,7 @@ impl AppState {
             return iced::Task::none();
         };
 
+        tracing::debug!("Peer requested transfer with nonce {nonce}");
         self.update_publish_peer_connect_resulted(nonce, Some(peer_request))
     }
 
@@ -1456,6 +1493,7 @@ impl AppState {
         &mut self,
         publish: CreateOrExistingPublish,
     ) -> iced::Task<Message> {
+        tracing::debug!("Publish dialog closed");
         self.modal = false;
 
         // Ensure the client is connected to a server.
@@ -1514,6 +1552,7 @@ impl AppState {
 
         iced::Task::perform(
             async move {
+                tracing::info!("Determine the file size and hash for publish");
                 tokio::select! {
                     // Allow cancelling the publish request thread.
                     () = cancellation_token.cancelled() => Err(PublishRequestResult::Cancelled),
@@ -1540,7 +1579,7 @@ impl AppState {
     }
 
     /// Take a file and hash info and create a new publish request.
-    #[tracing::instrument(skip(self, publish))]
+    #[tracing::instrument(skip(self))]
     fn update_publish_file_hashed(
         &mut self,
         publish: CreateOrExistingPublish,
@@ -1557,15 +1596,29 @@ impl AppState {
         };
 
         let saving_hash = new_hash && file_size > 1_000_000_000; // If the file is larger than 1GB, save the hash to disk.
-        let mut create_publish = false;
         if saving_hash {
-            // Before saving the new hash to disk, recreate `last_publishes`.
-            self.options.last_publishes = publishes.iter().map(SavedPublish::from).collect();
+            // Before saving the new hash to disk, create `last_publishes`.
+            self.options.last_publishes = if let CreateOrExistingPublish::Existing(nonce) = publish
+            {
+                publishes
+                    .iter()
+                    .filter_map(|p| {
+                        // If the publish item already exists, do not include it in the saved list yet.
+                        // We will add it later with the correct hash and file size.
+                        if p.nonce == nonce {
+                            None
+                        } else {
+                            Some(SavedPublish::from(p))
+                        }
+                    })
+                    .collect()
+            } else {
+                publishes.iter().map(SavedPublish::from).collect()
+            };
         }
 
         let (nonce, cancellation_token, path) = match publish {
             CreateOrExistingPublish::Create(path) => {
-                create_publish = true;
                 let publish = PublishItem::new(path, Arc::new(RwLock::new(1.)));
                 let nonce = publish.nonce;
                 let cancellation_token = publish.cancellation_token.clone();
@@ -1586,13 +1639,12 @@ impl AppState {
         if saving_hash {
             tracing::info!("File is larger than 1GB, saving hash to disk early");
 
-            if create_publish {
-                // Append the new publish to the list of last publishes.
-                self.options.last_publishes.push(SavedPublish::new(
-                    path.as_ref().clone(),
-                    Some((hash, file_size)),
-                ));
-            }
+            // Append the new publish to the list of last publishes.
+            self.options.last_publishes.push(SavedPublish::new(
+                path.as_ref().clone(),
+                Some((hash, file_size)),
+            ));
+
             if let Err(e) = save_settings(&self.options) {
                 log_status_change::<LogErrorStatus>(
                     &mut self.status_message,
@@ -1744,7 +1796,7 @@ impl AppState {
     }
 
     /// Update after a connection attempt to a peer for publishing has completed.
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(skip(self, peer))]
     fn update_publish_peer_connect_resulted(
         &mut self,
         pub_nonce: Nonce,
@@ -1761,7 +1813,7 @@ impl AppState {
             return iced::Task::none();
         };
         let Some(peer) = peer else {
-            // Silently fail if the peer connection was not successful when publishing.
+            tracing::debug!("Peer connection attempt failed for publish nonce {pub_nonce}");
             return iced::Task::none();
         };
 
@@ -2794,6 +2846,8 @@ impl AppState {
     /// Try to safely close.
     #[tracing::instrument(skip(self))]
     fn safely_close(&mut self, close_type: CloseType) -> iced::Task<Message> {
+        tracing::debug!("Safely leaving server");
+
         // If connected, close the connection and save the current state.
         if let ConnectionState::Connected(ConnectedState {
             endpoint,
@@ -2841,7 +2895,7 @@ impl AppState {
 
             // Save the app settings when closing our connections.
             if let Err(e) = save_settings(&self.options) {
-                tracing::warn!("Could not save settings: {e}");
+                tracing::error!("Could not save settings: {e}");
             } else {
                 tracing::info!("Settings saved");
             }
@@ -3216,18 +3270,26 @@ fn remove_nonce_for_peer(
             } else {
                 tracing::warn!("Nonce was not found for peer");
             }
+        } else if cfg!(debug_assertions) {
+            tracing::debug!("Removed nonce for peer {peer_address}");
+        } else {
+            tracing::debug!("Removed nonce for peer");
         }
 
         // If there are no more streams to the peer, close the connection.
         if nonces.is_empty() {
+            let connection = peer.stable_id();
             if cfg!(debug_assertions) {
-                tracing::debug!("Closing peer {peer_address} connection");
+                tracing::debug!("Closing peer {peer_address} connection {connection}");
             } else {
-                tracing::debug!("Closing peer connection");
+                tracing::debug!("Closing peer connection {connection}");
             }
 
             // Remove the connection from the manager.
-            ConnectionsManager::instance().blocking_remove_peer(peer_address, peer.stable_id());
+            ConnectionsManager::instance().blocking_remove_peer(peer_address, connection);
+
+            // Remove the peer from our map of known peer addresses.
+            e.remove();
         }
     } else if cfg!(debug_assertions) {
         tracing::warn!("Peer {peer_address} not found in peers map");
