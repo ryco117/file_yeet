@@ -356,7 +356,8 @@ pub async fn renew_port_mapping(
         mapping_changed = true;
     }
 
-    tracing::debug!("Port mapping renewal succeeded");
+    let expiration_time = instant_to_datetime_string(port_mapping.expiration());
+    tracing::debug!("Port mapping renewal succeeded. Expiration at {expiration_time}");
     Ok(mapping_changed)
 }
 
@@ -710,7 +711,7 @@ pub async fn udp_holepunch(
 }
 
 /// Try to finalize a peer connection attempt by turning it into a bi-directional stream.
-#[tracing::instrument(skip(connection, expected_hash))]
+#[tracing::instrument(skip_all)]
 pub async fn peer_connection_into_stream(
     connection: &quinn::Connection,
     expected_hash: HashBytes,
@@ -841,7 +842,7 @@ pub enum DownloadError {
 }
 
 /// Download a slice of a file from the peer. Initiates the download by specifying the range of bytes to download.
-#[tracing::instrument(skip(peer_streams, file_offsets, byte_progress))]
+#[tracing::instrument(skip(peer_streams, file, file_offsets, byte_progress))]
 pub async fn download_partial_from_peer(
     expected_hash: HashBytes,
     peer_streams: &mut BiStream,
@@ -934,7 +935,7 @@ pub async fn reject_download_request(peer_streams: &mut BiStream) -> Result<(), 
 }
 
 /// Download a file from the peer to the specified file path.
-#[tracing::instrument(skip(expected_hash, peer_streams, byte_progress))]
+#[tracing::instrument(skip(peer_streams, byte_progress))]
 pub async fn download_from_peer(
     expected_hash: HashBytes,
     peer_streams: &mut BiStream,
@@ -942,9 +943,12 @@ pub async fn download_from_peer(
     output_path: &Path,
     byte_progress: Option<&RwLock<u64>>,
 ) -> Result<(), DownloadError> {
+    tracing::info!("Downloading entire file from peer...");
+
+    // Specify that we want to download the entire file.
     let file_offsets = DownloadOffsetState::new(0..file_size, None);
 
-    // Open the file for writing, ensuring it is empty.
+    // Open the file for writing, truncating if the file already exists.
     let mut file = tokio::fs::OpenOptions::new()
         .create(true)
         .truncate(true)

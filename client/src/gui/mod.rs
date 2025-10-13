@@ -537,14 +537,13 @@ impl AppState {
 
             // Handle the hash input being changed.
             Message::HashInputChanged(hash) => {
-                tracing::debug!("Hash input changed to {hash}");
                 if let ConnectionState::Connected(ConnectedState { hash_input, .. }) =
                     &mut self.connection_state
                 {
-                    tracing::debug!("Hash input changed to {hash}");
+                    tracing::debug!("Hash input changed to '{hash}'");
                     *hash_input = hash;
                 } else {
-                    tracing::warn!("Hash input changed to {hash} while not connected");
+                    tracing::warn!("Hash input changed to '{hash}' while not connected");
                 }
                 iced::Task::none()
             }
@@ -1595,6 +1594,17 @@ impl AppState {
             return iced::Task::none();
         };
 
+        // Ensure we don't publish the same file twice.
+        if let CreateOrExistingPublish::Create(p) = &publish {
+            if publishes.iter().any(|pi| pi.path.as_ref().eq(p.as_ref())) {
+                log_status_change::<LogWarnStatus>(
+                    &mut self.status_message,
+                    PUBLISH_PATH_EXISTS.to_owned(),
+                );
+                return iced::Task::none();
+            }
+        }
+
         let saving_hash = new_hash && file_size > 1_000_000_000; // If the file is larger than 1GB, save the hash to disk.
         if saving_hash {
             // Before saving the new hash to disk, create `last_publishes`.
@@ -1625,6 +1635,7 @@ impl AppState {
                 publishes.push(publish);
                 (nonce, cancellation_token, &publishes.last().unwrap().path)
             }
+
             CreateOrExistingPublish::Existing(nonce) => {
                 let publish = publishes.iter_mut().find(|p| p.nonce == nonce);
                 if let Some(publish) = publish {
@@ -1991,10 +2002,10 @@ impl AppState {
             );
             return iced::Task::none();
         }
-        if publishes.iter().any(|p| path.eq(p.path.as_ref())) {
+        if publishes.iter().any(|p| &path == p.path.as_ref()) {
             log_status_change::<LogWarnStatus>(
                 &mut self.status_message,
-                "Publish using this path already exists".to_owned(),
+                PUBLISH_PATH_EXISTS.to_owned(),
             );
             return iced::Task::none();
         }
@@ -3306,3 +3317,4 @@ enum CloseType {
 }
 
 const INVALID_PORT_FORWARD: &str = "Invalid port forward. Defaults to no port mappings";
+const PUBLISH_PATH_EXISTS: &str = "Publish using this path already exists";

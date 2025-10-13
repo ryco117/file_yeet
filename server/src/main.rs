@@ -601,7 +601,7 @@ async fn handle_subscribe(
 
     // Attempt to get the client from the map.
     let read_lock = clients.read().await;
-    let Some(client_list) = read_lock.get(&hash).filter(|v| !v.is_empty()) else {
+    let Some(client_list) = read_lock.get(&hash) else {
         tracing::debug!("Failed to find client for hash {hash}");
 
         // Send the subscriber a message that no publishers are available.
@@ -666,7 +666,9 @@ async fn handle_subscribe(
         .await
         .map_err(|e| ClientRequestError::IoError(e.into()))?;
 
-    if n != 0 {
+    if n == 0 {
+        tracing::debug!("No peers to introduce");
+    } else {
         tracing::debug!("Introduced {n} peers");
     }
 

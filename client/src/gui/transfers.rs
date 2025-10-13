@@ -74,6 +74,8 @@ impl TransferSnapshot {
     }
 
     /// Update the snapshot with the current progress.
+    /// Each successive call requires the `bytes_transferred` to be non-decreasing,
+    /// otherwise the speed will not be updated and a warning will be logged.
     pub fn update(&mut self, bytes_transferred: u64) {
         let byte_difference = bytes_transferred.checked_sub(self.bytes_transferred);
         self.bytes_transferred = bytes_transferred;
