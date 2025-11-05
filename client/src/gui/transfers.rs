@@ -18,6 +18,7 @@ use crate::{
         remove_nonce_for_peer, text_horizontal_scrollbar, timed_tooltip, CancelOrPause,
         CreateOrExistingPublish, Message, Nonce, PeerRequestStream, ERROR_RED_COLOR,
     },
+    intervals::FileIntervals,
 };
 
 /// The rate at which transfer speed text is updated.
@@ -30,7 +31,7 @@ pub enum DownloadResult {
     #[error("Transfer succeeded")]
     Success,
 
-    /// The transfer failed. Has bool indicating whether the failure is recoverable.
+    /// The transfer failed. Boolean field is `true` when the failure is recoverable.
     #[error("{0}")]
     Failure(Arc<String>, bool),
 
@@ -95,25 +96,60 @@ impl TransferSnapshot {
     }
 }
 
+/// A download from a single peer.
+#[derive(Debug)]
+pub struct DownloadSinglePeer {
+    pub peer_string: String,
+    pub peer: quinn::Connection,
+    pub progress_lock: Arc<RwLock<u64>>,
+}
+
+#[derive(Debug)]
+pub struct DownloadPartRange {
+    pub range: std::ops::Range<u64>,
+    pub progress_lock: Arc<RwLock<u64>>,
+}
+impl crate::intervals::RangeData for DownloadPartRange {
+    fn start(&self) -> u64 {
+        self.range.start
+    }
+    fn end(&self) -> u64 {
+        self.range.end
+    }
+}
+
+/// A download from multiple peers.
+#[derive(Debug)]
+pub struct DownloadMultiPeer {
+    pub peers: HashSet<quinn::Connection>,
+    pub intervals: FileIntervals<DownloadPartRange>,
+}
+
+/// The strategy used for the download transfer.
+#[derive(Debug)]
+pub enum DownloadStrategy {
+    SinglePeer(DownloadSinglePeer),
+    MultiPeer(DownloadMultiPeer),
+}
+
 /// The state of a download transfer with a peer.
 #[derive(Debug)]
 pub enum DownloadState {
     /// The transfer is awaiting a connection attempt.
     Connecting,
 
-    /// The transfer is awaiting user confirmation.
-    Consent(PeerRequestStream),
+    /// The transfer is awaiting user confirmation with a list of connected peers.
+    Consent(nonempty::NonEmpty<PeerRequestStream>),
 
     /// The transfer is in progress.
     Transferring {
-        peer: quinn::Connection,
-        progress_lock: Arc<RwLock<u64>>,
+        strategy: DownloadStrategy,
         progress_animation: f32,
         snapshot: TransferSnapshot,
     },
 
     /// The transfer has been paused.
-    Paused(Option<SocketAddr>),
+    Paused(Option<FileIntervals<std::ops::Range<u64>>>),
 
     /// Resuming a download by hashing the partial file.
     ResumingHash(Arc<RwLock<f32>>),
@@ -124,16 +160,22 @@ pub enum DownloadState {
 impl DownloadState {
     /// If the progress state contains a peer connection, return it.
     /// Otherwise, return `None`.
-    pub fn connection(&self) -> Option<&quinn::Connection> {
+    pub fn connections(&self) -> Box<dyn std::iter::Iterator<Item = &quinn::Connection> + '_> {
         match self {
             // Connection in these states.
-            DownloadState::Consent(PeerRequestStream { connection, .. })
-            | DownloadState::Transferring {
-                peer: connection, ..
-            } => Some(connection),
+            DownloadState::Consent(peers) => Box::new(peers.iter().map(|p| &p.connection)),
+            DownloadState::Transferring {
+                strategy: DownloadStrategy::SinglePeer(DownloadSinglePeer { peer, .. }),
+                ..
+            } => Box::new(std::iter::once(peer)),
 
-            // No connection in remaining states.
-            _ => None,
+            DownloadState::Transferring {
+                strategy: DownloadStrategy::MultiPeer(DownloadMultiPeer { peers, .. }),
+                ..
+            } => Box::new(peers.iter()),
+
+            // No connections in the remaining states.
+            _ => Box::new(std::iter::empty()),
         }
     }
 }
@@ -176,8 +218,6 @@ pub struct TransferBase {
     pub hash: HashBytes,
     pub hash_hex: String,
     pub file_size: u64,
-    pub peer_string: String,
-    pub peer_socket: Option<SocketAddr>,
     pub path: Arc<PathBuf>,
     pub cancellation_token: CancellationToken,
 }
@@ -203,14 +243,24 @@ impl Transfer for DownloadTransfer {
     }
     fn update_animation(&mut self) {
         if let DownloadState::Transferring {
-            progress_lock,
+            strategy,
             progress_animation,
             snapshot,
             ..
         } = &mut self.progress
         {
-            // Update the progress bar with the most recent value.
-            let bytes_transferred = *progress_lock.blocking_read();
+            // Get the total bytes transferred at the current moment.
+            let bytes_transferred = match strategy {
+                DownloadStrategy::SinglePeer(DownloadSinglePeer { progress_lock, .. }) => {
+                    *progress_lock.blocking_read()
+                }
+                DownloadStrategy::MultiPeer(DownloadMultiPeer { intervals, .. }) => intervals
+                    .ranges()
+                    .iter()
+                    .fold(0u64, |acc, r| acc + *r.progress_lock.blocking_read()),
+            };
+
+            // Update the progress bar with the fraction of the file downloaded.
             *progress_animation = bytes_transferred as f32 / self.base.file_size as f32;
 
             // Update the transfer speed in human readable units.
@@ -285,12 +335,12 @@ impl Transfer for DownloadTransfer {
             .align_y(iced::Alignment::Center)
             .into(),
 
-            DownloadState::Paused(peer) => widget::row!(
+            DownloadState::Paused(_) => widget::row!(
                 "Download is paused",
                 widget::horizontal_space(),
                 tooltip_button(
                     "Resume",
-                    Message::ResumePausedDownload(self.base.nonce, *peer),
+                    Message::ResumePausedDownload(self.base.nonce),
                     "Attempt to resume the download",
                 ),
                 tooltip_button(
@@ -366,12 +416,8 @@ impl Transfer for DownloadTransfer {
                         DownloadResult::Failure(_, true) => {
                             Element::<Message>::from(
                                 widget::row!(
-                                    widget::button(widget::text("Retry").size(12)).on_press(
-                                        Message::ResumePausedDownload(
-                                            self.base.nonce,
-                                            self.base.peer_socket
-                                        )
-                                    ),
+                                    widget::button(widget::text("Retry").size(12))
+                                        .on_press(Message::ResumePausedDownload(self.base.nonce)),
                                     remove
                                 )
                                 .spacing(12),
@@ -384,6 +430,16 @@ impl Transfer for DownloadTransfer {
             }
         };
 
+        let peer_str = match &self.progress {
+            // Use the only active peer's string in single-peer downloads.
+            DownloadState::Transferring {
+                strategy: DownloadStrategy::SinglePeer(DownloadSinglePeer { peer_string, .. }),
+                ..
+            } => peer_string,
+
+            // Default to empty string for other states.
+            _ => "",
+        };
         widget::container(widget::column!(
             progress,
             widget::row!(
@@ -395,7 +451,7 @@ impl Transfer for DownloadTransfer {
                 ),
             ),
             widget::row!(
-                widget::text(&self.base.peer_string).size(12),
+                widget::text(peer_str).size(12),
                 widget::scrollable(
                     widget::text(self.base.path.to_string_lossy())
                         .size(12)
@@ -418,6 +474,7 @@ impl Transfer for DownloadTransfer {
 #[derive(Debug)]
 pub struct UploadTransfer {
     pub base: TransferBase,
+    pub peer_string: String,
     pub progress: UploadState,
 }
 impl Transfer for UploadTransfer {
@@ -512,7 +569,7 @@ impl Transfer for UploadTransfer {
                 ),
             ),
             widget::row!(
-                widget::text(&self.base.peer_string).size(12),
+                widget::text(&self.peer_string).size(12),
                 widget::scrollable(
                     widget::text(self.base.path.to_string_lossy())
                         .size(12)
@@ -544,18 +601,19 @@ pub fn update_download_result(
             // If the transfer result is cancelled, ignore it.
             // This is expected if the transfer was paused.
             if matches!(result, DownloadResult::Cancelled) {
-                tracing::debug!("Download was paused and then cancelled, expected race condition");
+                tracing::warn!("Download was paused and then cancelled, expected race condition");
                 return;
             }
         }
 
         // Handle a transfer that is already done.
         DownloadState::Done(done) => {
-            // If we are cancelling twice, ignore the second cancellation.
-            // Otherwise, this is an unexpected double-result.
-            if !matches!(result, DownloadResult::Cancelled)
-                || !matches!(done, DownloadResult::Cancelled)
+            // If we are cancelling twice, this is a more forgiveable double-result.
+            if matches!(result, DownloadResult::Cancelled)
+                && matches!(done, DownloadResult::Cancelled)
             {
+                tracing::debug!("Download already marked as cancelled");
+            } else {
                 tracing::warn!("Download already marked as done {done}");
             }
             return;
@@ -565,7 +623,7 @@ pub fn update_download_result(
     }
 
     // If the download was connected to a peer, remove the nonce from transactions.
-    if let Some(connection) = progress.connection() {
+    for connection in progress.connections() {
         remove_nonce_for_peer(connection, peers, nonce);
     }
 
@@ -582,9 +640,10 @@ pub fn update_upload_result(
 ) {
     // Handle a transfer that is already done.
     if let UploadState::Done(done) = progress {
-        // If we are cancelling twice, ignore the second cancellation.
-        // Otherwise, this is an unexpected double-result.
-        if !matches!(result, UploadResult::Cancelled) || !matches!(done, UploadResult::Cancelled) {
+        // If we are cancelling twice, this is a more forgiveable double-result.
+        if matches!(result, UploadResult::Cancelled) && matches!(done, UploadResult::Cancelled) {
+            tracing::debug!("Upload already marked as cancelled");
+        } else {
             tracing::warn!("Upload already marked as done {done}");
         }
         return;

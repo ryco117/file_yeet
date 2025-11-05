@@ -3,6 +3,14 @@ pub trait RangeData {
     fn start(&self) -> u64;
     fn end(&self) -> u64;
 }
+impl RangeData for std::ops::Range<u64> {
+    fn start(&self) -> u64 {
+        self.start
+    }
+    fn end(&self) -> u64 {
+        self.end
+    }
+}
 
 /// Errors that may occur when reading a subscriber address from the server.
 #[derive(Debug, thiserror::Error)]
@@ -22,9 +30,11 @@ pub enum AddIntervalError {
 }
 
 /// Helper for managing file intervals.
+#[derive(Clone, Debug)]
 pub struct FileIntervals<R: RangeData> {
     intervals: Vec<R>,
     total_size: u64,
+    remaining_size: u64,
 }
 impl<R: RangeData> FileIntervals<R> {
     /// Create a new multi-download progress tracker.
@@ -33,15 +43,17 @@ impl<R: RangeData> FileIntervals<R> {
         Self {
             intervals: Vec::new(),
             total_size,
+            remaining_size: total_size,
         }
     }
 
     /// Add a new interval to track.
     /// # Errors
     /// Returns an error if:
+    /// * the new interval has a size of zero
     /// * the new interval overlaps with any existing intervals
     /// * the new interval is out of bounds
-    /// * the new interval has a size of zero
+    ///
     /// The state is not modified on error.
     pub fn add_interval(&mut self, range: R) -> Result<(), AddIntervalError> {
         let range_start = range.start();
@@ -67,11 +79,13 @@ impl<R: RangeData> FileIntervals<R> {
         }
 
         self.intervals.insert(i, range);
+        self.remaining_size -= range_end - range_start;
         Ok(())
     }
 
     /// Get the next empty range available.
     /// Returns `None` if there are no gaps.
+    #[must_use]
     pub fn next_empty_range(&self) -> Option<std::ops::Range<u64>> {
         // Look through intervals for gaps.
         let mut last_end = 0;
@@ -87,6 +101,48 @@ impl<R: RangeData> FileIntervals<R> {
             return Some(last_end..self.total_size);
         }
         None
+    }
+
+    /// Convert the ranges to another type.
+    #[must_use]
+    pub fn convert_ranges<S, F>(self, f: F) -> FileIntervals<S>
+    where
+        S: RangeData,
+        F: Fn(R) -> S,
+    {
+        let Self {
+            intervals,
+            total_size,
+            remaining_size,
+        } = self;
+
+        // Map the intervals to the new type.
+        let intervals = intervals.into_iter().map(f).collect();
+
+        // TODO: Verify that the sorting and non-overlapping properties are preserved.
+        FileIntervals {
+            intervals,
+            total_size,
+            remaining_size,
+        }
+    }
+
+    /// Extract the ranges as a vector, consuming `self`.
+    #[must_use]
+    pub fn into_ranges(self) -> Vec<R> {
+        self.intervals
+    }
+
+    /// Get the intervals being managed.
+    #[must_use]
+    pub fn ranges(&self) -> &[R] {
+        &self.intervals
+    }
+
+    /// Get the remaining size to be downloaded.
+    #[must_use]
+    pub fn remaining_size(&self) -> u64 {
+        self.remaining_size
     }
 
     /// Get the total file size.

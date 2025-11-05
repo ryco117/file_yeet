@@ -43,7 +43,7 @@ impl HashBytes {
 impl std::fmt::Debug for HashBytes {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Hexadecimal requires 2 characters per byte.
-        let mut hex_str_bytes = [0u8; HASH_BYTE_COUNT << 1];
+        let mut hex_str_bytes = [0u8; 2 * HASH_BYTE_COUNT];
 
         // Encode the hash bytes into a hexadecimal string.
         let hex = faster_hex::hex_encode(&self.bytes, &mut hex_str_bytes)

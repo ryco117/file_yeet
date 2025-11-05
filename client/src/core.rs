@@ -30,9 +30,9 @@ pub static HASH_EXT_REGEX: std::sync::LazyLock<regex::Regex> = std::sync::LazyLo
 /// Use a sane default timeout for server connections.
 pub const SERVER_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
 /// Sane default timeout for listening for a peer.
-pub const PEER_LISTEN_TIMEOUT: Duration = Duration::from_secs(3);
+pub const PEER_LISTEN_TIMEOUT: Duration = Duration::from_millis(1500);
 /// Sane default timeout for peer connection attempts. Should try to connect for a longer time than listening.
-pub const PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
+pub const PEER_CONNECT_TIMEOUT: Duration = Duration::from_millis(2000);
 
 /// Define a sane number of maximum retries.
 pub const MAX_PEER_CONNECTION_ATTEMPTS: NonZeroUsize = NonZeroUsize::new(10).unwrap();
@@ -468,38 +468,38 @@ pub async fn port_override_request(
     Ok(())
 }
 
-/// Errors that may occur when sending an introduction request.
-#[derive(Debug, thiserror::Error)]
-pub enum IntroductionError {
-    /// Failed to establish a new QUIC stream for the introduction request.
-    #[error("{0}")]
-    Connection(#[from] quinn::ConnectionError),
+// /// Errors that may occur when sending an introduction request.
+// #[derive(Debug, thiserror::Error)]
+// pub enum IntroductionError {
+//     /// Failed to establish a new QUIC stream for the introduction request.
+//     #[error("{0}")]
+//     Connection(#[from] quinn::ConnectionError),
 
-    /// Failed to send the introduction request.
-    #[error("{0}")]
-    SendRequest(#[from] quinn::WriteError),
-}
+//     /// Failed to send the introduction request.
+//     #[error("{0}")]
+//     SendRequest(#[from] quinn::WriteError),
+// }
 
-/// Perform an introduction request to the server for a specific peer and hash.
-#[tracing::instrument(skip(server_connection, bb, external_address))]
-pub async fn introduction(
-    server_connection: &quinn::Connection,
-    bb: &mut bytes::BytesMut,
-    hash: HashBytes,
-    external_address: SocketAddr,
-) -> Result<(), IntroductionError> {
-    // Create a bi-directional stream to the server.
-    let mut server_streams: BiStream = server_connection.open_bi().await?.into();
+// /// Perform an introduction request to the server for a specific peer and hash.
+// #[tracing::instrument(skip(server_connection, bb, external_address))]
+// pub async fn introduction(
+//     server_connection: &quinn::Connection,
+//     bb: &mut bytes::BytesMut,
+//     hash: HashBytes,
+//     external_address: SocketAddr,
+// ) -> Result<(), IntroductionError> {
+//     // Create a bi-directional stream to the server.
+//     let mut server_streams: BiStream = server_connection.open_bi().await?.into();
 
-    // Send the server an introduction request.
-    bb.clear();
-    bb.put_u16(file_yeet_shared::ClientApiRequest::Introduction as u16);
-    bb.put(&hash.bytes[..]);
-    file_yeet_shared::write_ip_and_port(bb, external_address.ip(), external_address.port());
-    server_streams.send.write_all(bb).await?;
+//     // Send the server an introduction request.
+//     bb.clear();
+//     bb.put_u16(file_yeet_shared::ClientApiRequest::Introduction as u16);
+//     bb.put(&hash.bytes[..]);
+//     file_yeet_shared::write_ip_and_port(bb, external_address.ip(), external_address.port());
+//     server_streams.send.write_all(bb).await?;
 
-    Ok(())
-}
+//     Ok(())
+// }
 
 /// Errors that may occur when sending a publish request to the server.
 #[derive(Debug, thiserror::Error)]
@@ -927,7 +927,7 @@ pub async fn download_partial_from_peer(
 /// Reject a download request gracefully by sending a null download range to the peer.
 #[tracing::instrument(skip_all)]
 pub async fn reject_download_request(peer_streams: &mut BiStream) -> Result<(), DownloadError> {
-    // Send a null download range to the peer to reject the download request.
+    // Send a null download range to the peer to reject the download gracefully.
     let bytes = [0u8; size_of::<u64>() * 2];
     peer_streams.send.write_all(&bytes).await?;
 
@@ -1101,7 +1101,7 @@ pub async fn read_publish_range(
         None => Err(ReadPubRangeError::RangeOverflow),
         Some(end) => Ok(end),
     }?;
-    tracing::debug!("Peer requested upload range: {start_index}..{end_index} bytes");
+    tracing::info!("Peer requested upload range: {start_index}..{end_index} bytes");
 
     Ok((start_index, upload_length))
 }

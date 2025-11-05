@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, num::NonZeroU16, path::PathBuf};
+use std::{num::NonZeroU16, path::PathBuf};
 
 use file_yeet_shared::HashBytes;
 
@@ -18,13 +18,13 @@ impl SavedPublish {
     }
 }
 
-/// The elements of a saved download transfer with partial or no progress.
+/// The saveable information for a download transfer with partial or no progress.
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub struct SavedDownload {
     pub hash: HashBytes,
     pub file_size: u64,
-    pub peer_socket: Option<SocketAddr>,
     pub path: PathBuf,
+    pub intervals: Option<Vec<std::ops::Range<u64>>>,
 }
 
 /// The state of the port mapping options in the GUI.

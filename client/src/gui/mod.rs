@@ -27,11 +27,12 @@ use crate::{
     gui::{
         publish::{draw_publishes, Publish, PublishItem, PublishRequestResult, PublishState},
         transfers::{
-            update_download_result, update_upload_result, DownloadResult, DownloadState,
-            DownloadTransfer, Transfer, TransferBase, TransferSnapshot, UploadResult, UploadState,
-            UploadTransfer,
+            update_download_result, update_upload_result, DownloadMultiPeer, DownloadResult,
+            DownloadSinglePeer, DownloadState, DownloadStrategy, DownloadTransfer, Transfer,
+            TransferBase, TransferSnapshot, UploadResult, UploadState, UploadTransfer,
         },
     },
+    intervals::{FileIntervals, RangeData},
     settings::{
         load_settings, save_settings, AppSettings, PortMappingSetting, SavedDownload, SavedPublish,
     },
@@ -338,7 +339,7 @@ pub enum Message {
     SubscribePeersResult(Result<IncomingSubscribePeers, Arc<SubscribeError>>),
 
     /// A subscribe connection attempt was completed.
-    SubscribePeerConnectResulted(Nonce, Option<PeerRequestStream>),
+    SubscribePeerConnectResulted(Nonce, Vec<PeerRequestStream>),
 
     // A download was accepted, initiate the download.
     AcceptDownload(Nonce),
@@ -364,8 +365,8 @@ pub enum Message {
     /// Cancel or pause a transfer that is in-progress.
     CancelOrPauseTransfer(Nonce, FileYeetCommandType, CancelOrPause),
 
-    /// The resume button was pressed for a paused download.
-    ResumePausedDownload(Nonce, Option<SocketAddr>),
+    /// The resume button was pressed for a paused (or recoverable) download.
+    ResumePausedDownload(Nonce),
 
     /// A resume attempt to get a partial file hash completed.
     ResumeFromPartialHashFile(
@@ -612,7 +613,7 @@ impl AppState {
             Message::CancelOrPauseTransfer(nonce, transfer_type, cancel_or_pause) => {
                 self.update_cancel_or_pause(nonce, transfer_type, cancel_or_pause)
             }
-            Message::ResumePausedDownload(nonce, peer) => self.update_resume_paused(nonce, peer),
+            Message::ResumePausedDownload(nonce) => self.update_resume_paused(nonce),
             Message::ResumeFromPartialHashFile(nonce, result) => {
                 self.update_resume_partial_hash(nonce, result)
             }
@@ -1846,7 +1847,7 @@ impl AppState {
         let upload_nonce = rand::random();
         let progress_lock = Arc::new(RwLock::new(0));
         let cancellation_token = CancellationToken::new();
-        let peer_socket = peer.connection.remote_address();
+        let peer_string = peer.connection.remote_address().to_string();
         let requested_size = Arc::new(RwLock::new(None));
         uploads.push(UploadTransfer {
             base: TransferBase {
@@ -1854,11 +1855,10 @@ impl AppState {
                 hash: publishing.hash,
                 hash_hex: publishing.hash.to_string(),
                 file_size: publishing.file_size,
-                peer_string: peer_socket.to_string(),
-                peer_socket: Some(peer_socket),
                 path: path.clone(),
                 cancellation_token: cancellation_token.clone(),
             },
+            peer_string,
             progress: UploadState::Transferring {
                 peer: peer.connection.clone(),
                 progress_lock: progress_lock.clone(),
@@ -2050,28 +2050,51 @@ impl AppState {
             return iced::Task::none();
         };
 
-        let SavedDownload {
-            hash,
-            file_size,
-            peer_socket,
-            path,
-        } = saved_download;
+        // Get a unique nonce for this download.
         let nonce = rand::random();
+
+        // Extract the saved download information.
+        let (hash, file_size, path, saved_intervals) = {
+            let SavedDownload {
+                hash,
+                file_size,
+                path,
+                intervals,
+            } = saved_download;
+
+            let intervals = if let Some(intervals) = intervals {
+                // Recreate the file intervals from the saved ranges.
+                let mut file_intervals = FileIntervals::new(file_size);
+                for interval in intervals {
+                    if let Err(e) = file_intervals.add_interval(interval) {
+                        log_status_change::<LogErrorStatus>(
+                            &mut self.status_message,
+                            format!("Failed to recover partial download {hash}: {e}"),
+                        );
+                        return iced::Task::none();
+                    }
+                }
+                Some(file_intervals)
+            } else {
+                None
+            };
+
+            (hash, file_size, path, intervals)
+        };
+
         downloads.push(DownloadTransfer {
             base: TransferBase {
                 nonce,
                 hash,
-                hash_hex: saved_download.hash.to_string(),
+                hash_hex: hash.to_string(),
                 file_size,
-                peer_string: String::new(),
-                peer_socket: None,
                 path: Arc::new(path),
                 cancellation_token: CancellationToken::new(),
             },
-            progress: DownloadState::Paused(peer_socket),
+            progress: DownloadState::Paused(saved_intervals),
         });
 
-        iced::Task::done(Message::ResumePausedDownload(nonce, peer_socket))
+        iced::Task::done(Message::ResumePausedDownload(nonce))
     }
 
     /// Update after server has responded to a subscribe request.
@@ -2107,9 +2130,21 @@ impl AppState {
                 let hash_hex = faster_hex::hex_string(&hash.bytes);
                 let path = Arc::new(path);
 
+                // Group peers by file size.
+                let mut peers_by_size = HashMap::new();
+                for (peer, size) in peers_with_size {
+                    peers_by_size
+                        .entry(size)
+                        .and_modify(|v: &mut nonempty::NonEmpty<_>| v.push(peer))
+                        .or_insert_with(|| nonempty::nonempty![peer]);
+                }
+
                 // Create a new transfer state and connection attempt for each peer.
                 let transfers_commands_iter =
-                    peers_with_size.into_iter().map(|(peer, file_size)| {
+                    peers_by_size.into_iter().map(|(file_size, peers)| {
+                        // TODO: Support multi-downloads from multiple peers.
+                        let peer = *peers.first();
+
                         // Create a nonce to identify the transfer.
                         let nonce = rand::random();
                         let cancellation_token = CancellationToken::new();
@@ -2121,8 +2156,6 @@ impl AppState {
                                 hash,
                                 hash_hex: hash_hex.clone(),
                                 file_size,
-                                peer_string: peer.to_string(),
-                                peer_socket: Some(peer),
                                 path: path.clone(),
                                 cancellation_token: cancellation_token.clone(),
                             },
@@ -2160,7 +2193,7 @@ impl AppState {
                                 }
                             };
                             iced::Task::perform(future, move |r| {
-                                Message::SubscribePeerConnectResulted(nonce, r)
+                                Message::SubscribePeerConnectResulted(nonce, r.into_iter().collect())
                             })
                         };
 
@@ -2188,12 +2221,12 @@ impl AppState {
         }
     }
 
-    /// Update the state after a subscribe connection attempt to a peer completed.
+    /// Update the download state after connect attempts resulted with the given peers.
     #[tracing::instrument(skip(self, result))]
     fn update_subscribe_connect_resulted(
         &mut self,
         nonce: Nonce,
-        result: Option<PeerRequestStream>,
+        mut result: Vec<PeerRequestStream>,
     ) -> iced::Task<Message> {
         let ConnectionState::Connected(ConnectedState {
             peers, downloads, ..
@@ -2209,16 +2242,23 @@ impl AppState {
             .enumerate()
             .find(|(_, t)| t.base.nonce == nonce)
         else {
-            tracing::warn!("Subscribe connect resulted for unknown nonce");
+            tracing::error!("Subscribe connect resulted for unknown nonce");
             return iced::Task::none();
         };
 
         // Update the state of the transfer with the result.
-        if let Some(peer_request) = result {
+        for peer_request in &result {
             insert_nonce_for_peer(peer_request.connection.remote_address(), peers, nonce);
-            transfer.progress = DownloadState::Consent(peer_request);
+        }
+
+        if let Some(p) = result.pop() {
+            // Promise to update with a non-empty list of peers.
+            let peers = nonempty::NonEmpty::from((p, result));
+
+            // Update the transfer to await the user's confirmation.
+            transfer.progress = DownloadState::Consent(peers);
         } else {
-            // Remove unreachable peers from view.
+            // Remove this download entry since no connections are available.
             downloads.remove(index);
         }
         iced::Task::none()
@@ -2236,23 +2276,42 @@ impl AppState {
 
         // Get the current transfer status.
         let Some(transfer) = downloads.iter_mut().find(|t| t.base.nonce == nonce) else {
-            tracing::warn!("No transfer found to accept download");
+            log_status_change::<LogErrorStatus>(
+                &mut self.status_message,
+                "No transfer found to accept download".to_owned(),
+            );
             return iced::Task::none();
         };
+
+        // Extract the progress and replace with a temporary state of connecting.
+        let progress = std::mem::replace(&mut transfer.progress, DownloadState::Connecting);
+
+        // Get necessary info for the download.
         let hash = transfer.base.hash;
         let file_size = transfer.base.file_size;
-        let peer_streams = if let DownloadState::Consent(p) = &mut transfer.progress {
-            p.clone()
-        } else {
-            tracing::warn!("Transfer is not in consent state");
+        let DownloadState::Consent(peer_streams) = progress else {
+            log_status_change::<LogErrorStatus>(
+                &mut self.status_message,
+                "Transfer is not in consent state".to_owned(),
+            );
+
+            // Revert the progress state back since we cannot proceed.
+            transfer.progress = progress;
+
             return iced::Task::none();
         };
+
+        // TODO: Support multi-downloads from multiple peers.
+        let peer_streams = peer_streams.head;
 
         // Begin the transfer.
         let byte_progress = Arc::new(RwLock::new(0));
         transfer.progress = DownloadState::Transferring {
-            peer: peer_streams.connection.clone(),
-            progress_lock: byte_progress.clone(),
+            strategy: DownloadStrategy::SinglePeer(DownloadSinglePeer {
+                peer_string: peer_streams.connection.remote_address().to_string(),
+                peer: peer_streams.connection.clone(),
+                progress_lock: byte_progress.clone(),
+            }),
             progress_animation: 0.,
             snapshot: TransferSnapshot::new(),
         };
@@ -2262,17 +2321,17 @@ impl AppState {
 
         // Remove all downloads to the same path when accepting this one.
         downloads.retain(|d| {
-            if d.base.path != path
-                || !matches!(
+            if d.base.path == path
+                && d.base.nonce != nonce
+                && matches!(
                     d.progress,
-                    DownloadState::Consent(_) | DownloadState::Connecting
+                    DownloadState::Connecting | DownloadState::Consent(_)
                 )
-                || d.base.nonce == nonce
             {
-                true
-            } else {
                 d.base.cancellation_token.cancel();
                 false
+            } else {
+                true
             }
         });
 
@@ -2332,7 +2391,7 @@ impl AppState {
         download.base.cancellation_token.cancel();
 
         // Remove the nonce from the peer's transactions.
-        if let Some(connection) = download.progress.connection() {
+        for connection in download.progress.connections() {
             remove_nonce_for_peer(connection, peers, nonce);
         }
 
@@ -2350,8 +2409,14 @@ impl AppState {
             let DownloadState::Consent(r) = download.progress else {
                 return;
             };
-            let mut bi_stream_lock = r.bistream.lock().await;
-            let _ = crate::core::reject_download_request(&mut bi_stream_lock).await;
+
+            // Reject the download request on all peer streams.
+            let reject_futures = r.into_iter().map(|peer| async move {
+                let mut bi_stream = peer.bistream.lock().await;
+                let _ = crate::core::reject_download_request(&mut bi_stream).await;
+            });
+
+            futures_util::future::join_all(reject_futures).await;
         })
         .discard()
     }
@@ -2516,7 +2581,7 @@ impl AppState {
                                 tracing::debug!("Cancelled download {}", t.base.hash_hex);
 
                                 // If the transfer was connected to a peer, remove the nonce from transactions
-                                if let Some(connection) = t.progress.connection() {
+                                for connection in t.progress.connections() {
                                     remove_nonce_for_peer(connection, peers, nonce);
                                 }
 
@@ -2525,11 +2590,34 @@ impl AppState {
                             }
                             CancelOrPause::Pause => {
                                 tracing::debug!("Paused download {}", t.base.hash_hex);
-                                let peer = t
-                                    .progress
-                                    .connection()
-                                    .map(quinn::Connection::remote_address);
-                                t.progress = DownloadState::Paused(peer);
+
+                                // Default to no saved intervals.
+                                let progress =
+                                    std::mem::replace(&mut t.progress, DownloadState::Paused(None));
+                                let intervals = match progress {
+                                    // Retain existing paused intervals. This shouldn't happen ever.
+                                    DownloadState::Paused(intervals) => {
+                                        tracing::error!("Download is already paused");
+                                        intervals
+                                    }
+
+                                    // Get the currently saved intervals for this download.
+                                    DownloadState::Transferring {
+                                        strategy:
+                                            DownloadStrategy::MultiPeer(DownloadMultiPeer {
+                                                intervals,
+                                                ..
+                                            }),
+                                        ..
+                                    } => Some(intervals.convert_ranges(|r| {
+                                        let start = r.start();
+                                        start..start + *r.progress_lock.blocking_read()
+                                    })),
+
+                                    // Already set to `None`, return.
+                                    _ => return,
+                                };
+                                t.progress = DownloadState::Paused(intervals);
                             }
                         }
                     })
@@ -2567,12 +2655,8 @@ impl AppState {
     }
 
     /// Update the state to resume a paused transfer.
-    #[tracing::instrument(skip(self, peer))]
-    fn update_resume_paused(
-        &mut self,
-        nonce: Nonce,
-        peer: Option<SocketAddr>,
-    ) -> iced::Task<Message> {
+    #[tracing::instrument(skip(self))]
+    fn update_resume_paused(&mut self, nonce: Nonce) -> iced::Task<Message> {
         let ConnectionState::Connected(ConnectedState {
             endpoint,
             server,
@@ -2615,43 +2699,9 @@ impl AppState {
 
             // Get the list of peers to resume the download from.
             let mut bb = bytes::BytesMut::with_capacity(MAX_PEER_COMMUNICATION_SIZE);
-            let mut peers = crate::core::subscribe(&server, &mut bb, hash, Some(external_address))
+            let peers = crate::core::subscribe(&server, &mut bb, hash, Some(external_address))
                 .await
                 .map_err(|e| Some(Arc::new(e.into())))?;
-
-            // Try to connect to the previous peer first if one was provided and they are still
-            // publishing the hash.
-            if let Some(peer) = peer {
-                if cfg!(debug_assertions) {
-                    tracing::debug!("Resuming with preferred peer: {peer}");
-                } else {
-                    tracing::debug!("Resuming with a preferred peer");
-                }
-
-                // Find the previous connection for resuming.
-                if let Some(i) = peers
-                    .iter()
-                    .position(|(p, f)| peer.eq(p) && *f == final_file_size)
-                {
-                    // No need for introduction if the peer is already in the list.
-                    // Ensure the peer is at the front of the list.
-                    if i != 0 {
-                        peers.swap(0, i);
-                    }
-                } else if let Some(e) = crate::core::introduction(&server, &mut bb, hash, peer)
-                    .await
-                    .err()
-                {
-                    tracing::warn!("Failed to receive introduction with peer {peer}: {e}");
-                } else {
-                    // Attempt to connect to the original peer first.
-                    let i = peers.len();
-                    peers.push((peer, final_file_size));
-                    if i != 0 {
-                        peers.swap(0, i);
-                    }
-                }
-            }
 
             // Get a request stream to the peer to resume the download.
             let request = first_matching_download(&endpoint, &peers, hash, final_file_size)
@@ -2705,8 +2755,11 @@ impl AppState {
                 let progress = Arc::new(RwLock::new(start_index));
                 let progress_animation = start_index as f32 / t.base.file_size as f32;
                 t.progress = DownloadState::Transferring {
-                    peer: request.connection.clone(),
-                    progress_lock: progress.clone(),
+                    strategy: DownloadStrategy::SinglePeer(DownloadSinglePeer {
+                        peer_string: request.connection.remote_address().to_string(),
+                        peer: request.connection.clone(),
+                        progress_lock: progress.clone(),
+                    }),
                     progress_animation,
                     snapshot: TransferSnapshot::new(),
                 };
@@ -2885,20 +2938,35 @@ impl AppState {
                     d.base.cancellation_token.cancel();
 
                     // Ensure all downloads that were in-progress are saved.
-                    let peer_socket = match d.progress {
-                        DownloadState::Transferring { peer, .. } => Some(peer.remote_address()),
-                        DownloadState::Paused(peer) => peer,
-                        DownloadState::ResumingHash(_)
+                    let intervals = match d.progress {
+                        // States where no save progress is available or needed.
+                        DownloadState::Transferring {
+                            strategy: DownloadStrategy::SinglePeer(_),
+                            ..
+                        }
+                        | DownloadState::ResumingHash(_)
                         | DownloadState::Done(DownloadResult::Failure(_, true)) => None,
+
+                        // States where saved intervals are available.
+                        DownloadState::Paused(intervals) => intervals,
+                        DownloadState::Transferring {
+                            strategy:
+                                DownloadStrategy::MultiPeer(DownloadMultiPeer { intervals, .. }),
+                            ..
+                        } => Some(intervals.convert_ranges(|r| {
+                            let start = r.start();
+                            start..start + *r.progress_lock.blocking_read()
+                        })),
 
                         // In other cases, do not save the download.
                         _ => return None,
-                    };
+                    }
+                    .map(FileIntervals::into_ranges);
                     Some(SavedDownload {
                         hash: d.base.hash,
                         file_size: d.base.file_size,
-                        peer_socket,
                         path: d.base.path.as_ref().clone(),
+                        intervals,
                     })
                 }));
 
@@ -2973,8 +3041,9 @@ impl LogStatusLevel for LogWarnStatus {
 }
 
 /// Helper to log an error that we assign to the status message.
-/// This helper assumes that the error string is non-empty.
+/// This helper assumes that the status string is non-empty.
 fn log_status_change<L: LogStatusLevel>(status_message: &mut Option<String>, status: String) {
+    // TODO: Store a log history in the GUI state to allow for GUI users to see all failures.
     L::log_status(&status);
     *status_message = Some(status);
 }
