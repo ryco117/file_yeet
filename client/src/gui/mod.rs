@@ -2217,7 +2217,7 @@ impl AppState {
                     // Let the user know why nothing else is happening.
                     log_status_change::<LogWarnStatus>(
                         &mut self.status_message,
-                        "No peers available".to_owned(),
+                        format!("No peers available for {hash}"),
                         &mut self.status_message_history,
                     );
                     return iced::Task::none();
