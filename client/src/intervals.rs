@@ -103,9 +103,10 @@ impl<R: RangeData> FileIntervals<R> {
         None
     }
 
-    /// Convert the ranges to another type.
-    #[must_use]
-    pub fn convert_ranges<S, F>(self, f: F) -> FileIntervals<S>
+    /// Convert the ranges to another type. Safely filters out zero-size ranges.
+    /// # Errors
+    /// Returns an error if adding any of the converted ranges fails.
+    pub fn convert_ranges<S, F>(self, f: F) -> Result<FileIntervals<S>, AddIntervalError>
     where
         S: RangeData,
         F: Fn(R) -> S,
@@ -113,18 +114,19 @@ impl<R: RangeData> FileIntervals<R> {
         let Self {
             intervals,
             total_size,
-            remaining_size,
+            ..
         } = self;
 
         // Map the intervals to the new type.
-        let intervals = intervals.into_iter().map(f).collect();
-
-        // TODO: Verify that the sorting and non-overlapping properties are preserved.
-        FileIntervals {
-            intervals,
-            total_size,
-            remaining_size,
+        let mut new_intervals = FileIntervals::new(total_size);
+        for range in intervals.into_iter().map(f) {
+            match new_intervals.add_interval(range) {
+                Ok(()) | Err(AddIntervalError::ZeroSize(_, _)) => {}
+                Err(e) => return Err(e),
+            }
         }
+
+        Ok(new_intervals)
     }
 
     /// Extract the ranges as a vector, consuming `self`.

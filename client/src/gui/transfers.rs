@@ -43,11 +43,11 @@ pub enum DownloadResult {
 /// The result of a file upload with a peer.
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum UploadResult {
-    /// The transfer succeeded.
+    /// The transfer succeeded at uploading the specified range.
     #[error("Transfer succeeded")]
-    Success,
+    Success(std::ops::Range<u64>),
 
-    /// The transfer failed.
+    /// The transfer failed with the specified error message.
     #[error("{0}")]
     Failure(Arc<String>),
 
@@ -59,8 +59,13 @@ pub enum UploadResult {
 /// The progress of a file transfer at a moment in time.
 #[derive(Clone, Debug)]
 pub struct TransferSnapshot {
+    /// The instant at which the snapshot was taken.
     instant: Instant,
+
+    /// The total number of bytes transferred at the last update.
     bytes_transferred: u64,
+
+    /// A human readable string representing the current transfer speed.
     human_readable: String,
 }
 impl TransferSnapshot {
@@ -516,45 +521,50 @@ impl Transfer for UploadTransfer {
             )
         };
 
-        // Try to get a transfer rate string or None.
-        let rate = match &self.progress {
-            UploadState::Transferring { snapshot, .. } => Some(snapshot.human_readable.clone()),
-            UploadState::Done(_) => None,
-        };
-
-        let progress = match &self.progress {
+        let (progress, rate_or_size) = match &self.progress {
             UploadState::Transferring {
                 progress_animation: p,
+                snapshot,
                 ..
-            } => widget::row!(
-                "Transferring...",
-                widget::progress_bar(0.0..=1., *p).height(24),
-                tooltip_button(
-                    "Cancel",
-                    Message::CancelOrPauseTransfer(
-                        self.base.nonce,
-                        FileYeetCommandType::Pub,
-                        CancelOrPause::Cancel,
+            } => {
+                let progress = widget::row!(
+                    "Transferring...",
+                    widget::progress_bar(0.0..=1., *p).height(24),
+                    tooltip_button(
+                        "Cancel",
+                        Message::CancelOrPauseTransfer(
+                            self.base.nonce,
+                            FileYeetCommandType::Pub,
+                            CancelOrPause::Cancel,
+                        ),
+                        "Cancel the upload. The peer may attempt to recover the transfer later",
                     ),
-                    "Cancel the upload. The peer may attempt to recover the transfer later",
-                ),
-            )
-            .spacing(6)
-            .align_y(iced::Alignment::Center),
+                )
+                .spacing(6)
+                .align_y(iced::Alignment::Center);
 
-            UploadState::Done(r) => {
+                (progress, snapshot.human_readable.clone())
+            }
+
+            UploadState::Done(result) => {
                 let remove = tooltip_button(
                     "Remove",
                     Message::RemoveFromTransfers(self.base.nonce, FileYeetCommandType::Pub),
                     "Remove from list, file is untouched",
                 );
-                let result_text = widget::text(r.to_string())
+                let text_string = if let UploadResult::Success(r) = result {
+                    humanize_bytes(r.end - r.start)
+                } else {
+                    String::new()
+                };
+                let result_text = widget::text(result.to_string())
                     .width(iced::Length::Fill)
-                    .color_maybe(match r {
+                    .color_maybe(match result {
                         UploadResult::Failure(_) => Some(ERROR_RED_COLOR),
                         _ => None,
                     });
-                widget::row!(result_text, remove,)
+
+                (widget::row!(result_text, remove), text_string)
             }
         };
 
@@ -563,10 +573,7 @@ impl Transfer for UploadTransfer {
             widget::row!(
                 widget::text(&self.base.hash_hex).size(12),
                 widget::horizontal_space(),
-                rate.map_or_else(
-                    || widget::horizontal_space().into(),
-                    |r| Element::from(widget::text(r).size(12)),
-                ),
+                Element::from(widget::text(rate_or_size).size(12)),
             ),
             widget::row!(
                 widget::text(&self.peer_string).size(12),
@@ -601,14 +608,14 @@ pub fn update_download_result(
             // If the transfer result is cancelled, ignore it.
             // This is expected if the transfer was paused.
             if matches!(result, DownloadResult::Cancelled) {
-                tracing::warn!("Download was paused and then cancelled, expected race condition");
+                tracing::debug!("Download was paused and then cancelled, expected race condition");
                 return;
             }
         }
 
         // Handle a transfer that is already done.
         DownloadState::Done(done) => {
-            // If we are cancelling twice, this is a more forgiveable double-result.
+            // If we are cancelling twice, this is a more forgivable double-result.
             if matches!(result, DownloadResult::Cancelled)
                 && matches!(done, DownloadResult::Cancelled)
             {
@@ -640,7 +647,7 @@ pub fn update_upload_result(
 ) {
     // Handle a transfer that is already done.
     if let UploadState::Done(done) = progress {
-        // If we are cancelling twice, this is a more forgiveable double-result.
+        // If we are cancelling twice, this is a more forgivable double-result.
         if matches!(result, UploadResult::Cancelled) && matches!(done, UploadResult::Cancelled) {
             tracing::debug!("Upload already marked as cancelled");
         } else {

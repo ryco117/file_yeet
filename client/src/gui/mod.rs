@@ -9,6 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use circular_buffer::CircularBuffer;
 use file_yeet_shared::{
     BiStream, HashBytes, ReadIpPortError, DEFAULT_PORT, GOODBYE_CODE, GOODBYE_MESSAGE,
     MAX_SERVER_COMMUNICATION_SIZE,
@@ -16,6 +17,7 @@ use file_yeet_shared::{
 use iced::{widget, window, Element};
 use tokio::{io::AsyncWriteExt as _, sync::RwLock};
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument as _;
 
 use crate::{
     core::{
@@ -68,6 +70,9 @@ pub static EMOJI_FONT: &[u8] = include_bytes!("../../NotoEmoji-Regular.ttf");
 
 /// The delay of mouse inactivity before showing tooltips.
 const TOOLTIP_WAIT_DURATION: Duration = Duration::from_millis(400);
+
+/// The maximum number of lines to keep in the status message history.
+const MAX_LOG_HISTORY_LINES: usize = 256;
 
 /// A peer connection representing a single request/command.
 /// Peers may have multiple connections to the same peer for different requests.
@@ -242,8 +247,11 @@ pub struct AppState {
     connection_state: ConnectionState,
     options: AppSettings,
     status_message: Option<String>,
+    status_message_history: CircularBuffer<MAX_LOG_HISTORY_LINES, String>,
+    status_logs_visible: bool,
     modal: bool,
     safely_closing: bool,
+    save_on_exit: bool,
     port_mapping: Option<crab_nat::PortMapping>,
     main_window: Option<window::Id>,
     last_mouse_move: Option<Instant>,
@@ -275,6 +283,9 @@ pub enum Message {
 
     /// A moment in time has passed, update the animations.
     AnimationTick,
+
+    /// Toggle showing the status message history.
+    ToggleStatusHistory,
 
     /// The result of a server connection attempt.
     ConnectResulted(Result<crate::core::PreparedConnection, Arc<PrepareConnectionError>>),
@@ -398,6 +409,7 @@ impl AppState {
     /// Create a new application state.
     pub fn new(args: crate::Cli) -> (Self, iced::Task<Message>) {
         let mut status_message = None;
+        let mut status_message_history = CircularBuffer::new();
 
         // Get base settings from the settings file, or default.
         // If there is an error, show the error message and use default settings.
@@ -405,6 +417,7 @@ impl AppState {
             log_status_change::<LogErrorStatus>(
                 &mut status_message,
                 format!("Failed to load settings: {e}"),
+                &mut status_message_history,
             );
             AppSettings::default()
         });
@@ -486,12 +499,14 @@ impl AppState {
             Message::ServerAddressChanged(address) => {
                 tracing::debug!("Server address changed to {address}");
                 self.options.server_address = address;
+                self.save_on_exit = true;
                 iced::Task::none()
             }
 
             Message::InternalPortTextChanged(text) => {
                 tracing::debug!("Internal port text changed to {text}");
                 self.options.internal_port_text = text;
+                self.save_on_exit = true;
                 iced::Task::none()
             }
             Message::PortMappingRadioChanged(selection) => {
@@ -501,6 +516,7 @@ impl AppState {
             Message::GatewayTextChanged(text) => self.update_gateway_text(text),
             Message::ConnectClicked => self.update_connect_clicked(),
             Message::AnimationTick => self.update_animation_tick(),
+            Message::ToggleStatusHistory => self.update_show_status_logs(),
             Message::ConnectResulted(r) => self.update_connect_resulted(r),
             Message::PortMappingUpdated(mapping) => self.update_port_mapping(mapping),
 
@@ -554,7 +570,7 @@ impl AppState {
                 tracing::debug!("Publish button clicked");
 
                 // Clear the status message before starting the publish attempt.
-                self.status_message = None;
+                self.clear_status_message();
 
                 // Let state know that a modal dialog is open.
                 self.modal = true;
@@ -627,6 +643,7 @@ impl AppState {
                     log_status_change::<LogErrorStatus>(
                         &mut self.status_message,
                         format!("Failed to open file: {e}"),
+                        &mut self.status_message_history,
                     );
                 });
                 iced::Task::none()
@@ -687,8 +704,6 @@ impl AppState {
     /// Listen for events that should be translated into messages.
     #[tracing::instrument(skip(self))]
     pub fn subscription(&self) -> iced::Subscription<Message> {
-        use tracing::Instrument;
-
         // Listen for runtime events that iced did not handle internally. Used for safe exit handling.
         fn unhandled_events() -> iced::Subscription<Message> {
             iced::event::listen_with(|event, status, window| match status {
@@ -867,41 +882,78 @@ impl AppState {
             .unwrap_or_default();
 
         // Create a different top-level page based on the connection state.
-        let page: Element<Message> = match &self.connection_state {
-            // Display a prompt for the server address when disconnected.
-            ConnectionState::Disconnected => self.view_disconnected_page(),
+        let page: Element<Message> = if self.status_logs_visible {
+            let content = widget::column(self.status_message_history.iter().map(|t| {
+                widget::text(t)
+                    .color(ERROR_RED_COLOR)
+                    .align_y(iced::alignment::Vertical::Bottom)
+                    .into()
+            }))
+            .spacing(6);
+            widget::column![
+                widget::vertical_space(),
+                widget::scrollable(content)
+                    .spacing(0)
+                    .width(iced::Length::Fill)
+            ]
+            .into()
+        } else {
+            match &self.connection_state {
+                // Display a prompt for the server address when disconnected.
+                ConnectionState::Disconnected => self.view_disconnected_page(),
 
-            // Display a spinner while connecting/stalling.
-            &ConnectionState::Stalling { start, tick } => {
-                if self.safely_closing {
-                    widget::column!(
-                        Self::view_connecting_page(start, tick, MAX_SHUTDOWN_WAIT),
-                        widget::text("Closing... Pressing close a second time will cancel safety operations.").size(24),
-                        widget::vertical_space(),
-                    ).align_x(iced::Alignment::Center).into()
-                } else {
-                    Self::view_connecting_page(start, tick, SERVER_CONNECTION_TIMEOUT)
+                // Display a spinner while connecting/stalling.
+                &ConnectionState::Stalling { start, tick } => {
+                    if self.safely_closing {
+                        widget::column!(
+                            Self::view_connecting_page(start, tick, MAX_SHUTDOWN_WAIT),
+                            widget::text("Closing, please wait...").size(24),
+                            widget::text(
+                                "Pressing close a second time will cancel safety operations."
+                            )
+                            .size(16),
+                            widget::vertical_space(),
+                        )
+                        .spacing(4)
+                        .align_x(iced::Alignment::Center)
+                        .into()
+                    } else {
+                        Self::view_connecting_page(start, tick, SERVER_CONNECTION_TIMEOUT)
+                    }
                 }
-            }
 
-            // Display the main application controls when connected.
-            ConnectionState::Connected(connected_state) => {
-                self.view_connected_page(connected_state, &mouse_move_elapsed)
+                // Display the main application controls when connected.
+                ConnectionState::Connected(connected_state) => {
+                    self.view_connected_page(connected_state, &mouse_move_elapsed)
+                }
             }
         };
 
         // Always display the status bar at the bottom.
-        let status_bar = widget::container(if let Some(status_message) = &self.status_message {
-            Element::from(
-                widget::text(status_message)
-                    .color(ERROR_RED_COLOR)
-                    .width(iced::Length::Fill)
-                    .height(iced::Length::Shrink),
+        let status_bar = widget::row![
+            if let Some(status_message) = &self.status_message {
+                Element::from(
+                    widget::text(status_message)
+                        .color(ERROR_RED_COLOR)
+                        .width(iced::Length::Fill)
+                        .height(iced::Length::Shrink),
+                )
+            } else {
+                widget::horizontal_space().into()
+            },
+            timed_tooltip(
+                widget::button("Status History").on_press_maybe(
+                    (!self.status_message_history.is_empty() || self.status_logs_visible)
+                        .then_some(Message::ToggleStatusHistory)
+                ),
+                "Toggle visibility of the status history. Disabled if the history is empty",
+                &mouse_move_elapsed,
             )
-        } else {
-            widget::horizontal_space().into()
-        });
-        widget::column!(page, status_bar).padding(6).into()
+        ];
+        widget::column!(page, horizontal_line(), status_bar)
+            .spacing(4)
+            .padding(6)
+            .into()
     }
 
     /// Prefer a dark theme.
@@ -917,7 +969,8 @@ impl AppState {
             &self.options.server_address,
         );
 
-        let mut connect_button = widget::button("Connect");
+        let connect_button = widget::button("Connect")
+            .on_press_maybe((!self.modal).then_some(Message::ConnectClicked));
         let mut internal_port_text = widget::text_input(
             "E.g., 12345. Leave empty to use any available port",
             &self.options.internal_port_text,
@@ -929,7 +982,6 @@ impl AppState {
             server_address = server_address
                 .on_input(Message::ServerAddressChanged)
                 .on_submit(Message::ConnectClicked);
-            connect_button = connect_button.on_press(Message::ConnectClicked);
 
             internal_port_text = internal_port_text.on_input(Message::InternalPortTextChanged);
             if let PortMappingSetting::PortForwarding(_) = &self.options.port_mapping {
@@ -1007,8 +1059,6 @@ impl AppState {
         tick: Instant,
         max_duration: Duration,
     ) -> iced::Element<'a, Message> {
-        // TODO: Update progress value on a timer. This is necessary because of how `iced` does
-        // differencing on the state for redraws.
         let fraction_waited = (tick - start)
             .as_secs_f32()
             .div(max_duration.as_secs_f32())
@@ -1041,12 +1091,7 @@ impl AppState {
         connected_state: &'a ConnectedState,
         mouse_move_elapsed: &Duration,
     ) -> iced::Element<'a, Message> {
-        /// Helper for creating a horizontal line.
-        fn horizontal_line<'c>() -> iced::Element<'c, Message> {
-            widget::horizontal_rule(3).into()
-        }
-
-        // Define the elements that we want to be modal aware first.
+        // Define the elements that we want to be modal-aware first.
         let mut publish_button = widget::button("Publish");
         let mut download_button = widget::button("Download");
         let mut hash_text_input = widget::text_input("Hash", &connected_state.hash_input);
@@ -1073,7 +1118,7 @@ impl AppState {
         );
         let download_button = timed_tooltip(
             download_button,
-            "Download file with specified hash",
+            "Download file with specified hash. Disabled if the hash is invalid",
             mouse_move_elapsed,
         );
         let leave_server_button = timed_tooltip(
@@ -1177,7 +1222,7 @@ impl AppState {
         )
         .width(iced::Length::Fill)
         .height(iced::Length::Fill)
-        .padding(12)
+        .padding(6)
         .into()
     }
 
@@ -1187,7 +1232,7 @@ impl AppState {
         tracing::debug!("Port radio UI changed");
         self.options.port_mapping = match selection {
             PortMappingSetting::None => {
-                self.status_message = None;
+                self.clear_status_message();
                 PortMappingSetting::None
             }
             PortMappingSetting::PortForwarding(_) => PortMappingSetting::PortForwarding({
@@ -1200,15 +1245,19 @@ impl AppState {
                     log_status_change::<LogWarnStatus>(
                         &mut self.status_message,
                         format!("{INVALID_PORT_FORWARD}: {e}"),
+                        &mut self.status_message_history,
                     );
+                } else {
+                    self.clear_status_message();
                 }
                 o.ok()
             }),
             PortMappingSetting::TryPcpNatPmp => {
-                self.status_message = None;
+                self.clear_status_message();
                 PortMappingSetting::TryPcpNatPmp
             }
         };
+        self.save_on_exit = true;
         iced::Task::none()
     }
 
@@ -1226,17 +1275,19 @@ impl AppState {
             {
                 Ok(p) => {
                     *port = Some(p);
-                    self.status_message = None;
+                    self.clear_status_message();
                 }
                 Err(e) => {
                     *port = None;
                     log_status_change::<LogWarnStatus>(
                         &mut self.status_message,
                         format!("{INVALID_PORT_FORWARD}: {e}"),
+                        &mut self.status_message_history,
                     );
                 }
             }
         }
+        self.save_on_exit = true;
         iced::Task::none()
     }
 
@@ -1249,6 +1300,7 @@ impl AppState {
         } else {
             self.options.gateway_address = Some(text);
         }
+        self.save_on_exit = true;
         iced::Task::none()
     }
 
@@ -1258,7 +1310,7 @@ impl AppState {
         tracing::debug!("Connect button clicked");
 
         // Clear the status message before starting the connection attempt.
-        self.status_message = None;
+        self.clear_status_message();
 
         // Determine if a valid server address was entered.
         let regex_match = if self.options.server_address.trim().is_empty() {
@@ -1299,6 +1351,7 @@ impl AppState {
             log_status_change::<LogWarnStatus>(
                 &mut self.status_message,
                 "Invalid server address".to_owned(),
+                &mut self.status_message_history,
             );
             return iced::Task::none();
         };
@@ -1314,6 +1367,7 @@ impl AppState {
                 log_status_change::<LogWarnStatus>(
                     &mut self.status_message,
                     "Invalid internal port".to_owned(),
+                    &mut self.status_message_history,
                 );
                 return iced::Task::none();
             }
@@ -1382,6 +1436,12 @@ impl AppState {
         iced::Task::none()
     }
 
+    /// Update the state to show or hide the status logs.
+    fn update_show_status_logs(&mut self) -> iced::Task<Message> {
+        self.status_logs_visible = !self.status_logs_visible;
+        iced::Task::none()
+    }
+
     /// Update the state after a connection attempt to the server completed.
     fn update_connect_resulted(
         &mut self,
@@ -1438,6 +1498,7 @@ impl AppState {
                 log_status_change::<LogErrorStatus>(
                     &mut self.status_message,
                     format!("Error connecting: {e}"),
+                    &mut self.status_message_history,
                 );
                 self.connection_state = ConnectionState::Disconnected;
             }
@@ -1517,6 +1578,7 @@ impl AppState {
                     log_status_change::<LogWarnStatus>(
                         &mut self.status_message,
                         "File is already being published".to_owned(),
+                        &mut self.status_message_history,
                     );
                     return iced::Task::none();
                 }
@@ -1601,6 +1663,7 @@ impl AppState {
                 log_status_change::<LogWarnStatus>(
                     &mut self.status_message,
                     PUBLISH_PATH_EXISTS.to_owned(),
+                    &mut self.status_message_history,
                 );
                 return iced::Task::none();
             }
@@ -1661,16 +1724,22 @@ impl AppState {
                 log_status_change::<LogErrorStatus>(
                     &mut self.status_message,
                     format!("Failed to save settings: {e}"),
+                    &mut self.status_message_history,
                 );
+                self.save_on_exit = true;
             } else {
                 tracing::debug!("Settings saved after hashing file");
+                self.save_on_exit = false;
             }
+        } else if new_hash {
+            // Mark that the change in publishes needs to be saved.
+            self.save_on_exit = true;
         }
 
         let server = server.clone();
         iced::Task::perform(
             async move {
-                tracing::debug!("Attempting to publish file with known hash");
+                tracing::info!("Attempting to publish file");
                 tokio::select! {
                     // Allow cancelling the publish request thread.
                     () = cancellation_token.cancelled() => PublishRequestResult::Cancelled,
@@ -1686,7 +1755,7 @@ impl AppState {
                         }
                     } => r,
                 }
-            },
+            }.instrument(tracing::info_span!("Publish request to server", %hash)),
             move |r| Message::PublishRequestResulted(nonce, r),
         )
     }
@@ -1720,9 +1789,11 @@ impl AppState {
                     });
                 }
                 (PublishRequestResult::Failure(e), Some(publish)) => {
+                    tracing::error!("Publish request failed: {e}");
                     publish.state = PublishState::Failure(e, publish.state.hash_and_file_size());
                 }
                 (PublishRequestResult::Cancelled, Some(publish)) => {
+                    tracing::debug!("Publish request cancelled");
                     publish.state = PublishState::Cancelled(publish.state.hash_and_file_size());
                 }
                 (_, None) => {
@@ -1898,7 +1969,7 @@ impl AppState {
                     requested_size.write().await.replace(l);
                 } else {
                     tracing::info!("The requested upload size is zero, skipping upload");
-                    return UploadResult::Success;
+                    return UploadResult::Success((start_index)..(start_index + upload_length));
                 }
 
                 // Prepare a reader for the file to upload.
@@ -1913,7 +1984,7 @@ impl AppState {
                         reader,
                         Some(&progress_lock),
                     )) => match result {
-                        Ok(()) => UploadResult::Success,
+                        Ok(()) => UploadResult::Success((start_index)..(start_index + upload_length)),
                         Err(e) => UploadResult::Failure(Arc::new(format!("Upload failed: {e}"))),
                     }
                 }
@@ -1926,7 +1997,7 @@ impl AppState {
     #[tracing::instrument(skip(self))]
     fn update_subscribe_started(&mut self) -> iced::Task<Message> {
         // Clear the status message before starting the subscribe attempt.
-        self.status_message = None;
+        self.clear_status_message();
 
         // Let state know that a modal dialog is open.
         self.modal = true;
@@ -1999,6 +2070,7 @@ impl AppState {
             log_status_change::<LogWarnStatus>(
                 &mut self.status_message,
                 "Download using this path already exists".to_owned(),
+                &mut self.status_message_history,
             );
             return iced::Task::none();
         }
@@ -2006,6 +2078,7 @@ impl AppState {
             log_status_change::<LogWarnStatus>(
                 &mut self.status_message,
                 PUBLISH_PATH_EXISTS.to_owned(),
+                &mut self.status_message_history,
             );
             return iced::Task::none();
         }
@@ -2016,6 +2089,7 @@ impl AppState {
             log_status_change::<LogErrorStatus>(
                 &mut self.status_message,
                 format!("Failed to decode matched hash: {e}"),
+                &mut self.status_message_history,
             );
             return iced::Task::none();
         }
@@ -2070,6 +2144,7 @@ impl AppState {
                         log_status_change::<LogErrorStatus>(
                             &mut self.status_message,
                             format!("Failed to recover partial download {hash}: {e}"),
+                            &mut self.status_message_history,
                         );
                         return iced::Task::none();
                     }
@@ -2124,6 +2199,7 @@ impl AppState {
                     log_status_change::<LogWarnStatus>(
                         &mut self.status_message,
                         "No peers available".to_owned(),
+                        &mut self.status_message_history,
                     );
                     return iced::Task::none();
                 }
@@ -2215,6 +2291,7 @@ impl AppState {
                 log_status_change::<LogErrorStatus>(
                     &mut self.status_message,
                     format!("Error subscribing to the server: {e}"),
+                    &mut self.status_message_history,
                 );
                 iced::Task::none()
             }
@@ -2279,6 +2356,7 @@ impl AppState {
             log_status_change::<LogErrorStatus>(
                 &mut self.status_message,
                 "No transfer found to accept download".to_owned(),
+                &mut self.status_message_history,
             );
             return iced::Task::none();
         };
@@ -2293,6 +2371,7 @@ impl AppState {
             log_status_change::<LogErrorStatus>(
                 &mut self.status_message,
                 "Transfer is not in consent state".to_owned(),
+                &mut self.status_message_history,
             );
 
             // Revert the progress state back since we cannot proceed.
@@ -2535,6 +2614,8 @@ impl AppState {
         {
             if let Some(i) = publishes.iter().position(|p| p.nonce == nonce) {
                 tracing::debug!("Removing publish item {i}");
+                self.save_on_exit = true;
+
                 // Cancel the publish task and remove.
                 publishes[i].cancellation_token.cancel();
                 publishes.remove(i);
@@ -2609,10 +2690,20 @@ impl AppState {
                                                 ..
                                             }),
                                         ..
-                                    } => Some(intervals.convert_ranges(|r| {
-                                        let start = r.start();
-                                        start..start + *r.progress_lock.blocking_read()
-                                    })),
+                                    } => intervals
+                                        .convert_ranges(|r| {
+                                            let start = r.start();
+                                            start..start + *r.progress_lock.blocking_read()
+                                        })
+                                        .map_or_else(
+                                            |e| {
+                                                tracing::error!(
+                                                    "Failed to convert multi-peer intervals: {e}"
+                                                );
+                                                None
+                                            },
+                                            Some,
+                                        ),
 
                                     // Already set to `None`, return.
                                     _ => return,
@@ -2953,10 +3044,18 @@ impl AppState {
                             strategy:
                                 DownloadStrategy::MultiPeer(DownloadMultiPeer { intervals, .. }),
                             ..
-                        } => Some(intervals.convert_ranges(|r| {
-                            let start = r.start();
-                            start..start + *r.progress_lock.blocking_read()
-                        })),
+                        } => intervals
+                            .convert_ranges(|r| {
+                                let start = r.start();
+                                start..start + *r.progress_lock.blocking_read()
+                            })
+                            .map_or_else(
+                                |e| {
+                                    tracing::error!("Failed to convert multi-peer intervals: {e}");
+                                    None
+                                },
+                                Some,
+                            ),
 
                         // In other cases, do not save the download.
                         _ => return None,
@@ -2972,11 +3071,15 @@ impl AppState {
 
             endpoint.close(GOODBYE_CODE, GOODBYE_MESSAGE.as_bytes());
 
-            // Save the app settings when closing our connections.
-            if let Err(e) = save_settings(&self.options) {
-                tracing::error!("Could not save settings: {e}");
+            // Save the app settings if needed.
+            if self.save_on_exit || !self.options.last_downloads.is_empty() {
+                if let Err(e) = save_settings(&self.options) {
+                    tracing::error!("Could not save settings: {e}");
+                } else {
+                    tracing::info!("Settings saved");
+                }
             } else {
-                tracing::info!("Settings saved");
+                tracing::debug!("No changes to settings, not saving");
             }
         }
 
@@ -3020,6 +3123,19 @@ impl AppState {
             }
         }
     }
+
+    /// Helper to clear the current status message.
+    fn clear_status_message(&mut self) {
+        // Save the old status message to history.
+        if let Some(old_status) = self.status_message.take() {
+            self.status_message_history.push_back(old_status);
+        }
+    }
+}
+
+/// Helper for creating a horizontal line.
+fn horizontal_line<'c>() -> iced::Element<'c, Message> {
+    widget::horizontal_rule(3).into()
 }
 
 /// A trait to log status messages at different levels.
@@ -3042,9 +3158,18 @@ impl LogStatusLevel for LogWarnStatus {
 
 /// Helper to log an error that we assign to the status message.
 /// This helper assumes that the status string is non-empty.
-fn log_status_change<L: LogStatusLevel>(status_message: &mut Option<String>, status: String) {
-    // TODO: Store a log history in the GUI state to allow for GUI users to see all failures.
+fn log_status_change<L: LogStatusLevel>(
+    status_message: &mut Option<String>,
+    status: String,
+    status_message_history: &mut CircularBuffer<MAX_LOG_HISTORY_LINES, String>,
+) {
     L::log_status(&status);
+
+    // Save the old status message to history.
+    if let Some(old_status) = status_message.take() {
+        status_message_history.push_back(old_status);
+    }
+
     *status_message = Some(status);
 }
 
@@ -3365,8 +3490,8 @@ fn remove_nonce_for_peer(
                 tracing::debug!("Closing peer connection {connection}");
             }
 
-            // Remove the connection from the manager.
-            ConnectionsManager::instance().blocking_remove_peer(peer_address, connection);
+            // Locally close the connection. The request loop for this connection will handle any cleanup.
+            peer.close(GOODBYE_CODE, GOODBYE_MESSAGE.as_bytes());
 
             // Remove the peer from our map of known peer addresses.
             e.remove();

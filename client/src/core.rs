@@ -203,7 +203,7 @@ pub async fn prepare_server_connection(
                     let external_port = m.external_port();
                     let internal_port = m.internal_port();
                     let expiration_time = instant_to_datetime_string(m.expiration());
-                    tracing::info!("Mapped external port {gateway}:{external_port} -> internal {internal_port}, expiration at {expiration_time}");
+                    tracing::info!("Mapped external port {external_port} -> internal {internal_port}, expiration at {expiration_time}");
                     (Some(m), Some(external_port))
                 }
                 Err(e) => {
@@ -1349,30 +1349,6 @@ impl ConnectionsManager {
             tracing::debug!("Peer connection accepted by manager: {peer_address}");
         } else {
             tracing::debug!("Peer connection accepted by manager");
-        }
-    }
-
-    /// Remove a specific peer connection from the manager, with synchronous lock behavior.
-    #[tracing::instrument(skip(self, peer_address))]
-    pub fn blocking_remove_peer(&mut self, peer_address: SocketAddr, connection_id: usize) {
-        // Remove entry for peer if the stable IDs match.
-        match self.map.blocking_write().entry(peer_address) {
-            hash_map::Entry::Occupied(e) => {
-                if let IncomingPeerState::Connected(c) = e.get() {
-                    if c.stable_id() == connection_id {
-                        e.remove();
-                        tracing::info!("Connection manager removed peer");
-                    } else {
-                        tracing::debug!(
-                            "Connection manager found peer, but stable IDs did not match"
-                        );
-                    }
-                }
-            }
-
-            hash_map::Entry::Vacant(_) => {
-                tracing::warn!("Connection manager asked to remove a non-existent peer");
-            }
         }
     }
 
