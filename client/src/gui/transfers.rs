@@ -227,12 +227,13 @@ pub struct TransferBase {
     pub cancellation_token: CancellationToken,
 }
 pub trait Transfer {
+    /// Get the base information common to all transfers.
     fn base(&self) -> &TransferBase;
 
-    /// Update fields related to the progress animation.
+    /// Update fields related to animations.
     fn update_animation(&mut self);
 
-    /// Draw the transfer item in the GUI.
+    /// Draw the transfer item.
     fn draw(&self, mouse_move_elapsed: &Duration) -> iced::Element<'_, Message>;
 }
 

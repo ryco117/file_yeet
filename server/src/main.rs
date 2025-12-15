@@ -3,7 +3,10 @@ use std::{
     mem::size_of,
     net::{IpAddr, Ipv6Addr, SocketAddr},
     num::{NonZeroU16, NonZeroU32},
-    sync::Arc,
+    sync::{
+        atomic::{self, AtomicU64},
+        Arc,
+    },
 };
 
 use bytes::BufMut as _;
@@ -52,7 +55,7 @@ impl PublishedFile {
 }
 
 /// A nonce for the server to use in its communications with clients.
-type Nonce = [u64; 2];
+type Nonce = u64;
 
 /// The command line interface for `file_yeet_server`.
 #[derive(Parser)]
@@ -250,7 +253,7 @@ struct ClientSession {
 impl ClientSession {
     pub fn new(socket_addr: SocketAddr, cancellation_token: CancellationToken) -> Self {
         let preferred_port = Arc::new(RwLock::new(socket_addr.port()));
-        let nonce = random_nonce();
+        let nonce = generate_nonce();
 
         Self {
             nonce,
@@ -407,9 +410,12 @@ async fn handle_quic_connection(
     }
 }
 
-/// Generate a random nonce to uniquely identify client connections.
-fn random_nonce() -> Nonce {
-    [rand::random(), rand::random()]
+/// Generate a unique nonce to identify client connections.
+fn generate_nonce() -> Nonce {
+    // Global atomic counter for generating unique nonces.
+    static NONCE_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+    NONCE_COUNTER.fetch_add(1, atomic::Ordering::Relaxed)
 }
 
 /// Send a ping response to the client by sending the address we introduce them to peers as.

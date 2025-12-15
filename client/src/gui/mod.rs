@@ -5,7 +5,10 @@ use std::{
     num::{NonZeroU16, NonZeroU64},
     ops::Div as _,
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        atomic::{self, AtomicU64},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -99,6 +102,14 @@ impl From<(quinn::Connection, BiStream)> for PeerRequestStream {
 
 /// Nonce used to identifying items locally.
 type Nonce = u64;
+
+/// Generate a unique nonce using atomic increment.
+pub fn generate_nonce() -> Nonce {
+    // Global atomic counter for generating unique nonces.
+    static NONCE_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+    NONCE_COUNTER.fetch_add(1, atomic::Ordering::Relaxed)
+}
 
 /// The information to create a new publish item, or the nonce of an existing one.
 #[derive(Clone, Debug)]
@@ -1915,7 +1926,7 @@ impl AppState {
             return iced::Task::none();
         };
 
-        let upload_nonce = rand::random();
+        let upload_nonce = generate_nonce();
         let progress_lock = Arc::new(RwLock::new(0));
         let cancellation_token = CancellationToken::new();
         let peer_string = peer.connection.remote_address().to_string();
@@ -2125,7 +2136,7 @@ impl AppState {
         };
 
         // Get a unique nonce for this download.
-        let nonce = rand::random();
+        let nonce = generate_nonce();
 
         // Extract the saved download information.
         let (hash, file_size, path, saved_intervals) = {
@@ -2222,7 +2233,7 @@ impl AppState {
                         let peer = *peers.first();
 
                         // Create a nonce to identify the transfer.
-                        let nonce = rand::random();
+                        let nonce = generate_nonce();
                         let cancellation_token = CancellationToken::new();
 
                         // New download state for this request.

@@ -8,8 +8,8 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     core::FileAccessError,
     gui::{
-        text_horizontal_scrollbar, timed_tooltip, IncomingPublishSession, Message, Nonce,
-        ERROR_RED_COLOR,
+        generate_nonce, text_horizontal_scrollbar, timed_tooltip, IncomingPublishSession, Message,
+        Nonce, ERROR_RED_COLOR,
     },
     settings::SavedPublish,
 };
@@ -83,7 +83,7 @@ impl PublishItem {
     /// Make a new publish item in the hashing state.
     pub fn new(path: Arc<PathBuf>, progress_lock: Arc<RwLock<f32>>) -> Self {
         Self {
-            nonce: rand::random(),
+            nonce: generate_nonce(),
             path,
             cancellation_token: CancellationToken::new(),
             state: PublishState::Hashing(progress_lock),

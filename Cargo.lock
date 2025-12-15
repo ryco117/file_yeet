@@ -1345,7 +1345,6 @@ dependencies = [
  "nonempty",
  "open",
  "quinn",
- "rand 0.9.2",
  "regex",
  "rfd",
  "rustls",
