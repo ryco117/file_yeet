@@ -10,7 +10,6 @@ use crate::core::{humanize_bytes, FileYeetCommandType, PreparedConnection, HASH_
 
 mod core;
 mod gui;
-mod intervals;
 mod logging;
 mod settings;
 #[cfg(all(target_os = "windows", not(debug_assertions)))]

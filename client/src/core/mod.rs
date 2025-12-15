@@ -17,6 +17,8 @@ use tokio::{
     sync::RwLock,
 };
 
+pub mod intervals;
+
 /// The name of the application.
 pub static APP_TITLE: &str = env!("CARGO_PKG_NAME");
 

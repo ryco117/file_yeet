@@ -24,10 +24,12 @@ use tracing::Instrument as _;
 
 use crate::{
     core::{
-        humanize_bytes, peer_connection_into_stream, udp_holepunch, ConnectionsManager,
-        FileYeetCommandType, PortMappingConfig, PrepareConnectionError, PreparedConnection,
-        ReadSubscribingPeerError, SubscribeError, HASH_EXT_REGEX, MAX_PEER_COMMUNICATION_SIZE,
-        PEER_CONNECT_TIMEOUT, SERVER_CONNECTION_TIMEOUT,
+        humanize_bytes,
+        intervals::{FileIntervals, RangeData as _},
+        peer_connection_into_stream, udp_holepunch, ConnectionsManager, FileYeetCommandType,
+        PortMappingConfig, PrepareConnectionError, PreparedConnection, ReadSubscribingPeerError,
+        SubscribeError, HASH_EXT_REGEX, MAX_PEER_COMMUNICATION_SIZE, PEER_CONNECT_TIMEOUT,
+        SERVER_CONNECTION_TIMEOUT,
     },
     gui::{
         publish::{draw_publishes, Publish, PublishItem, PublishRequestResult, PublishState},
@@ -37,7 +39,6 @@ use crate::{
             TransferBase, TransferSnapshot, UploadResult, UploadState, UploadTransfer,
         },
     },
-    intervals::{FileIntervals, RangeData},
     settings::{
         load_settings, save_settings, AppSettings, PortMappingSetting, SavedDownload, SavedPublish,
     },
@@ -252,14 +253,20 @@ impl ConnectionState {
     }
 }
 
+/// Manages the status message and its history.
+#[derive(Default)]
+struct StatusManager {
+    pub message: Option<String>,
+    pub history: CircularBuffer<MAX_LOG_HISTORY_LINES, String>,
+    pub history_visible: bool,
+}
+
 /// The state of the application for interacting with the GUI.
 #[derive(Default)]
 pub struct AppState {
     connection_state: ConnectionState,
     options: AppSettings,
-    status_message: Option<String>,
-    status_message_history: CircularBuffer<MAX_LOG_HISTORY_LINES, String>,
-    status_logs_visible: bool,
+    status_manager: StatusManager,
     modal: bool,
     safely_closing: bool,
     save_on_exit: bool,
@@ -419,16 +426,14 @@ pub enum Message {
 impl AppState {
     /// Create a new application state.
     pub fn new(args: crate::Cli) -> (Self, iced::Task<Message>) {
-        let mut status_message = None;
-        let mut status_message_history = CircularBuffer::new();
+        let mut status_manager = StatusManager::default();
 
         // Get base settings from the settings file, or default.
         // If there is an error, show the error message and use default settings.
         let mut settings = load_settings().unwrap_or_else(|e| {
             log_status_change::<LogErrorStatus>(
-                &mut status_message,
+                &mut status_manager,
                 format!("Failed to load settings: {e}"),
-                &mut status_message_history,
             );
             AppSettings::default()
         });
@@ -472,7 +477,7 @@ impl AppState {
         // Create the initial state with the settings.
         let mut initial_state = Self {
             options: settings,
-            status_message,
+            status_manager,
             ..Self::default()
         };
 
@@ -652,9 +657,8 @@ impl AppState {
                 tracing::debug!("Opening file: {}", path.to_string_lossy());
                 open::that(path.as_ref()).unwrap_or_else(|e| {
                     log_status_change::<LogErrorStatus>(
-                        &mut self.status_message,
+                        &mut self.status_manager,
                         format!("Failed to open file: {e}"),
-                        &mut self.status_message_history,
                     );
                 });
                 iced::Task::none()
@@ -673,9 +677,8 @@ impl AppState {
                     if self.main_window.map_or_else(
                         || {
                             log_status_change::<LogErrorStatus>(
-                                &mut self.status_message,
+                                &mut self.status_manager,
                                 "Main window not available at close event".to_owned(),
-                                &mut self.status_message_history,
                             );
                             false
                         },
@@ -708,9 +711,8 @@ impl AppState {
                 self.main_window.map_or_else(
                     || {
                         log_status_change::<LogErrorStatus>(
-                            &mut self.status_message,
+                            &mut self.status_manager,
                             "Main window not available at force exit".to_owned(),
-                            &mut self.status_message_history,
                         );
                         iced::exit()
                     },
@@ -901,9 +903,10 @@ impl AppState {
             .unwrap_or_default();
 
         // Create a different top-level page based on the connection state.
-        let page: Element<Message> = if self.status_logs_visible {
+        let page: Element<Message> = if self.status_manager.history_visible {
             let content = widget::column(
-                self.status_message_history
+                self.status_manager
+                    .history
                     .iter()
                     .map(|t| widget::text(t).color(ERROR_RED_COLOR).into()),
             )
@@ -949,9 +952,9 @@ impl AppState {
 
         // Always display the status bar at the bottom.
         let status_bar = widget::row![
-            if let Some(status_message) = &self.status_message {
+            if let Some(status_manager) = &self.status_manager.message {
                 Element::from(
-                    widget::text(status_message)
+                    widget::text(status_manager)
                         .color(ERROR_RED_COLOR)
                         .width(iced::Length::Fill)
                         .height(iced::Length::Shrink),
@@ -961,7 +964,8 @@ impl AppState {
             },
             timed_tooltip(
                 widget::button("Status History").on_press_maybe(
-                    (!self.status_message_history.is_empty() || self.status_logs_visible)
+                    (!self.status_manager.history.is_empty()
+                        || self.status_manager.history_visible)
                         .then_some(Message::ToggleStatusHistory)
                 ),
                 "Toggle visibility of the status history. Disabled if the history is empty",
@@ -1262,9 +1266,8 @@ impl AppState {
                     .parse::<NonZeroU16>();
                 if let Err(e) = &o {
                     log_status_change::<LogWarnStatus>(
-                        &mut self.status_message,
+                        &mut self.status_manager,
                         format!("{INVALID_PORT_FORWARD}: {e}"),
-                        &mut self.status_message_history,
                     );
                 } else {
                     self.clear_status_message();
@@ -1299,9 +1302,8 @@ impl AppState {
                 Err(e) => {
                     *port = None;
                     log_status_change::<LogWarnStatus>(
-                        &mut self.status_message,
+                        &mut self.status_manager,
                         format!("{INVALID_PORT_FORWARD}: {e}"),
-                        &mut self.status_message_history,
                     );
                 }
             }
@@ -1368,9 +1370,8 @@ impl AppState {
         // If the server address is invalid, display an error message and return.
         let Some((server_address, port)) = regex_match else {
             log_status_change::<LogWarnStatus>(
-                &mut self.status_message,
+                &mut self.status_manager,
                 "Invalid server address".to_owned(),
-                &mut self.status_message_history,
             );
             return iced::Task::none();
         };
@@ -1384,9 +1385,8 @@ impl AppState {
                 Some(n)
             } else {
                 log_status_change::<LogWarnStatus>(
-                    &mut self.status_message,
+                    &mut self.status_manager,
                     "Invalid internal port".to_owned(),
-                    &mut self.status_message_history,
                 );
                 return iced::Task::none();
             }
@@ -1457,7 +1457,7 @@ impl AppState {
 
     /// Update the state to show or hide the status logs.
     fn update_show_status_logs(&mut self) -> iced::Task<Message> {
-        self.status_logs_visible = !self.status_logs_visible;
+        self.status_manager.history_visible = !self.status_manager.history_visible;
         iced::Task::none()
     }
 
@@ -1515,9 +1515,8 @@ impl AppState {
             }
             Err(e) => {
                 log_status_change::<LogErrorStatus>(
-                    &mut self.status_message,
+                    &mut self.status_manager,
                     format!("Error connecting: {e}"),
-                    &mut self.status_message_history,
                 );
                 self.connection_state = ConnectionState::Disconnected;
             }
@@ -1595,9 +1594,8 @@ impl AppState {
                 // Ensure the file path is not already being published.
                 if publishes.iter().any(|p| p.path == path) {
                     log_status_change::<LogWarnStatus>(
-                        &mut self.status_message,
+                        &mut self.status_manager,
                         "File is already being published".to_owned(),
-                        &mut self.status_message_history,
                     );
                     return iced::Task::none();
                 }
@@ -1680,9 +1678,8 @@ impl AppState {
         if let CreateOrExistingPublish::Create(p) = &publish {
             if publishes.iter().any(|pi| pi.path.as_ref().eq(p.as_ref())) {
                 log_status_change::<LogWarnStatus>(
-                    &mut self.status_message,
+                    &mut self.status_manager,
                     PUBLISH_PATH_EXISTS.to_owned(),
-                    &mut self.status_message_history,
                 );
                 return iced::Task::none();
             }
@@ -1741,9 +1738,8 @@ impl AppState {
 
             if let Err(e) = save_settings(&self.options) {
                 log_status_change::<LogErrorStatus>(
-                    &mut self.status_message,
+                    &mut self.status_manager,
                     format!("Failed to save settings: {e}"),
-                    &mut self.status_message_history,
                 );
                 self.save_on_exit = true;
             } else {
@@ -2087,17 +2083,15 @@ impl AppState {
         // TODO: Use `HashSet`s to more efficiently track these file paths.
         if downloads.iter().any(|d| path.eq(d.base.path.as_ref())) {
             log_status_change::<LogWarnStatus>(
-                &mut self.status_message,
+                &mut self.status_manager,
                 "Download using this path already exists".to_owned(),
-                &mut self.status_message_history,
             );
             return iced::Task::none();
         }
         if publishes.iter().any(|p| &path == p.path.as_ref()) {
             log_status_change::<LogWarnStatus>(
-                &mut self.status_message,
+                &mut self.status_manager,
                 PUBLISH_PATH_EXISTS.to_owned(),
-                &mut self.status_message_history,
             );
             return iced::Task::none();
         }
@@ -2106,9 +2100,8 @@ impl AppState {
         let mut hash = HashBytes::default();
         if let Err(e) = faster_hex::hex_decode(hash_hex.as_bytes(), &mut hash.bytes) {
             log_status_change::<LogErrorStatus>(
-                &mut self.status_message,
+                &mut self.status_manager,
                 format!("Failed to decode matched hash: {e}"),
-                &mut self.status_message_history,
             );
             return iced::Task::none();
         }
@@ -2161,9 +2154,8 @@ impl AppState {
                 for interval in intervals {
                     if let Err(e) = file_intervals.add_interval(interval) {
                         log_status_change::<LogErrorStatus>(
-                            &mut self.status_message,
+                            &mut self.status_manager,
                             format!("Failed to recover partial download {hash}: {e}"),
-                            &mut self.status_message_history,
                         );
                         return iced::Task::none();
                     }
@@ -2216,9 +2208,8 @@ impl AppState {
                 if peers_with_size.is_empty() {
                     // Let the user know why nothing else is happening.
                     log_status_change::<LogWarnStatus>(
-                        &mut self.status_message,
+                        &mut self.status_manager,
                         format!("No peers available for {hash}"),
-                        &mut self.status_message_history,
                     );
                     return iced::Task::none();
                 }
@@ -2308,9 +2299,8 @@ impl AppState {
             }
             Err(e) => {
                 log_status_change::<LogErrorStatus>(
-                    &mut self.status_message,
+                    &mut self.status_manager,
                     format!("Error subscribing to the server: {e}"),
-                    &mut self.status_message_history,
                 );
                 iced::Task::none()
             }
@@ -2373,9 +2363,8 @@ impl AppState {
         // Get the current transfer status.
         let Some(transfer) = downloads.iter_mut().find(|t| t.base.nonce == nonce) else {
             log_status_change::<LogErrorStatus>(
-                &mut self.status_message,
+                &mut self.status_manager,
                 "No transfer found to accept download".to_owned(),
-                &mut self.status_message_history,
             );
             return iced::Task::none();
         };
@@ -2388,9 +2377,8 @@ impl AppState {
         let file_size = transfer.base.file_size;
         let DownloadState::Consent(peer_streams) = progress else {
             log_status_change::<LogErrorStatus>(
-                &mut self.status_message,
+                &mut self.status_manager,
                 "Transfer is not in consent state".to_owned(),
-                &mut self.status_message_history,
             );
 
             // Revert the progress state back since we cannot proceed.
@@ -3146,8 +3134,8 @@ impl AppState {
     /// Helper to clear the current status message.
     fn clear_status_message(&mut self) {
         // Save the old status message to history.
-        if let Some(old_status) = self.status_message.take() {
-            self.status_message_history.push_back(old_status);
+        if let Some(old_status) = self.status_manager.message.take() {
+            self.status_manager.history.push_back(old_status);
         }
     }
 }
@@ -3177,19 +3165,15 @@ impl LogStatusLevel for LogWarnStatus {
 
 /// Helper to log an error that we assign to the status message.
 /// This helper assumes that the status string is non-empty.
-fn log_status_change<L: LogStatusLevel>(
-    status_message: &mut Option<String>,
-    status: String,
-    status_message_history: &mut CircularBuffer<MAX_LOG_HISTORY_LINES, String>,
-) {
+fn log_status_change<L: LogStatusLevel>(status_manager: &mut StatusManager, status: String) {
     L::log_status(&status);
 
     // Save the old status message to history.
-    if let Some(old_status) = status_message.take() {
-        status_message_history.push_back(old_status);
+    if let Some(old_status) = status_manager.message.take() {
+        status_manager.history.push_back(old_status);
     }
 
-    *status_message = Some(status);
+    status_manager.message = Some(status);
 }
 
 /// Helper to get a consistent horizontal scrollbar for text overflow.

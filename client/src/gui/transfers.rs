@@ -13,12 +13,15 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    core::{humanize_bytes, FileYeetCommandType},
+    core::{
+        humanize_bytes,
+        intervals::{FileIntervals, RangeData},
+        FileYeetCommandType,
+    },
     gui::{
         remove_nonce_for_peer, text_horizontal_scrollbar, timed_tooltip, CancelOrPause,
         CreateOrExistingPublish, Message, Nonce, PeerRequestStream, ERROR_RED_COLOR,
     },
-    intervals::FileIntervals,
 };
 
 /// The rate at which transfer speed text is updated.
@@ -114,7 +117,7 @@ pub struct DownloadPartRange {
     pub range: std::ops::Range<u64>,
     pub progress_lock: Arc<RwLock<u64>>,
 }
-impl crate::intervals::RangeData for DownloadPartRange {
+impl RangeData for DownloadPartRange {
     fn start(&self) -> u64 {
         self.range.start
     }
