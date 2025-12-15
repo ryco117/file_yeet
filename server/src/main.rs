@@ -3,10 +3,7 @@ use std::{
     mem::size_of,
     net::{IpAddr, Ipv6Addr, SocketAddr},
     num::{NonZeroU16, NonZeroU32},
-    sync::{
-        atomic::{self, AtomicU64},
-        Arc,
-    },
+    sync::Arc,
 };
 
 use bytes::BufMut as _;
@@ -55,7 +52,7 @@ impl PublishedFile {
 }
 
 /// A nonce for the server to use in its communications with clients.
-type Nonce = u64;
+type Nonce = usize;
 
 /// The command line interface for `file_yeet_server`.
 #[derive(Parser)]
@@ -246,17 +243,19 @@ enum ClientRequestError {
 struct ClientSession {
     /// Unique identifier for the client session.
     pub nonce: Nonce,
+
+    /// The preferred port the client wants to be introduced to peers over.
     pub preferred_port: Arc<RwLock<u16>>,
     pub client_pubs: Vec<PublisherRef>,
     pub cancellation_token: CancellationToken,
 }
 impl ClientSession {
-    pub fn new(socket_addr: SocketAddr, cancellation_token: CancellationToken) -> Self {
+    pub fn new(connection: &quinn::Connection, cancellation_token: CancellationToken) -> Self {
+        let socket_addr = connection.remote_address();
         let preferred_port = Arc::new(RwLock::new(socket_addr.port()));
-        let nonce = generate_nonce();
 
         Self {
-            nonce,
+            nonce: connection.stable_id(),
             preferred_port,
             client_pubs: Vec::new(),
             cancellation_token,
@@ -278,7 +277,7 @@ async fn handle_quic_connection(
     let socket_addr = connection.remote_address();
 
     let session = Arc::new(RwLock::new(ClientSession::new(
-        socket_addr,
+        &connection,
         cancellation_token.clone(),
     )));
     let client_preferred_port = session.read().await.preferred_port.clone();
@@ -408,14 +407,6 @@ async fn handle_quic_connection(
             }
         }
     }
-}
-
-/// Generate a unique nonce to identify client connections.
-fn generate_nonce() -> Nonce {
-    // Global atomic counter for generating unique nonces.
-    static NONCE_COUNTER: AtomicU64 = AtomicU64::new(1);
-
-    NONCE_COUNTER.fetch_add(1, atomic::Ordering::Relaxed)
 }
 
 /// Send a ping response to the client by sending the address we introduce them to peers as.

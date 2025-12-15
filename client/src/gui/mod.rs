@@ -672,7 +672,11 @@ impl AppState {
 
                     if self.main_window.map_or_else(
                         || {
-                            tracing::error!("Main window not available at unhandled event");
+                            log_status_change::<LogErrorStatus>(
+                                &mut self.status_message,
+                                "Main window not available at close event".to_owned(),
+                                &mut self.status_message_history,
+                            );
                             false
                         },
                         |w| w != window,
@@ -703,7 +707,11 @@ impl AppState {
                 tracing::debug!("Force exit requested");
                 self.main_window.map_or_else(
                     || {
-                        tracing::error!("Main window not available at force exit");
+                        log_status_change::<LogErrorStatus>(
+                            &mut self.status_message,
+                            "Main window not available at force exit".to_owned(),
+                            &mut self.status_message_history,
+                        );
                         iced::exit()
                     },
                     iced::window::close,
@@ -894,12 +902,11 @@ impl AppState {
 
         // Create a different top-level page based on the connection state.
         let page: Element<Message> = if self.status_logs_visible {
-            let content = widget::column(self.status_message_history.iter().map(|t| {
-                widget::text(t)
-                    .color(ERROR_RED_COLOR)
-                    .align_y(iced::alignment::Vertical::Bottom)
-                    .into()
-            }))
+            let content = widget::column(
+                self.status_message_history
+                    .iter()
+                    .map(|t| widget::text(t).color(ERROR_RED_COLOR).into()),
+            )
             .spacing(6);
             widget::column![
                 widget::vertical_space(),
@@ -960,7 +967,8 @@ impl AppState {
                 "Toggle visibility of the status history. Disabled if the history is empty",
                 &mouse_move_elapsed,
             )
-        ];
+        ]
+        .align_y(iced::Alignment::Center);
         widget::column!(page, horizontal_line(), status_bar)
             .spacing(4)
             .padding(6)

@@ -125,11 +125,11 @@ pub enum ClientApiRequest {
 impl std::fmt::Display for ClientApiRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let str = match self {
-            ClientApiRequest::SocketPing => "SOCKET_PING  ",
+            ClientApiRequest::SocketPing => "SOCKET_PING",
             ClientApiRequest::PortOverride => "PORT_OVERRIDE",
-            ClientApiRequest::Publish => "PUBLISH      ",
-            ClientApiRequest::Subscribe => "SUBSCRIBE    ",
-            ClientApiRequest::Introduction => "INTRODUCTION ",
+            ClientApiRequest::Publish => "PUBLISH",
+            ClientApiRequest::Subscribe => "SUBSCRIBE",
+            ClientApiRequest::Introduction => "INTRODUCTION",
         };
         write!(f, "REQ: {str}")
     }
