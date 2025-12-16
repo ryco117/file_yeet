@@ -116,6 +116,11 @@ pub fn generate_nonce() -> Nonce {
     NONCE_COUNTER.fetch_add(1, atomic::Ordering::Relaxed)
 }
 
+trait NonceItem {
+    /// Get the nonce of this item.
+    fn nonce(&self) -> Nonce;
+}
+
 /// The information to create a new publish item, or the nonce of an existing one.
 #[derive(Clone, Debug)]
 pub enum CreateOrExistingPublish {
@@ -1609,15 +1614,20 @@ impl AppState {
                 let publish = PublishItem::new(path.clone(), progress.clone());
                 let cancellation_token = publish.cancellation_token.clone();
                 let nonce = publish.nonce;
-
                 publishes.push(publish);
+
+                if cfg!(debug_assertions) && !is_nonce_sorted(publishes) {
+                    tracing::warn!("Publishes not sorted by nonce after adding new publish");
+                    sort_nonce(publishes);
+                }
+
                 (progress, cancellation_token, nonce, path)
             }
 
             // If an existing publish is requested, find it by nonce.
             CreateOrExistingPublish::Existing(nonce) => {
-                let publish = publishes.iter_mut().find(|p| p.nonce == nonce);
-                if let Some(publish) = publish {
+                let publish = binary_find_nonce_mut(publishes, nonce);
+                if let Some((_, publish)) = publish {
                     let progress = Arc::new(RwLock::new(0.));
                     publish.state = PublishState::Hashing(progress.clone());
                     (
@@ -1627,7 +1637,10 @@ impl AppState {
                         publish.path.clone(),
                     )
                 } else {
-                    tracing::warn!("Publish chosen for unknown nonce {nonce}");
+                    log_status_change::<LogWarnStatus>(
+                        &mut self.status_manager,
+                        format!("Publish chosen for unknown nonce {nonce}"),
+                    );
                     return iced::Task::none();
                 }
             }
@@ -1714,18 +1727,27 @@ impl AppState {
         let (nonce, cancellation_token, path) = match publish {
             CreateOrExistingPublish::Create(path) => {
                 let publish = PublishItem::new(path, Arc::new(RwLock::new(1.)));
-                let nonce = publish.nonce;
                 let cancellation_token = publish.cancellation_token.clone();
+                let nonce = publish.nonce;
                 publishes.push(publish);
+
+                if cfg!(debug_assertions) && !is_nonce_sorted(publishes) {
+                    tracing::warn!("Publishes not sorted by nonce after adding new publish");
+                    sort_nonce(publishes);
+                }
+
                 (nonce, cancellation_token, &publishes.last().unwrap().path)
             }
 
             CreateOrExistingPublish::Existing(nonce) => {
-                let publish = publishes.iter_mut().find(|p| p.nonce == nonce);
-                if let Some(publish) = publish {
+                let publish = binary_find_nonce(publishes, nonce);
+                if let Some((_, publish)) = publish {
                     (nonce, publish.cancellation_token.clone(), &publish.path)
                 } else {
-                    tracing::warn!("Publish file hashed for unknown nonce {nonce}");
+                    log_status_change::<LogWarnStatus>(
+                        &mut self.status_manager,
+                        format!("Publish file hashed for unknown nonce {nonce}"),
+                    );
                     return iced::Task::none();
                 }
             }
@@ -1789,14 +1811,14 @@ impl AppState {
         if let ConnectionState::Connected(ConnectedState { publishes, .. }) =
             &mut self.connection_state
         {
-            match (result, publishes.iter_mut().find(|p| p.nonce == nonce)) {
+            match (result, binary_find_nonce_mut(publishes, nonce)) {
                 (
                     PublishRequestResult::Success(IncomingPublishSession {
                         server_streams,
                         hash,
                         file_size,
                     }),
-                    Some(publish),
+                    Some((_, publish)),
                 ) => {
                     tracing::debug!("Publish request succeeded");
                     publish.state = PublishState::Publishing(Publish {
@@ -1807,11 +1829,11 @@ impl AppState {
                         human_readable_size: humanize_bytes(file_size),
                     });
                 }
-                (PublishRequestResult::Failure(e), Some(publish)) => {
+                (PublishRequestResult::Failure(e), Some((_, publish))) => {
                     tracing::error!("Publish request failed: {e}");
                     publish.state = PublishState::Failure(e, publish.state.hash_and_file_size());
                 }
-                (PublishRequestResult::Cancelled, Some(publish)) => {
+                (PublishRequestResult::Cancelled, Some((_, publish))) => {
                     tracing::debug!("Publish request cancelled");
                     publish.state = PublishState::Cancelled(publish.state.hash_and_file_size());
                 }
@@ -1840,13 +1862,9 @@ impl AppState {
             return iced::Task::none();
         };
 
-        let publish = publishes.iter().find_map(|p| {
+        let publish = binary_find_nonce(publishes, nonce).and_then(|(_, p)| {
             if let PublishState::Publishing(publishing) = &p.state {
-                if p.nonce == nonce {
-                    Some(publishing.clone())
-                } else {
-                    None
-                }
+                Some(publishing.clone())
             } else {
                 None
             }
@@ -1919,18 +1937,19 @@ impl AppState {
             return iced::Task::none();
         };
 
-        let Some((publishing, path)) = publishes.iter().find_map(|pi| {
-            if let PublishState::Publishing(p) = &pi.state {
-                if pi.nonce == pub_nonce {
+        let Some((publishing, path)) =
+            binary_find_nonce(publishes, pub_nonce).and_then(|(_, pi)| {
+                if let PublishState::Publishing(p) = &pi.state {
                     Some((p, pi.path.clone()))
                 } else {
                     None
                 }
-            } else {
-                None
-            }
-        }) else {
-            tracing::warn!("Peer connected for unknown publish nonce {pub_nonce}");
+            })
+        else {
+            log_status_change::<LogWarnStatus>(
+                &mut self.status_manager,
+                format!("Peer connected for unknown publish nonce {pub_nonce}"),
+            );
             return iced::Task::none();
         };
 
@@ -1957,6 +1976,11 @@ impl AppState {
                 snapshot: TransferSnapshot::new(),
             },
         });
+
+        if cfg!(debug_assertions) && !is_nonce_sorted(uploads) {
+            tracing::warn!("Uploads not sorted by nonce after adding new upload");
+            sort_nonce(uploads);
+        }
 
         insert_nonce_for_peer(peer.connection.remote_address(), peers, upload_nonce);
 
@@ -2140,9 +2164,6 @@ impl AppState {
             return iced::Task::none();
         };
 
-        // Get a unique nonce for this download.
-        let nonce = generate_nonce();
-
         // Extract the saved download information.
         let (hash, file_size, path, saved_intervals) = {
             let SavedDownload {
@@ -2172,6 +2193,9 @@ impl AppState {
             (hash, file_size, path, intervals)
         };
 
+        // Get a unique nonce for this download.
+        let nonce = generate_nonce();
+
         downloads.push(DownloadTransfer {
             base: TransferBase {
                 nonce,
@@ -2183,6 +2207,11 @@ impl AppState {
             },
             progress: DownloadState::Paused(saved_intervals),
         });
+
+        if cfg!(debug_assertions) && !is_nonce_sorted(downloads) {
+            tracing::warn!("Downloads not sorted by nonce after adding new download");
+            sort_nonce(downloads);
+        }
 
         iced::Task::done(Message::ResumePausedDownload(nonce))
     }
@@ -2307,6 +2336,12 @@ impl AppState {
 
                 // Add the new transfers to the list of active transfers.
                 downloads.append(&mut new_transfers);
+
+                if cfg!(debug_assertions) && !is_nonce_sorted(downloads) {
+                    tracing::warn!("Downloads not sorted by nonce after adding new downloads");
+                    sort_nonce(downloads);
+                }
+
                 iced::Task::batch(connect_commands)
             }
             Err(e) => {
@@ -2335,12 +2370,11 @@ impl AppState {
         };
 
         // Find the transfer with the matching nonce.
-        let Some((index, transfer)) = downloads
-            .iter_mut()
-            .enumerate()
-            .find(|(_, t)| t.base.nonce == nonce)
-        else {
-            tracing::error!("Subscribe connect resulted for unknown nonce");
+        let Some((index, transfer)) = binary_find_nonce_mut(downloads, nonce) else {
+            log_status_change::<LogWarnStatus>(
+                &mut self.status_manager,
+                "Subscribe connect resulted for unknown nonce".to_owned(),
+            );
             return iced::Task::none();
         };
 
@@ -2373,7 +2407,7 @@ impl AppState {
         };
 
         // Get the current transfer status.
-        let Some(transfer) = downloads.iter_mut().find(|t| t.base.nonce == nonce) else {
+        let Some((_, transfer)) = binary_find_nonce_mut(downloads, nonce) else {
             log_status_change::<LogErrorStatus>(
                 &mut self.status_manager,
                 "No transfer found to accept download".to_owned(),
@@ -2540,8 +2574,11 @@ impl AppState {
             return iced::Task::none();
         };
 
-        let Some(publish_item) = publishes.iter().find(|p| p.nonce == nonce) else {
-            tracing::warn!("No publish found with input nonce");
+        let Some((_, publish_item)) = binary_find_nonce(publishes, nonce) else {
+            log_status_change::<LogWarnStatus>(
+                &mut self.status_manager,
+                "No publish found with nonce to copy hash".to_owned(),
+            );
             return iced::Task::none();
         };
         let PublishState::Publishing(Publish { hash_hex, .. }) = &publish_item.state else {
@@ -2566,23 +2603,26 @@ impl AppState {
             return iced::Task::none();
         };
 
-        if let Some(publish) = publishes.iter_mut().find(|p| p.nonce == nonce) {
-            let progress = Arc::new(RwLock::new(0.));
-            tracing::debug!("Rehashing publish {}", publish.path.to_string_lossy());
-            publish.state = PublishState::Hashing(progress.clone());
-            publish.cancellation_token.cancel();
-            publish.cancellation_token = CancellationToken::new();
+        let Some((_, publish)) = binary_find_nonce_mut(publishes, nonce) else {
+            log_status_change::<LogWarnStatus>(
+                &mut self.status_manager,
+                "No publish found with nonce to rehash".to_owned(),
+            );
+            return iced::Task::none();
+        };
 
-            hash_publish_task(
-                publish.nonce,
-                publish.path.clone(),
-                publish.cancellation_token.clone(),
-                progress,
-            )
-        } else {
-            tracing::warn!("No publish found to rehash");
-            iced::Task::none()
-        }
+        let progress = Arc::new(RwLock::new(0.));
+        tracing::debug!("Rehashing publish {}", publish.path.to_string_lossy());
+        publish.state = PublishState::Hashing(progress.clone());
+        publish.cancellation_token.cancel();
+        publish.cancellation_token = CancellationToken::new();
+
+        hash_publish_task(
+            publish.nonce,
+            publish.path.clone(),
+            publish.cancellation_token.clone(),
+            progress,
+        )
     }
 
     /// Update the state after a publish was cancelled.
@@ -2591,7 +2631,7 @@ impl AppState {
         if let ConnectionState::Connected(ConnectedState { publishes, .. }) =
             &mut self.connection_state
         {
-            if let Some(publish) = publishes.iter_mut().find(|p| p.nonce == nonce) {
+            if let Some((_, publish)) = binary_find_nonce_mut(publishes, nonce) {
                 tracing::debug!("Cancelling the publish task");
                 publish.cancellation_token.cancel();
                 publish.state = PublishState::Cancelled(publish.state.hash_and_file_size());
@@ -2613,8 +2653,11 @@ impl AppState {
             tracing::warn!("No connected state to retry publish");
             return iced::Task::none();
         };
-        let Some(publish) = publishes.iter_mut().find(|p| p.nonce == nonce) else {
-            tracing::warn!("No publish found to retry");
+        let Some((_, publish)) = binary_find_nonce_mut(publishes, nonce) else {
+            log_status_change::<LogWarnStatus>(
+                &mut self.status_manager,
+                "No publish found with nonce to retry".to_owned(),
+            );
             return iced::Task::none();
         };
 
@@ -2678,73 +2721,69 @@ impl AppState {
             return iced::Task::none();
         };
 
-        let result = match transfer_type {
+        match transfer_type {
             FileYeetCommandType::Sub => {
-                downloads
-                    .iter_mut()
-                    .find(|t| t.base.nonce == nonce)
-                    .map(|t| {
-                        // Cancel the download's tasks.
-                        t.base.cancellation_token.cancel();
+                binary_find_nonce_mut(downloads, nonce).map(|(_, t)| {
+                    // Cancel the download's tasks.
+                    t.base.cancellation_token.cancel();
 
-                        match cancel_or_pause {
-                            CancelOrPause::Cancel => {
-                                tracing::debug!("Cancelled download {}", t.base.hash_hex);
+                    match cancel_or_pause {
+                        CancelOrPause::Cancel => {
+                            tracing::debug!("Cancelled download {}", t.base.hash_hex);
 
-                                // If the transfer was connected to a peer, remove the nonce from transactions
-                                for connection in t.progress.connections() {
-                                    remove_nonce_for_peer(connection, peers, nonce);
+                            // If the transfer was connected to a peer, remove the nonce from transactions
+                            for connection in t.progress.connections() {
+                                remove_nonce_for_peer(connection, peers, nonce);
+                            }
+
+                            // Mark the download as cancelled.
+                            t.progress = DownloadState::Done(DownloadResult::Cancelled);
+                        }
+                        CancelOrPause::Pause => {
+                            tracing::debug!("Paused download {}", t.base.hash_hex);
+
+                            // Default to no saved intervals.
+                            let progress =
+                                std::mem::replace(&mut t.progress, DownloadState::Paused(None));
+                            let intervals = match progress {
+                                // Retain existing paused intervals. This shouldn't happen ever.
+                                DownloadState::Paused(intervals) => {
+                                    tracing::error!("Download is already paused");
+                                    intervals
                                 }
 
-                                // Mark the download as cancelled.
-                                t.progress = DownloadState::Done(DownloadResult::Cancelled);
-                            }
-                            CancelOrPause::Pause => {
-                                tracing::debug!("Paused download {}", t.base.hash_hex);
+                                // Get the currently saved intervals for this download.
+                                DownloadState::Transferring {
+                                    strategy:
+                                        DownloadStrategy::MultiPeer(DownloadMultiPeer {
+                                            intervals, ..
+                                        }),
+                                    ..
+                                } => intervals
+                                    .convert_ranges(|r| {
+                                        let start = r.start();
+                                        start..start + *r.progress_lock.blocking_read()
+                                    })
+                                    .map_or_else(
+                                        |e| {
+                                            tracing::error!(
+                                                "Failed to convert multi-peer intervals: {e}"
+                                            );
+                                            None
+                                        },
+                                        Some,
+                                    ),
 
-                                // Default to no saved intervals.
-                                let progress =
-                                    std::mem::replace(&mut t.progress, DownloadState::Paused(None));
-                                let intervals = match progress {
-                                    // Retain existing paused intervals. This shouldn't happen ever.
-                                    DownloadState::Paused(intervals) => {
-                                        tracing::error!("Download is already paused");
-                                        intervals
-                                    }
-
-                                    // Get the currently saved intervals for this download.
-                                    DownloadState::Transferring {
-                                        strategy:
-                                            DownloadStrategy::MultiPeer(DownloadMultiPeer {
-                                                intervals,
-                                                ..
-                                            }),
-                                        ..
-                                    } => intervals
-                                        .convert_ranges(|r| {
-                                            let start = r.start();
-                                            start..start + *r.progress_lock.blocking_read()
-                                        })
-                                        .map_or_else(
-                                            |e| {
-                                                tracing::error!(
-                                                    "Failed to convert multi-peer intervals: {e}"
-                                                );
-                                                None
-                                            },
-                                            Some,
-                                        ),
-
-                                    // Already set to `None`, return.
-                                    _ => return,
-                                };
-                                t.progress = DownloadState::Paused(intervals);
-                            }
+                                // Already set to `None`, return.
+                                _ => return,
+                            };
+                            t.progress = DownloadState::Paused(intervals);
                         }
-                    })
+                    }
+                })
             }
             FileYeetCommandType::Pub => {
-                uploads.iter_mut().find(|t| t.base.nonce == nonce).map(|t| {
+                binary_find_nonce_mut(uploads, nonce).map(|(_, t)| {
                     // Cancel the upload's tasks.
                     t.base.cancellation_token.cancel();
 
@@ -2768,10 +2807,13 @@ impl AppState {
                     }
                 })
             }
-        };
-        if result.is_none() {
-            tracing::warn!("No transfer found to cancel or pause for nonce");
         }
+        .unwrap_or_else(|| {
+            log_status_change::<LogWarnStatus>(
+                &mut self.status_manager,
+                format!("No transfer found to {cancel_or_pause:?} for nonce"),
+            );
+        });
         iced::Task::none()
     }
 
@@ -2791,8 +2833,11 @@ impl AppState {
             return iced::Task::none();
         };
 
-        let Some(t) = downloads.iter_mut().find(|t| t.base.nonce == nonce) else {
-            tracing::warn!("No download found to resume for nonce");
+        let Some((_, t)) = binary_find_nonce_mut(downloads, nonce) else {
+            log_status_change::<LogWarnStatus>(
+                &mut self.status_manager,
+                "No download found to resume for nonce".to_owned(),
+            );
             return iced::Task::none();
         };
         let endpoint = endpoint.clone();
@@ -2885,8 +2930,11 @@ impl AppState {
             return iced::Task::none();
         };
 
-        let Some(t) = downloads.iter_mut().find(|t| t.base.nonce == nonce) else {
-            tracing::warn!("No download found to resume partial hash for nonce");
+        let Some((_, t)) = binary_find_nonce_mut(downloads, nonce) else {
+            log_status_change::<LogWarnStatus>(
+                &mut self.status_manager,
+                "No download found to resume partial hash for nonce".to_owned(),
+            );
             return iced::Task::none();
         };
 
@@ -2995,10 +3043,13 @@ impl AppState {
                 tracing::warn!("Transfer failed: {e}");
             }
 
-            if let Some(t) = downloads.iter_mut().find(|t| t.base.nonce == nonce) {
+            if let Some((_, t)) = binary_find_nonce_mut(downloads, nonce) {
                 update_download_result(&mut t.progress, result, peers, nonce);
             } else {
-                tracing::warn!("No download found to update result for nonce");
+                log_status_change::<LogWarnStatus>(
+                    &mut self.status_manager,
+                    "No download found to update result for nonce".to_owned(),
+                );
             }
         } else {
             tracing::warn!("No connected state to update transfer result");
@@ -3021,10 +3072,13 @@ impl AppState {
                 tracing::warn!("Transfer failed: {e}");
             }
 
-            if let Some(t) = uploads.iter_mut().find(|t| t.base.nonce == nonce) {
+            if let Some((_, t)) = binary_find_nonce_mut(uploads, nonce) {
                 update_upload_result(&mut t.progress, result, peers, nonce);
             } else {
-                tracing::warn!("No upload found to update result for nonce");
+                log_status_change::<LogWarnStatus>(
+                    &mut self.status_manager,
+                    "No upload found to update result for nonce".to_owned(),
+                );
             }
         } else {
             tracing::warn!("No connected state to update transfer result");
@@ -3200,6 +3254,34 @@ impl AppState {
             self.status_manager.history.push_back(old_status);
         }
     }
+}
+
+/// Helper to use a binary search to find a nonce item in a sorted slice.
+/// Returns the index and a reference to the item if found.
+fn binary_find_nonce<T: NonceItem>(items: &[T], nonce: Nonce) -> Option<(usize, &T)> {
+    items
+        .binary_search_by_key(&nonce, T::nonce)
+        .ok()
+        .and_then(|idx| items.get(idx).map(|item| (idx, item)))
+}
+
+/// Helper to use a binary search to find a nonce item in a sorted slice.
+/// Returns the index and a mutable reference to the item if found.
+fn binary_find_nonce_mut<T: NonceItem>(items: &mut [T], nonce: Nonce) -> Option<(usize, &mut T)> {
+    items
+        .binary_search_by_key(&nonce, T::nonce)
+        .ok()
+        .and_then(|idx| items.get_mut(idx).map(|item| (idx, item)))
+}
+
+/// Helper to check if a slice of nonce items is sorted by nonce.
+fn is_nonce_sorted<T: NonceItem>(items: &[T]) -> bool {
+    items.is_sorted_by_key(T::nonce)
+}
+
+/// Helper to sort a slice by their nonce.
+fn sort_nonce<T: NonceItem>(items: &mut [T]) {
+    items.sort_by_key(T::nonce);
 }
 
 /// Helper for creating a horizontal line.

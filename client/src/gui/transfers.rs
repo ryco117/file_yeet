@@ -20,7 +20,7 @@ use crate::{
     },
     gui::{
         remove_nonce_for_peer, text_horizontal_scrollbar, timed_tooltip, CancelOrPause,
-        CreateOrExistingPublish, Message, Nonce, PeerRequestStream, ERROR_RED_COLOR,
+        CreateOrExistingPublish, Message, Nonce, NonceItem, PeerRequestStream, ERROR_RED_COLOR,
     },
 };
 
@@ -255,6 +255,11 @@ pub trait Transfer {
 pub struct DownloadTransfer {
     pub base: TransferBase,
     pub progress: DownloadState,
+}
+impl NonceItem for DownloadTransfer {
+    fn nonce(&self) -> Nonce {
+        self.base.nonce
+    }
 }
 impl Transfer for DownloadTransfer {
     fn base(&self) -> &TransferBase {
@@ -495,6 +500,11 @@ pub struct UploadTransfer {
     pub base: TransferBase,
     pub peer_string: String,
     pub progress: UploadState,
+}
+impl NonceItem for UploadTransfer {
+    fn nonce(&self) -> Nonce {
+        self.base.nonce
+    }
 }
 impl Transfer for UploadTransfer {
     fn base(&self) -> &TransferBase {

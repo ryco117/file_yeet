@@ -9,7 +9,7 @@ use crate::{
     core::FileAccessError,
     gui::{
         generate_nonce, text_horizontal_scrollbar, timed_tooltip, IncomingPublishSession, Message,
-        Nonce, ERROR_RED_COLOR,
+        Nonce, NonceItem, ERROR_RED_COLOR,
     },
     settings::SavedPublish,
 };
@@ -88,6 +88,11 @@ impl PublishItem {
             cancellation_token: CancellationToken::new(),
             state: PublishState::Hashing(progress_lock),
         }
+    }
+}
+impl NonceItem for PublishItem {
+    fn nonce(&self) -> Nonce {
+        self.nonce
     }
 }
 impl From<PublishItem> for SavedPublish {
