@@ -1,3 +1,6 @@
+/// Download interval chunk size in bytes.
+const DOWNLOAD_CHUNK_INTERVAL: u64 = 256 * 1024 * 1024;
+
 /// Trait defining a type containing range data.
 pub trait RangeData {
     fn start(&self) -> u64;
@@ -101,6 +104,16 @@ impl<R: RangeData> FileIntervals<R> {
             return Some(last_end..self.total_size);
         }
         None
+    }
+
+    /// Get the next download chunk range.
+    /// Returns `None` if there are no gaps.
+    pub fn next_download_chunk(&self) -> Option<std::ops::Range<u64>> {
+        let empty_range = self.next_empty_range()?;
+        let chunk_end = empty_range
+            .end
+            .min(empty_range.start + DOWNLOAD_CHUNK_INTERVAL);
+        Some(empty_range.start..chunk_end)
     }
 
     /// Convert the ranges to another type. Safely filters out zero-size ranges.

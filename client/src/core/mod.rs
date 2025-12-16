@@ -842,6 +842,19 @@ pub enum DownloadError {
     #[error("The downloaded file hash does not match the expected hash")]
     HashMismatch,
 }
+impl DownloadError {
+    /// Return whether the error is recoverable and the download can be retried.
+    pub fn is_recoverable(&self) -> bool {
+        match self {
+            DownloadError::FileAccess(_)
+            | DownloadError::QuicRead(_)
+            | DownloadError::QuicWrite(_)
+            | DownloadError::UnexpectedEof => true,
+
+            DownloadError::HashMismatch => false,
+        }
+    }
+}
 
 /// Download a slice of a file from the peer. Initiates the download by specifying the range of bytes to download.
 #[tracing::instrument(skip(peer_streams, file, file_offsets, byte_progress))]

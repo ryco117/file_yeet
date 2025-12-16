@@ -35,8 +35,9 @@ use crate::{
         publish::{draw_publishes, Publish, PublishItem, PublishRequestResult, PublishState},
         transfers::{
             update_download_result, update_upload_result, DownloadMultiPeer, DownloadResult,
-            DownloadSinglePeer, DownloadState, DownloadStrategy, DownloadTransfer, Transfer,
-            TransferBase, TransferSnapshot, UploadResult, UploadState, UploadTransfer,
+            DownloadSinglePeer, DownloadState, DownloadStrategy, DownloadTransfer,
+            RecoverableState, Transfer, TransferBase, TransferSnapshot, UploadResult, UploadState,
+            UploadTransfer,
         },
     },
     settings::{
@@ -78,6 +79,9 @@ const TOOLTIP_WAIT_DURATION: Duration = Duration::from_millis(400);
 /// The maximum number of lines to keep in the status message history.
 const MAX_LOG_HISTORY_LINES: usize = 256;
 
+/// Maximum time to wait to gracefully reject a download.
+const MAX_REJECT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// A peer connection representing a single request/command.
 /// Peers may have multiple connections to the same peer for different requests.
 #[derive(Clone, Debug)]
@@ -107,7 +111,7 @@ type Nonce = u64;
 /// Generate a unique nonce using atomic increment.
 pub fn generate_nonce() -> Nonce {
     // Global atomic counter for generating unique nonces.
-    static NONCE_COUNTER: AtomicU64 = AtomicU64::new(1);
+    static NONCE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     NONCE_COUNTER.fetch_add(1, atomic::Ordering::Relaxed)
 }
@@ -2228,9 +2232,6 @@ impl AppState {
                 // Create a new transfer state and connection attempt for each peer.
                 let transfers_commands_iter =
                     peers_by_size.into_iter().map(|(file_size, peers)| {
-                        // TODO: Support multi-downloads from multiple peers.
-                        let peer = *peers.first();
-
                         // Create a nonce to identify the transfer.
                         let nonce = generate_nonce();
                         let cancellation_token = CancellationToken::new();
@@ -2251,7 +2252,7 @@ impl AppState {
                         // New connection attempt for this peer with result command identified by the nonce.
                         let task = {
                             // Create a new connection or open a stream on an existing one.
-                            let peer = if let Some(c) =
+                            let futures = peers.into_iter().map(|peer| if let Some(c) =
                                 ConnectionsManager::instance().get_connection_sync(peer)
                             {
                                 if cfg!(debug_assertions) {
@@ -2267,19 +2268,30 @@ impl AppState {
                                     tracing::debug!("Creating new connection to peer");
                                 }
                                 PeerConnectionOrTarget::Target(endpoint.clone(), peer)
-                            };
+                            })
+                            .map(|peer| {
+                                let cancellation_token = cancellation_token.clone();
 
-                            // The future to use to create the connection.
-                            let future = async move {
-                                tokio::select! {
-                                    // Allow cancelling the connection attempt.
-                                    () = cancellation_token.cancelled() => None,
+                                // The future to use to create the connection.
+                                async move {
+                                    tokio::select! {
+                                        // Allow cancelling the connection attempt.
+                                        () = cancellation_token.cancelled() => None,
 
-                                    r = try_peer_connection(peer, hash, FileYeetCommandType::Sub) => r,
+                                        r = try_peer_connection(peer, hash, FileYeetCommandType::Sub) => r,
+                                    }
                                 }
-                            };
-                            iced::Task::perform(future, move |r| {
-                                Message::SubscribePeerConnectResulted(nonce, r.into_iter().collect())
+                            });
+
+                            // Join all the connection attempts for this hash/size into a single future.
+                            let future = futures_util::future::join_all(futures);
+
+                            iced::Task::perform(future, move |results| {
+                                let peers = results
+                                    .into_iter()
+                                    .flatten()
+                                    .collect();
+                                Message::SubscribePeerConnectResulted(nonce, peers)
                             })
                         };
 
@@ -2440,8 +2452,13 @@ impl AppState {
                         match result {
                             Ok(()) => DownloadResult::Success,
                             Err(e) => {
-                                let is_recoverable = !matches!(e, crate::core::DownloadError::HashMismatch);
-                                DownloadResult::Failure(Arc::new(format!("Download failed: {e}")), is_recoverable)
+                                let recoverable = if e.is_recoverable() {
+                                    // No file interval needs to be stored for synchronous download type.
+                                    RecoverableState::Recoverable(None)
+                                } else {
+                                    RecoverableState::NonRecoverable
+                                };
+                                DownloadResult::Failure(Arc::new(format!("Download failed: {e}")), recoverable)
                             }
                         }
                     }
@@ -2499,10 +2516,16 @@ impl AppState {
             // Reject the download request on all peer streams.
             let reject_futures = r.into_iter().map(|peer| async move {
                 let mut bi_stream = peer.bistream.lock().await;
-                let _ = crate::core::reject_download_request(&mut bi_stream).await;
+                if let Err(e) = crate::core::reject_download_request(&mut bi_stream).await {
+                    tracing::debug!("Failed to reject download request: {e}");
+                }
             });
 
-            futures_util::future::join_all(reject_futures).await;
+            let _ = tokio::time::timeout(
+                MAX_REJECT_TIMEOUT,
+                futures_util::future::join_all(reject_futures),
+            )
+            .await;
         })
         .discard()
     }
@@ -2780,7 +2803,27 @@ impl AppState {
         let final_file_size = t.base.file_size;
 
         let progress_lock = Arc::new(RwLock::new(0.));
-        t.progress = DownloadState::ResumingHash(progress_lock.clone());
+        let paused_progress = std::mem::replace(
+            &mut t.progress,
+            DownloadState::ResumingHash(progress_lock.clone()),
+        );
+
+        // TODO: Support resuming multi-peer downloads.
+        let intervals = match paused_progress {
+            DownloadState::Paused(intervals) => intervals,
+            DownloadState::Done(DownloadResult::Failure(_, RecoverableState::Recoverable(i))) => i
+                .map(|i| {
+                    Arc::try_unwrap(i).unwrap_or_else(|arc| {
+                        tracing::warn!("Failed to unwrap Arc for saved intervals");
+                        (*arc).clone()
+                    })
+                }),
+            _ => {
+                tracing::warn!("Download is not in a paused state");
+                None
+            }
+        };
+
         t.base.cancellation_token = CancellationToken::new();
         let cancellation_token = t.base.cancellation_token.clone();
         *transfer_view = TransferView::Downloads;
@@ -2881,7 +2924,7 @@ impl AppState {
                             Err(e) => {
                                 return DownloadResult::Failure(
                                     Arc::new(format!("Failed to open the file: {e}")),
-                                    true,
+                                    RecoverableState::Recoverable(None),
                                 )
                             }
                         };
@@ -2900,8 +2943,13 @@ impl AppState {
                             )) => match result {
                                 Ok(()) => DownloadResult::Success,
                                 Err(e) => {
-                                    let is_recoverable = !matches!(e, crate::core::DownloadError::HashMismatch);
-                                    DownloadResult::Failure(Arc::new(format!("Upload failed: {e}")), is_recoverable)
+                                    let recoverable = if e.is_recoverable() {
+                                        // No file interval needs to be stored for synchronous download type.
+                                        RecoverableState::Recoverable(None)
+                                    } else {
+                                        RecoverableState::NonRecoverable
+                                    };
+                                    DownloadResult::Failure(Arc::new(format!("Upload failed: {e}")), recoverable)
                                 },
                             }
                         }
@@ -2919,7 +2967,13 @@ impl AppState {
                     tracing::info!("Failed to connect to peer to resume partial hash");
                     Arc::new("No reachable peers".into())
                 };
-                t.progress = DownloadState::Done(DownloadResult::Failure(e, true));
+
+                // No file interval needs to be stored for synchronous download type.
+                t.progress = DownloadState::Done(DownloadResult::Failure(
+                    e,
+                    RecoverableState::Recoverable(None),
+                ));
+
                 iced::Task::none()
             }
         }
@@ -3042,11 +3096,19 @@ impl AppState {
                             strategy: DownloadStrategy::SinglePeer(_),
                             ..
                         }
-                        | DownloadState::ResumingHash(_)
-                        | DownloadState::Done(DownloadResult::Failure(_, true)) => None,
+                        | DownloadState::ResumingHash(_) => None,
 
                         // States where saved intervals are available.
                         DownloadState::Paused(intervals) => intervals,
+                        DownloadState::Done(DownloadResult::Failure(
+                            _,
+                            RecoverableState::Recoverable(intervals),
+                        )) => intervals.map(|i| {
+                            Arc::try_unwrap(i).unwrap_or_else(|arc| {
+                                tracing::warn!("Failed to unwrap Arc for saved intervals");
+                                (*arc).clone()
+                            })
+                        }),
                         DownloadState::Transferring {
                             strategy:
                                 DownloadStrategy::MultiPeer(DownloadMultiPeer { intervals, .. }),

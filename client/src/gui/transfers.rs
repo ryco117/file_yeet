@@ -27,6 +27,16 @@ use crate::{
 /// The rate at which transfer speed text is updated.
 const TRANSFER_SPEED_UPDATE_INTERVAL: Duration = Duration::from_millis(400);
 
+/// The recoverable state of a failed transfer.
+#[derive(Clone, Debug)]
+pub enum RecoverableState {
+    /// The failure is likely recoverable, and the transfer will resume from existing partial progress.
+    Recoverable(Option<Arc<FileIntervals<std::ops::Range<u64>>>>),
+
+    /// The failure is not recoverable and the transfer must be restarted from scratch.
+    NonRecoverable,
+}
+
 /// The result of a file download with a peer.
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum DownloadResult {
@@ -36,7 +46,7 @@ pub enum DownloadResult {
 
     /// The transfer failed. Boolean field is `true` when the failure is recoverable.
     #[error("{0}")]
-    Failure(Arc<String>, bool),
+    Failure(Arc<String>, RecoverableState),
 
     /// The transfer was cancelled.
     #[error("Transfer cancelled")]
@@ -422,7 +432,7 @@ impl Transfer for DownloadTransfer {
                                 .spacing(12),
                             )
                         }
-                        DownloadResult::Failure(_, true) => {
+                        DownloadResult::Failure(_, RecoverableState::Recoverable(_)) => {
                             Element::<Message>::from(
                                 widget::row!(
                                     widget::button(widget::text("Retry").size(12))
