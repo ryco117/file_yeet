@@ -1699,11 +1699,29 @@ impl AppState {
 
         // Ensure we don't publish the same file twice.
         if let CreateOrExistingPublish::Create(p) = &publish {
-            if publishes.iter().any(|pi| pi.path.as_ref().eq(p.as_ref())) {
-                log_status_change::<LogWarnStatus>(
-                    &mut self.status_manager,
-                    PUBLISH_PATH_EXISTS.to_owned(),
-                );
+            if publishes.iter().any(|pi| {
+                if pi.path.as_ref().eq(p.as_ref()) {
+                    // Duplicate file path.
+                    log_status_change::<LogWarnStatus>(
+                        &mut self.status_manager,
+                        PUBLISH_PATH_EXISTS.to_owned(),
+                    );
+                    true
+                } else if pi
+                    .state
+                    .hash_and_file_size()
+                    .is_some_and(|(h, _)| h == hash)
+                {
+                    // Duplicate file hash.
+                    log_status_change::<LogWarnStatus>(
+                        &mut self.status_manager,
+                        "Already publishing file with the same hash".to_owned(),
+                    );
+                    true
+                } else {
+                    false
+                }
+            }) {
                 return iced::Task::none();
             }
         }
