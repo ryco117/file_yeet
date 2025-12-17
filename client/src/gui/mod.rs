@@ -1494,6 +1494,11 @@ impl AppState {
                 if !self.options.last_publishes.is_empty()
                     || !self.options.last_downloads.is_empty()
                 {
+                    if !self.options.last_downloads.is_empty() {
+                        // Consider the settings file to be out of sync if we are recreating downloads.
+                        self.save_on_exit = true;
+                    }
+
                     let tasks = self
                         .options
                         .last_publishes
@@ -1519,6 +1524,7 @@ impl AppState {
                                 .drain(..)
                                 .map(|d| iced::Task::done(Message::SubscribeRecreated(d))),
                         );
+
                     return iced::Task::batch(tasks);
                 }
             }

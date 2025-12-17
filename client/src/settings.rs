@@ -90,7 +90,7 @@ pub fn settings_path() -> Option<std::path::PathBuf> {
     })
 }
 
-/// Load the app settings from the settings file.
+/// Load the app settings from the settings file, or default if the settings file does not exist.
 pub fn load_settings() -> Result<AppSettings, std::io::Error> {
     // Get the path to the settings file, or return default settings.
     let Some(p) = settings_path() else {
@@ -114,10 +114,23 @@ pub fn load_settings() -> Result<AppSettings, std::io::Error> {
     }
 }
 
+/// The possible errors when saving the app settings.
+#[derive(Debug, thiserror::Error)]
+pub enum SaveSettingsError {
+    #[error("Could not determine a settings path.")]
+    NoDefaultPath,
+
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("Serialization error: {0}")]
+    Serde(#[from] serde_json::Error),
+}
+
 /// Save the app settings.
-pub fn save_settings(settings: &AppSettings) -> anyhow::Result<()> {
+pub fn save_settings(settings: &AppSettings) -> Result<(), SaveSettingsError> {
     settings_path()
-        .ok_or_else(|| anyhow::anyhow!("Could not determine a settings path for this environment."))
+        .ok_or(SaveSettingsError::NoDefaultPath)
         .and_then(|p| Ok(std::fs::File::create(p)?))
         .and_then(|f| Ok(serde_json::to_writer_pretty(f, settings)?))
 }
