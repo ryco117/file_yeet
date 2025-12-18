@@ -74,7 +74,7 @@ const ERROR_RED_COLOR: iced::Color = iced::Color::from_rgb(1., 0.35, 0.45);
 pub static EMOJI_FONT: &[u8] = include_bytes!("../../NotoEmoji-Regular.ttf");
 
 /// The delay of mouse inactivity before showing tooltips.
-const TOOLTIP_WAIT_DURATION: Duration = Duration::from_millis(400);
+const TOOLTIP_WAIT_DURATION: Duration = Duration::from_millis(500);
 
 /// The maximum number of lines to keep in the status message history.
 const MAX_LOG_HISTORY_LINES: usize = 256;
@@ -972,8 +972,8 @@ impl AppState {
         mouse_move_elapsed: &Duration,
     ) -> iced::Element<'a, Message> {
         // Define the elements that we want to be modal-aware first.
-        let mut publish_button = widget::button("Publish");
-        let mut download_button = widget::button("Download");
+        let mut publish_button = widget::button("Yeet");
+        let mut download_button = widget::button("Yoink");
         let mut hash_text_input = widget::text_input("Hash", &connected_state.hash_input);
         let mut leave_server_button = widget::button(widget::text("Leave").size(14));
 
@@ -1042,7 +1042,7 @@ impl AppState {
                     Some(connected_state.transfer_view),
                     Message::TransferViewChanged,
                 )
-                .size(18)
+                .size(16)
                 .spacing(8)
                 .into()
             }),
@@ -1563,7 +1563,7 @@ impl AppState {
                     // Duplicate file hash.
                     log_status_change::<LogWarnStatus>(
                         &mut self.status_manager,
-                        "Already publishing file with the same hash".to_owned(),
+                        format!("Already publishing a file with hash {hash}"),
                     );
                     true
                 } else {
@@ -1946,8 +1946,7 @@ impl AppState {
         }
 
         iced::Task::perform(builder.save_file(), move |f| {
-            // TODO: https://github.com/iced-rs/iced/pull/2827 resolves need for `.clone()` here.
-            Message::SubscribePathChosen(f.map(PathBuf::from), hash_hex.clone())
+            Message::SubscribePathChosen(f.map(PathBuf::from), hash_hex)
         })
     }
 
@@ -2305,7 +2304,7 @@ impl AppState {
             return iced::Task::none();
         };
 
-        // TODO: Support multi-downloads from multiple peers.
+        // TODO: Support multi-peer downloads.
         let peer_streams = peer_streams.head;
 
         // Begin the transfer.
@@ -2457,6 +2456,8 @@ impl AppState {
             tracing::warn!("Specified publish item is not in a publishing state");
             return iced::Task::none();
         };
+        tracing::debug!("Copying hash '{hash_hex}' to clipboard");
+
         let copy_string =
             if let Some(extension) = publish_item.path.extension().and_then(OsStr::to_str) {
                 format!("{hash_hex}:{extension}")
@@ -2725,7 +2726,6 @@ impl AppState {
             DownloadState::ResumingHash(progress_lock.clone()),
         );
 
-        // TODO: Support resuming multi-peer downloads.
         let intervals = match paused_progress {
             DownloadState::Paused(intervals) => intervals,
             DownloadState::Done(DownloadResult::Failure(_, RecoverableState::Recoverable(i))) => i
@@ -2740,6 +2740,16 @@ impl AppState {
                 None
             }
         };
+
+        if let Some(intervals) = intervals {
+            // TODO: Support resuming multi-peer downloads.
+            log_status_change::<LogWarnStatus>(
+                &mut self.status_manager,
+                "Resuming download with intervals is not supported yet".to_owned(),
+            );
+            t.progress = DownloadState::Paused(Some(intervals));
+            return iced::Task::none();
+        }
 
         t.base.cancellation_token = CancellationToken::new();
         let cancellation_token = t.base.cancellation_token.clone();
@@ -2944,8 +2954,15 @@ impl AppState {
                 tracing::warn!("Transfer failed: {e}");
             }
 
-            if let Some((_, t)) = binary_find_nonce_mut(uploads, nonce) {
+            if let Some((index, t)) = binary_find_nonce_mut(uploads, nonce) {
                 update_upload_result(&mut t.progress, result, peers, nonce);
+
+                // Remove successful uploads of partial-file ranges from the list.
+                if let UploadState::Done(UploadResult::Success(r)) = &t.progress {
+                    if r.end != t.base.file_size {
+                        uploads.remove(index);
+                    }
+                }
             } else {
                 log_status_change::<LogWarnStatus>(
                     &mut self.status_manager,

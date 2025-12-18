@@ -90,26 +90,34 @@ pub fn settings_path() -> Option<std::path::PathBuf> {
     })
 }
 
+/// The possible errors when loading the app settings.
+#[derive(Debug, thiserror::Error)]
+pub enum LoadSettingsError {
+    #[error("Could not determine a settings path.")]
+    NoDefaultPath,
+
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("Deserialization error: {0}")]
+    Serde(#[from] serde_json::Error),
+}
+
 /// Load the app settings from the settings file, or default if the settings file does not exist.
-pub fn load_settings() -> Result<AppSettings, std::io::Error> {
-    // Get the path to the settings file, or return default settings.
-    let Some(p) = settings_path() else {
-        return Ok(AppSettings::default());
-    };
+pub fn load_settings() -> Result<AppSettings, LoadSettingsError> {
+    // Get the path to the settings file.
+    let path = settings_path().ok_or(LoadSettingsError::NoDefaultPath)?;
 
     // Ensure the settings file and directory exist.
-    if p.exists() {
+    if path.exists() {
         // Try to read the settings for the app.
-        let settings = std::fs::read_to_string(p)?;
-        serde_json::from_str::<AppSettings>(&settings).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("Failed to parse settings: {e}"),
-            )
-        })
+        let settings = std::fs::read_to_string(path)?;
+        Ok(serde_json::from_str::<AppSettings>(&settings)?)
     } else {
-        // Create the settings file and directory.
-        std::fs::create_dir_all(p.parent().unwrap())?;
+        // Ensure the directories necessary to write to the settings file exist.
+        std::fs::create_dir_all(path.parent().unwrap())?;
+
+        // Return default settings.
         Ok(AppSettings::default())
     }
 }

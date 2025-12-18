@@ -89,6 +89,7 @@ fn main() {
     // Initialize logging based on the command line arguments.
     #[allow(unused_variables)]
     let log_to_stdout = logging::init(&args);
+    tracing::debug!("Initialized logging");
 
     // If no subcommand was provided, run the GUI.
     let Some(cmd) = args.cmd else {

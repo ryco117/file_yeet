@@ -195,7 +195,7 @@ pub fn draw_publishes<'a>(
                     tooltip_button(
                         "Remove",
                         Message::RemovePublish(pi.nonce),
-                        "Remove the publish, forgetting the hash. The file is untouched",
+                        "Remove this item, forgetting the hash. The file is untouched",
                     ),
                 ),
 
