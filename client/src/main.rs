@@ -103,10 +103,11 @@ fn main() {
 
         // Run the GUI. Specify that the application should override the default exit behavior.
         if let Err(e) = iced::application(
-            gui::AppState::title(),
+            move || gui::AppState::new(&args),
             gui::AppState::update,
             gui::AppState::view,
         )
+        .title(core::APP_TITLE)
         .subscription(gui::AppState::subscription)
         .theme(gui::AppState::theme)
         .font(gui::EMOJI_FONT)
@@ -115,7 +116,7 @@ fn main() {
             exit_on_close_request: false,
             ..Default::default()
         })
-        .run_with(|| gui::AppState::new(args))
+        .run()
         {
             tracing::error!("GUI failed to run: {e}");
         }

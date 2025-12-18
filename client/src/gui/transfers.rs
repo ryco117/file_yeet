@@ -335,7 +335,7 @@ impl Transfer for DownloadTransfer {
                 ..
             } => widget::row!(
                 "Transferring...",
-                widget::progress_bar(0.0..=1., *p).height(24),
+                widget::progress_bar(0.0..=1., *p).girth(24),
                 tooltip_button(
                     "Pause",
                     Message::CancelOrPauseTransfer(
@@ -361,7 +361,7 @@ impl Transfer for DownloadTransfer {
 
             DownloadState::Paused(_) => widget::row!(
                 "Download is paused",
-                widget::horizontal_space(),
+                widget::space().width(iced::Length::Fill),
                 tooltip_button(
                     "Resume",
                     Message::ResumePausedDownload(self.base.nonce),
@@ -382,7 +382,7 @@ impl Transfer for DownloadTransfer {
 
             DownloadState::ResumingHash(progress_lock) => widget::row!(
                 "Resuming with partial hash...",
-                widget::progress_bar(0.0..=1., *progress_lock.blocking_read()).height(24),
+                widget::progress_bar(0.0..=1., *progress_lock.blocking_read()).girth(24),
                 tooltip_button(
                     "Cancel",
                     Message::CancelOrPauseTransfer(
@@ -468,9 +468,9 @@ impl Transfer for DownloadTransfer {
             progress,
             widget::row!(
                 widget::text(&self.base.hash_hex).size(12),
-                widget::horizontal_space(),
+                widget::space().width(iced::Length::Fill),
                 rate.map_or_else(
-                    || widget::horizontal_space().into(),
+                    || widget::space().into(),
                     |r| Element::from(widget::text(r).size(12)),
                 ),
             ),
@@ -553,7 +553,7 @@ impl Transfer for UploadTransfer {
             } => {
                 let progress = widget::row!(
                     "Transferring...",
-                    widget::progress_bar(0.0..=1., *p).height(24),
+                    widget::progress_bar(0.0..=1., *p).girth(24),
                     tooltip_button(
                         "Cancel",
                         Message::CancelOrPauseTransfer(
@@ -596,7 +596,7 @@ impl Transfer for UploadTransfer {
             progress,
             widget::row!(
                 widget::text(&self.base.hash_hex).size(12),
-                widget::horizontal_space(),
+                widget::space().width(iced::Length::Fill),
                 Element::from(widget::text(rate_or_size).size(12)),
             ),
             widget::row!(

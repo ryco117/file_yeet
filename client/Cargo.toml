@@ -18,7 +18,7 @@ file_yeet_shared = { path = "../shared" }
 futures-channel = "0.3"
 futures-util = "0.3"
 human_bytes = { version = "0.4", features = ["fast"] }
-iced = { version = "0.13", features = ["tokio"] }
+iced = { version = "0.14", features = ["tokio"] }
 netdev = "0.39"
 nonempty = "0.12"
 open = "5.3"

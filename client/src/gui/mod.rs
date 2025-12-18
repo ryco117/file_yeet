@@ -14,11 +14,10 @@ use std::{
 
 use circular_buffer::CircularBuffer;
 use file_yeet_shared::{
-    BiStream, HashBytes, ReadIpPortError, DEFAULT_PORT, GOODBYE_CODE, GOODBYE_MESSAGE,
-    MAX_SERVER_COMMUNICATION_SIZE,
+    BiStream, HashBytes, DEFAULT_PORT, GOODBYE_CODE, GOODBYE_MESSAGE, MAX_SERVER_COMMUNICATION_SIZE,
 };
 use iced::{widget, window, Element};
-use tokio::{io::AsyncWriteExt as _, sync::RwLock};
+use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
@@ -46,6 +45,7 @@ use crate::{
 };
 
 mod publish;
+mod subscriptions;
 mod transfers;
 
 /// The string corresponding to a regex pattern for matching valid IPv6 addresses.
@@ -80,7 +80,7 @@ const TOOLTIP_WAIT_DURATION: Duration = Duration::from_millis(400);
 const MAX_LOG_HISTORY_LINES: usize = 256;
 
 /// Maximum time to wait to gracefully reject a download.
-const MAX_REJECT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+const MAX_REJECT_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// A peer connection representing a single request/command.
 /// Peers may have multiple connections to the same peer for different requests.
@@ -434,7 +434,7 @@ pub enum Message {
 /// The application state and logic.
 impl AppState {
     /// Create a new application state.
-    pub fn new(args: crate::Cli) -> (Self, iced::Task<Message>) {
+    pub fn new(args: &crate::Cli) -> (Self, iced::Task<Message>) {
         let mut status_manager = StatusManager::default();
 
         // Get base settings from the settings file, or default.
@@ -459,11 +459,11 @@ impl AppState {
             } = args;
 
             let mut used_cli = false;
-            if let Some(server_address) = server_address.filter(|s| !s.is_empty()) {
+            if let Some(server_address) = server_address.clone().filter(|s| !s.is_empty()) {
                 settings.server_address = server_address;
                 used_cli = true;
             }
-            if let Some(gateway) = gateway.filter(|g| !g.is_empty()) {
+            if let Some(gateway) = gateway.clone().filter(|g| !g.is_empty()) {
                 settings.gateway_address = Some(gateway);
                 used_cli = true;
             }
@@ -473,9 +473,9 @@ impl AppState {
             }
             if let Some(port) = external_port_override {
                 settings.port_forwarding_text = port.to_string();
-                settings.port_mapping = PortMappingSetting::PortForwarding(Some(port));
+                settings.port_mapping = PortMappingSetting::PortForwarding(Some(*port));
             } else if (!used_cli && matches!(settings.port_mapping, PortMappingSetting::None))
-                || nat_map
+                || *nat_map
             {
                 // Default to enabling NAT-PMP/PCP if no port forwarding is set.
                 // Average users may not know that this is usually the best option for them.
@@ -491,7 +491,7 @@ impl AppState {
         };
 
         // Get the ID of the main window.
-        let window_task = window::get_oldest().map(Message::MainWindowId);
+        let window_task = window::oldest().map(Message::MainWindowId);
 
         // Try connecting immediately if the server address is already set.
         if initial_state.options.server_address.is_empty() {
@@ -502,11 +502,6 @@ impl AppState {
             let connect_task = initial_state.update_connect_clicked();
             (initial_state, window_task.chain(connect_task))
         }
-    }
-
-    /// Get the application title text.
-    pub const fn title() -> &'static str {
-        crate::core::APP_TITLE
     }
 
     /// Update the application state based on a message.
@@ -734,171 +729,24 @@ impl AppState {
     /// Listen for events that should be translated into messages.
     #[tracing::instrument(skip(self))]
     pub fn subscription(&self) -> iced::Subscription<Message> {
-        // Listen for runtime events that iced did not handle internally. Used for safe exit handling.
-        fn unhandled_events() -> iced::Subscription<Message> {
-            iced::event::listen_with(|event, status, window| match status {
-                iced::event::Status::Ignored => Some(Message::UnhandledEvent(window, event)),
-                iced::event::Status::Captured => None,
-            })
-        }
-
-        // Listen for timing intervals to update animations.
-        fn animation() -> iced::Subscription<Message> {
-            iced::time::every(Duration::from_millis(35)).map(|_| Message::AnimationTick)
-        }
-
         match &self.connection_state {
             // Listen for close events and animation ticks when connecting/stalling.
-            ConnectionState::Stalling { .. } => {
-                iced::Subscription::batch([unhandled_events(), animation()])
-            }
+            ConnectionState::Stalling { .. } => subscriptions::stalling(),
 
             ConnectionState::Connected(ConnectedState {
                 endpoint,
                 external_address,
                 publishes,
                 ..
-            }) => {
-                let external_address = external_address.0;
-
-                // Create a task to listen for incoming connections to our QUIC endpoint.
-                let incoming_connections = {
-                    let endpoint = endpoint.clone();
-                    iced::Subscription::run_with_id(
-                        0,
-                        iced::stream::channel(4, move |_output| {
-                            ConnectionsManager::manage_incoming_loop(endpoint)
-                        }),
-                    )
-                };
-
-                // Create a task to renew the port mapping in a loop.
-                let port_mapping = self.port_mapping.clone().into_iter().map(|mut mapping| {
-                    iced::Subscription::run_with_id(
-                        1,
-                        iced::stream::channel(2, move |mut output| {
-                            async move {
-                                let mut last_lifetime = mapping.lifetime() as u64;
-                                let mut interval =
-                                    crate::core::new_renewal_interval(last_lifetime).await;
-                                loop {
-                                    // Ensure a reasonable wait time before each renewal attempt.
-                                    interval.tick().await;
-
-                                    match crate::core::renew_port_mapping(&mut mapping).await {
-                                        Ok(changed) if changed => {
-                                            if let Err(e) = output.try_send(
-                                                Message::PortMappingUpdated(Some(mapping.clone())),
-                                            ) {
-                                                let e = e.into_send_error();
-                                                tracing::error!(
-                                                    "Failed to send port mapping update: {e}"
-                                                );
-                                            }
-
-                                            // Update interval if the lifetime has changed.
-                                            let lifetime = mapping.lifetime() as u64;
-                                            if lifetime != last_lifetime {
-                                                last_lifetime = lifetime;
-                                                interval =
-                                                    crate::core::new_renewal_interval(lifetime)
-                                                        .await;
-                                            }
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!("Failed to renew port mapping: {e}");
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            }
-                            .instrument(tracing::info_span!("Port mapping renewal loop"))
-                        }),
-                    )
-                });
-
-                // For each publish we listen to the server for new peers requesting the file.
-                let pubs = publishes.iter().filter_map(|publish| {
-                    // If the publish is still hashing, skip for now.
-                    let PublishItem {
-                        nonce,
-                        cancellation_token,
-                        state: PublishState::Publishing(publish),
-                        ..
-                    } = &publish
-                    else {
-                        return None;
-                    };
-                    if cancellation_token.is_cancelled() {
-                        // If the cancellation token is cancelled, skip this publish.
-                        // TODO: Return a message to update the `PublishState` to `Cancelled`.
-                        return None;
-                    }
-
-                    let nonce = *nonce;
-                    let cancellation_token = cancellation_token.clone();
-                    let publish = publish.clone();
-
-                    // Subscribe to the server for new peers to upload to.
-                    Some(iced::Subscription::run_with_id(
-                        nonce,
-                        iced::stream::channel(8, async move |output| {
-                            peers_requesting_publish_loop(
-                                publish,
-                                nonce,
-                                &cancellation_token,
-                                external_address,
-                                output,
-                            )
-                            .await;
-
-                            // If we needed to return from the loop, then cancel this item.
-                            cancellation_token.cancel();
-                        }),
-                    ))
-                });
-
-                // Create a listener for each peer that may want a new request stream.
-                let peer_requests =
-                    ConnectionsManager::instance().filter_map(|(peer_addr, connection)| {
-                        let crate::core::IncomingPeerState::Connected(connection) = connection
-                        else {
-                            return None;
-                        };
-
-                        let peer_addr = *peer_addr;
-                        let connection = connection.clone();
-                        Some(iced::Subscription::run_with_id(
-                            peer_addr,
-                            iced::stream::channel(8, move |output| {
-                                async move {
-                                    connected_peer_request_loop(&connection, peer_addr, output)
-                                        .await;
-
-                                    // If we needed to return from the loop, then cancel this item.
-                                    let id = connection.stable_id();
-                                    connection.close(GOODBYE_CODE, GOODBYE_MESSAGE.as_bytes());
-                                    ConnectionsManager::instance()
-                                        .remove_peer(peer_addr, id)
-                                        .await;
-                                }
-                                .instrument(tracing::info_span!("Connected peer request loop"))
-                            }),
-                        ))
-                    });
-
-                // Batch all the listeners together.
-                iced::Subscription::batch(
-                    [unhandled_events(), animation(), incoming_connections]
-                        .into_iter()
-                        .chain(port_mapping)
-                        .chain(pubs)
-                        .chain(peer_requests),
-                )
-            }
+            }) => subscriptions::connected(
+                endpoint,
+                &external_address.0,
+                self.port_mapping.as_ref(),
+                publishes,
+            ),
 
             // Listen for application close events when disconnected.
-            ConnectionState::Disconnected => unhandled_events(),
+            ConnectionState::Disconnected => subscriptions::disconnected(),
         }
     }
 
@@ -921,7 +769,7 @@ impl AppState {
             )
             .spacing(6);
             widget::column![
-                widget::vertical_space(),
+                widget::space().height(iced::Length::Fill),
                 widget::scrollable(content)
                     .spacing(0)
                     .width(iced::Length::Fill)
@@ -942,7 +790,7 @@ impl AppState {
                                 "Pressing close a second time will cancel safety operations."
                             )
                             .size(16),
-                            widget::vertical_space(),
+                            widget::space().height(iced::Length::Fill),
                         )
                         .spacing(4)
                         .align_x(iced::Alignment::Center)
@@ -969,7 +817,7 @@ impl AppState {
                         .height(iced::Length::Shrink),
                 )
             } else {
-                widget::horizontal_space().into()
+                widget::space().width(iced::Length::Fill).into()
             },
             timed_tooltip(
                 widget::button("Status History").on_press_maybe(
@@ -1069,10 +917,10 @@ impl AppState {
 
         widget::container(
             widget::column!(
-                widget::vertical_space(),
+                widget::space().height(iced::Length::Fill),
                 server_address,
                 connect_button,
-                widget::vertical_space().height(iced::Length::FillPortion(2)),
+                widget::space().height(iced::Length::FillPortion(2)),
                 choose_port_mapping,
                 gateway,
             )
@@ -1175,7 +1023,7 @@ impl AppState {
                 mouse_move_elapsed,
             ),
             leave_server_button,
-            widget::horizontal_space(),
+            widget::space().width(iced::Length::Fill),
             "Our External Address:",
             widget::text(&connected_state.external_address.1),
         )
@@ -1210,7 +1058,7 @@ impl AppState {
                     connected_state.uploads.is_empty(),
                 ) {
                     // Both are empty, show nothing.
-                    (true, true) => iced::widget::Space::new(0, 0).into(),
+                    (true, true) => iced::widget::space().into(),
 
                     // Only uploads are empty, show publishes.
                     (false, true) => draw_publishes(&connected_state.publishes, mouse_move_elapsed),
@@ -1243,7 +1091,7 @@ impl AppState {
                 horizontal_line(),
                 widget::row!(
                     publish_button,
-                    widget::Space::with_width(iced::Length::Fixed(10.)),
+                    widget::space().width(iced::Length::Fixed(10.)),
                     download_input,
                 )
                 .spacing(6),
@@ -3310,7 +3158,7 @@ fn sort_nonce<T: NonceItem>(items: &mut [T]) {
 
 /// Helper for creating a horizontal line.
 fn horizontal_line<'c>() -> iced::Element<'c, Message> {
-    widget::horizontal_rule(3).into()
+    widget::rule::horizontal(3).into()
 }
 
 /// A trait to log status messages at different levels.
@@ -3432,48 +3280,6 @@ enum PeerConnectionOrTarget {
     Target(quinn::Endpoint, SocketAddr),
 }
 
-/// An asynchronous loop to await new requests from a peer connection.
-#[tracing::instrument(skip_all)]
-async fn connected_peer_request_loop(
-    connection: &quinn::Connection,
-    peer_address: SocketAddr,
-    mut output: futures_channel::mpsc::Sender<Message>,
-) {
-    loop {
-        // Wait for a new bi-directional stream request from the peer.
-        match connection.accept_bi().await.map(BiStream::from) {
-            Ok(mut streams) => {
-                // Get the file hash desired by the peer.
-                let mut hash = HashBytes::default();
-                if let Err(e) = streams.recv.read_exact(&mut hash.bytes).await {
-                    tracing::warn!("Failed to read hash from peer: {e}");
-                    continue;
-                }
-                tracing::debug!("Peer requested transfer: {hash}");
-
-                if let Err(e) = output.try_send(Message::PeerRequestedTransfer((
-                    hash,
-                    PeerRequestStream::new(connection.clone(), streams),
-                ))) {
-                    tracing::error!(
-                        "Failed to perform internal message passing for peer requested stream: {e}"
-                    );
-                    return;
-                }
-            }
-
-            Err(e) => {
-                if cfg!(debug_assertions) {
-                    tracing::debug!("Peer connection closed: {peer_address} {e:?}");
-                } else {
-                    tracing::debug!("Peer connection closed: {e:?}");
-                }
-                return;
-            }
-        }
-    }
-}
-
 /// Helper to get a task to hash a file and return the file size and hash.
 #[tracing::instrument(skip(cancellation, progress))]
 fn hash_publish_task(
@@ -3504,87 +3310,6 @@ fn hash_publish_task(
             },
         },
     )
-}
-
-/// For the given publish, await peers desiring to receive the file.
-#[tracing::instrument(skip(publish, cancellation_token, output, our_external_address))]
-async fn peers_requesting_publish_loop(
-    publish: Publish,
-    nonce: Nonce,
-    cancellation_token: &CancellationToken,
-    our_external_address: SocketAddr,
-    mut output: futures_channel::mpsc::Sender<Message>,
-) {
-    loop {
-        let mut request = publish.server_streams.lock().await;
-
-        tokio::select! {
-            // Let the task be cancelled.
-            () = cancellation_token.cancelled() => {
-                // Send data back to the server to tell them we are done with this task.
-                if let Err(e) = request.send.write_u8(0).await {
-                    let kind = e.kind();
-                    if let Ok(e) = e.downcast() {
-                        if matches!(e, crate::core::LOCALLY_CLOSED_WRITE) {
-                            // This error is expected in quick closes, don't warn.
-                            tracing::debug!("Closed endpoint before explicit publish cancel");
-                        } else {
-                            tracing::warn!("Failed to tell server to cancel publish: {e:?}");
-                        }
-                    } else {
-                        tracing::warn!("Failed to tell server to cancel publish of IO kind: {kind:?}");
-                    }
-                }
-
-                return;
-            }
-
-            // Await the server to send a peer connection.
-            result = crate::core::read_subscribing_peer(
-                &mut request.recv,
-                Some(our_external_address),
-            ) => {
-                // Handle errors appropriately based on the error type.
-                if let Err(e) = result {
-                    match e {
-                        // Our address was sent as a peer, expected while testing.
-                        ReadSubscribingPeerError::SelfAddress => {
-                            tracing::debug!("Expected failure to read peer introduction: {e}");
-                            continue;
-                        }
-
-                        // Unexpected error, log and continue.
-                        ReadSubscribingPeerError::ReadSocket(e) => {
-                            if matches!(e, ReadIpPortError::ReadIp(
-                                quinn::ReadExactError::ReadError(crate::core::LOCALLY_CLOSED_READ)
-                            )) {
-                                // Locally closed connection, expected.
-                                tracing::debug!("Expected failure to read peer introduction: Locally closed connection");
-                                return;
-                            }
-                            tracing::warn!("Failed to read peer introduction: {e}");
-
-                            // Try to tell the client to cancel the publish task.
-                            if let Err(e) = output.try_send(Message::PublishRequestResulted(nonce, PublishRequestResult::Failure(Arc::new(e.into())))) {
-                                tracing::error!("Failed to perform internal message passing for subscription peer: {e}");
-                            }
-                            return;
-                        }
-                    }
-                }
-
-                // Send the result back to the main loop.
-                if let Err(e) = output.try_send(Message::PublishPeerReceived(
-                        nonce,
-                        result.map_err(Arc::new),
-                    ))
-                {
-                    tracing::error!("Failed to perform internal message passing for subscription peer: {e}");
-                    return;
-                }
-            }
-        }
-    }
 }
 
 /// Try to establish a peer connection for a command type.

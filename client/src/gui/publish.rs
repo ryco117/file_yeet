@@ -133,7 +133,7 @@ pub fn draw_publishes<'a>(
                     widget::column!(
                         widget::row!(
                             widget::text("Hashing...").size(12),
-                            widget::progress_bar(0.0..=1., *progress.blocking_read()).height(12),
+                            widget::progress_bar(0.0..=1., *progress.blocking_read()).girth(12),
                         )
                         .spacing(6),
                         file_path_scrollable,
