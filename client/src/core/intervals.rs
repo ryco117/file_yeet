@@ -1,5 +1,9 @@
-/// Download interval chunk size in bytes.
-const DOWNLOAD_CHUNK_INTERVAL: u64 = 256 * 1024 * 1024;
+/// Maximum recommended download interval chunk size in bytes.
+pub const DOWNLOAD_CHUNK_INTERVAL_MAX: u64 = 256 * 1024 * 1024;
+
+/// Minimum recommended interval chunk size in bytes.
+/// The actual minimum should always be the remaining size if it is smaller than this.
+pub const DOWNLOAD_CHUNK_INTERVAL_MIN: u64 = 64 * 1024;
 
 /// Trait defining a type containing range data.
 pub trait RangeData {
@@ -68,10 +72,7 @@ impl<R: RangeData> FileIntervals<R> {
             return Err(AddIntervalError::OutOfBounds(range_end));
         }
 
-        let Err(i) = self
-            .intervals
-            .binary_search_by(|r| r.start().cmp(&range_start))
-        else {
+        let Err(i) = self.intervals.binary_search_by_key(&range_start, R::start) else {
             return Err(AddIntervalError::OverlappingIntervals);
         };
 
@@ -86,10 +87,27 @@ impl<R: RangeData> FileIntervals<R> {
         Ok(())
     }
 
+    /// Remove the interval with the given range start.
+    /// Returns the removed interval, or `None` if the interval was not found.
+    pub fn remove_interval_at(&mut self, range_start: u64) -> Option<R> {
+        let index = self
+            .intervals
+            .binary_search_by_key(&range_start, RangeData::start)
+            .ok()?;
+
+        let range = self.intervals.remove(index);
+        self.remaining_size += range.end() - range.start();
+        Some(range)
+    }
+
     /// Get the next empty range available.
     /// Returns `None` if there are no gaps.
     #[must_use]
     pub fn next_empty_range(&self) -> Option<std::ops::Range<u64>> {
+        if self.remaining_size == 0 {
+            return None;
+        }
+
         // Look through intervals for gaps.
         let mut last_end = 0;
         for range in &self.intervals {
@@ -103,20 +121,23 @@ impl<R: RangeData> FileIntervals<R> {
         if last_end < self.total_size {
             return Some(last_end..self.total_size);
         }
+
+        tracing::error!("FileIntervals::next_empty_range: remaining_size > 0 but no gaps found");
         None
     }
 
-    /// Get the next download chunk range.
+    /// Get the next download chunk range. Prefers to take the maximum chunk size, `DOWNLOAD_CHUNK_INTERVAL_MAX`.
     /// Returns `None` if there are no gaps.
+    #[must_use]
     pub fn next_download_chunk(&self) -> Option<std::ops::Range<u64>> {
         let empty_range = self.next_empty_range()?;
         let chunk_end = empty_range
             .end
-            .min(empty_range.start + DOWNLOAD_CHUNK_INTERVAL);
+            .min(empty_range.start + DOWNLOAD_CHUNK_INTERVAL_MAX);
         Some(empty_range.start..chunk_end)
     }
 
-    /// Convert the ranges to another type. Safely filters out zero-size ranges.
+    /// Convert the ranges to another type. Filters out zero-size ranges (after conversion) without error.
     /// # Errors
     /// Returns an error if adding any of the converted ranges fails.
     pub fn convert_ranges<S, F>(self, f: F) -> Result<FileIntervals<S>, AddIntervalError>
@@ -152,17 +173,5 @@ impl<R: RangeData> FileIntervals<R> {
     #[must_use]
     pub fn ranges(&self) -> &[R] {
         &self.intervals
-    }
-
-    /// Get the remaining size to be downloaded.
-    #[must_use]
-    pub fn remaining_size(&self) -> u64 {
-        self.remaining_size
-    }
-
-    /// Get the total file size.
-    #[must_use]
-    pub fn total_size(&self) -> u64 {
-        self.total_size
     }
 }

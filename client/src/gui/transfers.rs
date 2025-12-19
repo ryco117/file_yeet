@@ -139,7 +139,7 @@ impl RangeData for DownloadPartRange {
 /// A download from multiple peers.
 #[derive(Debug)]
 pub struct DownloadMultiPeer {
-    pub peers: HashSet<quinn::Connection>,
+    pub peers: HashMap<usize, quinn::Connection>,
     pub intervals: FileIntervals<DownloadPartRange>,
 }
 
@@ -169,8 +169,8 @@ pub enum DownloadState {
     /// The transfer has been paused.
     Paused(Option<FileIntervals<std::ops::Range<u64>>>),
 
-    /// Resuming a download by hashing the partial file.
-    ResumingHash(Arc<RwLock<f32>>),
+    /// Hashing the output file for resuming a partial download or verifying a result.
+    HashingFile(Arc<RwLock<f32>>),
 
     /// The transfer has completed.
     Done(DownloadResult),
@@ -180,20 +180,28 @@ impl DownloadState {
     /// Otherwise, return `None`.
     pub fn connections(&self) -> Box<dyn std::iter::Iterator<Item = &quinn::Connection> + '_> {
         match self {
-            // Connection in these states.
+            // Connections in these states.
             DownloadState::Consent(peers) => Box::new(peers.iter().map(|p| &p.connection)),
             DownloadState::Transferring {
                 strategy: DownloadStrategy::SinglePeer(DownloadSinglePeer { peer, .. }),
                 ..
             } => Box::new(std::iter::once(peer)),
-
             DownloadState::Transferring {
                 strategy: DownloadStrategy::MultiPeer(DownloadMultiPeer { peers, .. }),
                 ..
-            } => Box::new(peers.iter()),
+            } => Box::new(peers.values()),
 
             // No connections in the remaining states.
             _ => Box::new(std::iter::empty()),
+        }
+    }
+
+    /// Helper to create a new `DownloadState::Transferring {}` state.
+    pub fn new_transferring(strategy: DownloadStrategy) -> Self {
+        DownloadState::Transferring {
+            strategy,
+            progress_animation: 0.,
+            snapshot: TransferSnapshot::new(),
         }
     }
 }
@@ -380,8 +388,8 @@ impl Transfer for DownloadTransfer {
             .spacing(6)
             .into(),
 
-            DownloadState::ResumingHash(progress_lock) => widget::row!(
-                "Resuming with partial hash...",
+            DownloadState::HashingFile(progress_lock) => widget::row!(
+                "Hashing file...",
                 widget::progress_bar(0.0..=1., *progress_lock.blocking_read()).girth(24),
                 tooltip_button(
                     "Cancel",
@@ -390,7 +398,7 @@ impl Transfer for DownloadTransfer {
                         FileYeetCommandType::Sub,
                         CancelOrPause::Cancel,
                     ),
-                    "Cancel attempting to resume the download",
+                    "Cancel the download, abandoning progress",
                 ),
             )
             .spacing(6)
@@ -645,7 +653,7 @@ pub fn update_download_result(
             {
                 tracing::debug!("Download already marked as cancelled");
             } else {
-                tracing::warn!("Download already marked as done {done}");
+                tracing::warn!("Download already marked as done: {done}");
             }
             return;
         }
@@ -675,14 +683,20 @@ pub fn update_upload_result(
         if matches!(result, UploadResult::Cancelled) && matches!(done, UploadResult::Cancelled) {
             tracing::debug!("Upload already marked as cancelled");
         } else {
-            tracing::warn!("Upload already marked as done {done}");
+            tracing::warn!("Upload already marked as done: {done}");
         }
         return;
     }
 
     // If the upload was connected to a peer, remove the nonce from transactions.
     if let Some(connection) = progress.connection() {
-        remove_nonce_for_peer(connection, peers, nonce);
+        // Upload nonces should only be removed when not successful.
+        // This is to ensure healthy connections are not closed before peers have completed all their downloads.
+        if matches!(result, UploadResult::Success(_)) {
+            tracing::debug!("Not removing nonces for successful uploads");
+        } else {
+            remove_nonce_for_peer(connection, peers, nonce);
+        }
     }
 
     // Mark the transfer as done.

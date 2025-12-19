@@ -355,7 +355,7 @@ where
         };
         if cancellation_token.is_cancelled() {
             // If the cancellation token is cancelled, skip this publish.
-            // TODO: Return a message to update the `PublishState` to `Cancelled`.
+            // This shouldn't happen but this check is included out of an abundance of caution.
             return None;
         }
 

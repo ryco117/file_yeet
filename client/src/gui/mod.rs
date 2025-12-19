@@ -24,17 +24,17 @@ use tracing::Instrument as _;
 use crate::{
     core::{
         humanize_bytes,
-        intervals::{FileIntervals, RangeData as _},
+        intervals::{FileIntervals, RangeData as _, DOWNLOAD_CHUNK_INTERVAL_MIN},
         peer_connection_into_stream, udp_holepunch, ConnectionsManager, FileYeetCommandType,
-        PortMappingConfig, PrepareConnectionError, PreparedConnection, ReadSubscribingPeerError,
-        SubscribeError, HASH_EXT_REGEX, MAX_PEER_COMMUNICATION_SIZE, PEER_CONNECT_TIMEOUT,
-        SERVER_CONNECTION_TIMEOUT,
+        Hasher, PortMappingConfig, PrepareConnectionError, PreparedConnection,
+        ReadSubscribingPeerError, SubscribeError, HASH_EXT_REGEX, MAX_PEER_COMMUNICATION_SIZE,
+        PEER_CONNECT_TIMEOUT, SERVER_CONNECTION_TIMEOUT,
     },
     gui::{
         publish::{draw_publishes, Publish, PublishItem, PublishRequestResult, PublishState},
         transfers::{
-            update_download_result, update_upload_result, DownloadMultiPeer, DownloadResult,
-            DownloadSinglePeer, DownloadState, DownloadStrategy, DownloadTransfer,
+            update_download_result, update_upload_result, DownloadMultiPeer, DownloadPartRange,
+            DownloadResult, DownloadSinglePeer, DownloadState, DownloadStrategy, DownloadTransfer,
             RecoverableState, Transfer, TransferBase, TransferSnapshot, UploadResult, UploadState,
             UploadTransfer,
         },
@@ -409,11 +409,21 @@ pub enum Message {
     /// A resume attempt to get a partial file hash completed.
     ResumeFromPartialHashFile(
         Nonce,
-        Result<(sha2::Sha256, u64, PeerRequestStream), Option<Arc<anyhow::Error>>>,
+        Result<(Hasher, u64, PeerRequestStream), Option<Arc<String>>>,
     ),
 
     /// The result of a download attempt.
     DownloadTransferResulted(Nonce, DownloadResult),
+
+    /// The result of an attempt to initialize a multi-peer download by allocating the output file.
+    PrepareMultiPeerDownloadResulted(
+        Nonce,
+        Result<nonempty::NonEmpty<PeerRequestStream>, Arc<std::io::Error>>,
+    ),
+
+    /// The result of a chunk download from a peer in a multi-peer download.
+    /// `usize` is the connection ID in the multi-peer download.
+    MultiPeerDownloadTransferResulted(Nonce, std::ops::Range<u64>, usize, DownloadResult),
 
     /// The result of an upload attempt.
     UploadTransferResulted(Nonce, UploadResult),
@@ -654,6 +664,11 @@ impl AppState {
                 self.update_resume_partial_hash(nonce, result)
             }
             Message::DownloadTransferResulted(nonce, r) => self.update_download_resulted(nonce, r),
+            Message::PrepareMultiPeerDownloadResulted(nonce, r) => {
+                self.update_prepare_multi_peer_download_resulted(nonce, r)
+            }
+            Message::MultiPeerDownloadTransferResulted(nonce, range, connection_id, result) => self
+                .update_multi_peer_download_transfer_resulted(nonce, range, connection_id, result),
             Message::UploadTransferResulted(nonce, r) => self.update_upload_resulted(nonce, r),
 
             // Handle the `Open` button being pressed.
@@ -1493,39 +1508,14 @@ impl AppState {
                 } else {
                     log_status_change::<LogWarnStatus>(
                         &mut self.status_manager,
-                        format!("Publish chosen for unknown nonce {nonce}"),
+                        "Publish chosen for unknown item".to_owned(),
                     );
                     return iced::Task::none();
                 }
             }
         };
 
-        iced::Task::perform(
-            async move {
-                tracing::info!("Determine the file size and hash for publish");
-                tokio::select! {
-                    // Allow cancelling the publish request thread.
-                    () = cancellation_token.cancelled() => Err(PublishRequestResult::Cancelled),
-
-                    // Get the file size and hash of the chosen file to publish.
-                    r = crate::core::file_size_and_hash(&path, Some(&progress)) => match r {
-                        Ok(p) => Ok(p),
-                        Err(e) => {
-                            Err(PublishRequestResult::Failure(Arc::new(e.into())))
-                        }
-                    }
-                }
-            },
-            move |r| match r {
-                Err(r) => Message::PublishRequestResulted(nonce, r),
-                Ok((file_size, hash)) => Message::PublishFileHashed {
-                    publish: CreateOrExistingPublish::Existing(nonce),
-                    hash,
-                    file_size,
-                    new_hash: true, // The hash was freshly calculated.
-                },
-            },
-        )
+        hash_publish_task(nonce, path, cancellation_token, progress)
     }
 
     /// Take a file and hash info and create a new publish request.
@@ -1563,7 +1553,7 @@ impl AppState {
                     // Duplicate file hash.
                     log_status_change::<LogWarnStatus>(
                         &mut self.status_manager,
-                        format!("Already publishing a file with hash {hash}"),
+                        format!("Already publishing hash {hash}"),
                     );
                     true
                 } else {
@@ -1618,7 +1608,7 @@ impl AppState {
                 } else {
                     log_status_change::<LogWarnStatus>(
                         &mut self.status_manager,
-                        format!("Publish file hashed for unknown nonce {nonce}"),
+                        "Publish file hashed for unknown item".to_owned(),
                     );
                     return iced::Task::none();
                 }
@@ -1820,7 +1810,7 @@ impl AppState {
         else {
             log_status_change::<LogWarnStatus>(
                 &mut self.status_manager,
-                format!("Peer connected for unknown publish nonce {pub_nonce}"),
+                "Peer connected for unknown publish item".to_owned(),
             );
             return iced::Task::none();
         };
@@ -2244,7 +2234,7 @@ impl AppState {
         let Some((index, transfer)) = binary_find_nonce_mut(downloads, nonce) else {
             log_status_change::<LogWarnStatus>(
                 &mut self.status_manager,
-                "Subscribe connect resulted for unknown nonce".to_owned(),
+                "Subscribe connect resulted for unknown item".to_owned(),
             );
             return iced::Task::none();
         };
@@ -2290,10 +2280,8 @@ impl AppState {
         let progress = std::mem::replace(&mut transfer.progress, DownloadState::Connecting);
 
         // Get necessary info for the download.
-        let hash = transfer.base.hash;
-        let file_size = transfer.base.file_size;
         let DownloadState::Consent(peer_streams) = progress else {
-            log_status_change::<LogErrorStatus>(
+            log_status_change::<LogWarnStatus>(
                 &mut self.status_manager,
                 "Transfer is not in consent state".to_owned(),
             );
@@ -2303,28 +2291,64 @@ impl AppState {
 
             return iced::Task::none();
         };
-
-        // TODO: Support multi-peer downloads.
-        let peer_streams = peer_streams.head;
-
-        // Begin the transfer.
-        let byte_progress = Arc::new(RwLock::new(0));
-        transfer.progress = DownloadState::Transferring {
-            strategy: DownloadStrategy::SinglePeer(DownloadSinglePeer {
-                peer_string: peer_streams.connection.remote_address().to_string(),
-                peer: peer_streams.connection.clone(),
-                progress_lock: byte_progress.clone(),
-            }),
-            progress_animation: 0.,
-            snapshot: TransferSnapshot::new(),
-        };
+        let hash = transfer.base.hash;
+        let file_size = transfer.base.file_size;
         let output_path = transfer.base.path.clone();
-        let cancellation_token = transfer.base.cancellation_token.clone();
-        let path = transfer.base.path.clone();
+
+        let task = if peer_streams.tail.is_empty() {
+            // Single peer download optimization.
+            let peer_stream = peer_streams.head;
+
+            // Set the transfer state for a single peer download.
+            let byte_progress = Arc::new(RwLock::new(0));
+            transfer.progress =
+                DownloadState::new_transferring(DownloadStrategy::SinglePeer(DownloadSinglePeer {
+                    peer_string: peer_stream.connection.remote_address().to_string(),
+                    peer: peer_stream.connection.clone(),
+                    progress_lock: byte_progress.clone(),
+                }));
+            let cancellation_token = transfer.base.cancellation_token.clone();
+
+            // Download the full file from the peer.
+            iced::Task::perform(
+                full_download(
+                    peer_stream,
+                    cancellation_token,
+                    byte_progress,
+                    hash,
+                    file_size,
+                    output_path.clone(),
+                ),
+                move |r| Message::DownloadTransferResulted(nonce, r),
+            )
+        } else {
+            // Set the transfer state for a multi-peer download.
+            transfer.progress =
+                DownloadState::new_transferring(DownloadStrategy::MultiPeer(DownloadMultiPeer {
+                    peers: peer_streams
+                        .iter()
+                        .map(|p| (p.connection.stable_id(), p.connection.clone()))
+                        .collect(),
+                    intervals: FileIntervals::new(file_size),
+                }));
+
+            // Start by creating the output file with the necessary size.
+            // This is to allow each concurrent chunk to write into the file at the correct position.
+            let output_path = output_path.clone();
+            iced::Task::perform(
+                async move { create_sized_file(file_size, &output_path) },
+                move |r| {
+                    Message::PrepareMultiPeerDownloadResulted(
+                        nonce,
+                        r.map(|()| peer_streams).map_err(Arc::new),
+                    )
+                },
+            )
+        };
 
         // Remove all downloads to the same path when accepting this one.
         downloads.retain(|d| {
-            if d.base.path == path
+            if d.base.path == output_path
                 && d.base.nonce != nonce
                 && matches!(
                     d.progress,
@@ -2338,39 +2362,7 @@ impl AppState {
             }
         });
 
-        iced::Task::perform(
-            async move {
-                let mut peer_streams_lock = peer_streams.bistream.lock().await;
-
-                tokio::select! {
-                    // Let the transfer be cancelled. This is not an error if cancelled.
-                    () = cancellation_token.cancelled() => DownloadResult::Cancelled,
-
-                    // Await the file to be downloaded.
-                    result = crate::core::download_from_peer(
-                        hash,
-                        &mut peer_streams_lock,
-                        file_size,
-                        &output_path,
-                        Some(&byte_progress),
-                    ) => {
-                        match result {
-                            Ok(()) => DownloadResult::Success,
-                            Err(e) => {
-                                let recoverable = if e.is_recoverable() {
-                                    // No file interval needs to be stored for synchronous download type.
-                                    RecoverableState::Recoverable(None)
-                                } else {
-                                    RecoverableState::NonRecoverable
-                                };
-                                DownloadResult::Failure(Arc::new(format!("Download failed: {e}")), recoverable)
-                            }
-                        }
-                    }
-                }
-            },
-            move |r| Message::DownloadTransferResulted(nonce, r),
-        )
+        task
     }
 
     /// A download was rejected. Remove the transfer from the downloads list.
@@ -2456,7 +2448,6 @@ impl AppState {
             tracing::warn!("Specified publish item is not in a publishing state");
             return iced::Task::none();
         };
-        tracing::debug!("Copying hash '{hash_hex}' to clipboard");
 
         let copy_string =
             if let Some(extension) = publish_item.path.extension().and_then(OsStr::to_str) {
@@ -2464,6 +2455,7 @@ impl AppState {
             } else {
                 hash_hex.clone()
             };
+        tracing::debug!("Copying hash '{copy_string}' to clipboard");
         iced::clipboard::write(copy_string)
     }
 
@@ -2684,7 +2676,7 @@ impl AppState {
         .unwrap_or_else(|| {
             log_status_change::<LogWarnStatus>(
                 &mut self.status_manager,
-                format!("No transfer found to {cancel_or_pause:?} for nonce"),
+                format!("No transfer found to {cancel_or_pause:?}"),
             );
         });
         iced::Task::none()
@@ -2709,7 +2701,7 @@ impl AppState {
         let Some((_, t)) = binary_find_nonce_mut(downloads, nonce) else {
             log_status_change::<LogWarnStatus>(
                 &mut self.status_manager,
-                "No download found to resume for nonce".to_owned(),
+                "No download found to resume".to_owned(),
             );
             return iced::Task::none();
         };
@@ -2723,7 +2715,7 @@ impl AppState {
         let progress_lock = Arc::new(RwLock::new(0.));
         let paused_progress = std::mem::replace(
             &mut t.progress,
-            DownloadState::ResumingHash(progress_lock.clone()),
+            DownloadState::HashingFile(progress_lock.clone()),
         );
 
         let intervals = match paused_progress {
@@ -2763,13 +2755,13 @@ impl AppState {
                 Some(&progress_lock),
             ))
             .await
-            .map_err(|e| Some(Arc::new(e.into())))?;
+            .map_err(|e| Some(Arc::new(format!("{e}"))))?;
 
             // Get the list of peers to resume the download from.
             let mut bb = bytes::BytesMut::with_capacity(MAX_PEER_COMMUNICATION_SIZE);
             let peers = crate::core::subscribe(&server, &mut bb, hash, Some(external_address))
                 .await
-                .map_err(|e| Some(Arc::new(e.into())))?;
+                .map_err(|e| Some(Arc::new(format!("{e}"))))?;
 
             // Get a request stream to the peer to resume the download.
             let request = first_matching_download(&endpoint, &peers, hash, final_file_size)
@@ -2786,7 +2778,7 @@ impl AppState {
                     // Allow cancelling the resume request.
                     () = cancellation_token.cancelled() => {
                         tracing::debug!("Cancelling the resume request");
-                        Err(Some(Arc::new(anyhow::anyhow!("Cancelled"))))
+                        Err(Some(Arc::new("Cancelled".to_owned())))
                     }
 
                     // Await the resume request to complete.
@@ -2802,7 +2794,7 @@ impl AppState {
     fn update_resume_partial_hash(
         &mut self,
         nonce: Nonce,
-        result: Result<(sha2::Sha256, u64, PeerRequestStream), Option<Arc<anyhow::Error>>>,
+        result: Result<(Hasher, u64, PeerRequestStream), Option<Arc<String>>>,
     ) -> iced::Task<Message> {
         let ConnectionState::Connected(ConnectedState {
             peers, downloads, ..
@@ -2815,7 +2807,7 @@ impl AppState {
         let Some((_, t)) = binary_find_nonce_mut(downloads, nonce) else {
             log_status_change::<LogWarnStatus>(
                 &mut self.status_manager,
-                "No download found to resume partial hash for nonce".to_owned(),
+                "No download found to resume partial hash".to_owned(),
             );
             return iced::Task::none();
         };
@@ -2843,47 +2835,15 @@ impl AppState {
                 insert_nonce_for_peer(request.connection.remote_address(), peers, nonce);
 
                 iced::Task::perform(
-                    async move {
-                        let mut file = match tokio::fs::OpenOptions::new()
-                            .write(true)
-                            .append(true)
-                            .open(path.as_ref())
-                            .await
-                        {
-                            Ok(f) => f,
-                            Err(e) => {
-                                return DownloadResult::Failure(
-                                    Arc::new(format!("Failed to open the file: {e}")),
-                                    RecoverableState::Recoverable(None),
-                                )
-                            }
-                        };
-
-                        // Try to upload the file to the peer connection.
-                        let mut request = request.bistream.lock().await;
-                        tokio::select! {
-                            () = cancellation_token.cancelled() => DownloadResult::Cancelled,
-
-                            result = Box::pin(crate::core::download_partial_from_peer(
-                                hash,
-                                &mut request,
-                                &mut file,
-                                crate::core::DownloadOffsetState::new(start_index..file_size, Some(digest)),
-                                Some(&progress),
-                            )) => match result {
-                                Ok(()) => DownloadResult::Success,
-                                Err(e) => {
-                                    let recoverable = if e.is_recoverable() {
-                                        // No file interval needs to be stored for synchronous download type.
-                                        RecoverableState::Recoverable(None)
-                                    } else {
-                                        RecoverableState::NonRecoverable
-                                    };
-                                    DownloadResult::Failure(Arc::new(format!("Upload failed: {e}")), recoverable)
-                                },
-                            }
-                        }
-                    },
+                    partial_download(
+                        request,
+                        cancellation_token,
+                        progress,
+                        hash,
+                        start_index..file_size,
+                        path,
+                        Some(digest),
+                    ),
                     move |r| Message::DownloadTransferResulted(nonce, r),
                 )
             }
@@ -2930,13 +2890,333 @@ impl AppState {
             } else {
                 log_status_change::<LogWarnStatus>(
                     &mut self.status_manager,
-                    "No download found to update result for nonce".to_owned(),
+                    "No download found to update result".to_owned(),
                 );
             }
         } else {
             tracing::warn!("No connected state to update transfer result");
         }
         iced::Task::none()
+    }
+
+    /// Update the state after preparation for a multi-peer download has resulted.
+    #[tracing::instrument(skip(self, result))]
+    fn update_prepare_multi_peer_download_resulted(
+        &mut self,
+        nonce: Nonce,
+        result: Result<nonempty::NonEmpty<PeerRequestStream>, Arc<std::io::Error>>,
+    ) -> iced::Task<Message> {
+        let ConnectionState::Connected(ConnectedState { downloads, .. }) =
+            &mut self.connection_state
+        else {
+            tracing::warn!("No connected state to update multi-peer download");
+            return iced::Task::none();
+        };
+
+        let Some((_, t)) = binary_find_nonce_mut(downloads, nonce) else {
+            log_status_change::<LogWarnStatus>(
+                &mut self.status_manager,
+                "No item found to prepare multi-peer download".to_owned(),
+            );
+            return iced::Task::none();
+        };
+
+        match result {
+            Ok(peer_streams) => {
+                // Get the intervals manager for this download.
+                let DownloadState::Transferring {
+                    strategy: DownloadStrategy::MultiPeer(DownloadMultiPeer { intervals, .. }),
+                    ..
+                } = &mut t.progress
+                else {
+                    log_status_change::<LogWarnStatus>(
+                        &mut self.status_manager,
+                        "Download not in multi-peer transferring state".to_owned(),
+                    );
+                    return iced::Task::none();
+                };
+
+                let cancellation_token = t.base.cancellation_token.clone();
+                let hash = t.base.hash;
+                let output_path = t.base.path.clone();
+
+                let peer_share = u64::max(
+                    (t.base.file_size / peer_streams.len() as u64) / 2,
+                    DOWNLOAD_CHUNK_INTERVAL_MIN,
+                );
+                let tasks = peer_streams.into_iter().filter_map(|request| {
+                    let mut chunk = intervals.next_download_chunk()?;
+
+                    // Compare the chunk size to the fair peer share to promote each peer being utilized.
+                    if chunk.end - chunk.start > peer_share {
+                        chunk.end = chunk.start + peer_share;
+                    }
+
+                    let progress = Arc::new(RwLock::new(0));
+                    if let Err(e) = intervals.add_interval(DownloadPartRange {
+                        range: chunk.clone(),
+                        progress_lock: progress.clone(),
+                    }) {
+                        // Should never happen since we just got the chunk from `next_download_chunk`.
+                        // Log and treat as though no chunk is available.
+                        tracing::error!("Failed to add download interval: {e}");
+                        return None;
+                    }
+
+                    // Create a task which will seek to the correct position in the file and download the chunk.
+                    let stable_id = request.connection.stable_id();
+                    Some(iced::Task::perform(
+                        partial_download(
+                            request,
+                            cancellation_token.clone(),
+                            progress,
+                            hash,
+                            chunk.clone(),
+                            output_path.clone(),
+                            None,
+                        ),
+                        move |r| {
+                            Message::MultiPeerDownloadTransferResulted(nonce, chunk, stable_id, r)
+                        },
+                    ))
+                });
+                iced::Task::batch(tasks)
+            }
+
+            Err(e) => {
+                let err = format!("Failed to prepare output file: {e}");
+                tracing::warn!("{err}");
+                t.progress = DownloadState::Done(DownloadResult::Failure(
+                    Arc::new(err),
+                    RecoverableState::NonRecoverable,
+                ));
+                iced::Task::none()
+            }
+        }
+    }
+
+    /// Update the state after a multi-peer download transfer chunk has concluded, successfully or not.
+    #[tracing::instrument(skip(self, result))]
+    fn update_multi_peer_download_transfer_resulted(
+        &mut self,
+        nonce: Nonce,
+        range: std::ops::Range<u64>,
+        connection_id: usize,
+        result: DownloadResult,
+    ) -> iced::Task<Message> {
+        let ConnectionState::Connected(ConnectedState { downloads, .. }) =
+            &mut self.connection_state
+        else {
+            tracing::warn!("No connected state to update multi-peer download transfer");
+            return iced::Task::none();
+        };
+
+        let Some((_, t)) = binary_find_nonce_mut(downloads, nonce) else {
+            log_status_change::<LogWarnStatus>(
+                &mut self.status_manager,
+                "No item found to update multi-peer download".to_owned(),
+            );
+            return iced::Task::none();
+        };
+
+        let DownloadState::Transferring {
+            strategy: DownloadStrategy::MultiPeer(DownloadMultiPeer { peers, intervals }),
+            ..
+        } = &mut t.progress
+        else {
+            log_status_change::<LogWarnStatus>(
+                &mut self.status_manager,
+                "Download not in multi-peer transferring state".to_owned(),
+            );
+            return iced::Task::none();
+        };
+
+        match result {
+            DownloadResult::Success => {
+                if let Some(next_chunk) = intervals.next_download_chunk() {
+                    // Select a peer to download the next chunk from.
+                    // We should use the same peer if possible as this naturally balances load.
+                    let Some(peer) = peers.get(&connection_id).cloned() else {
+                        tracing::warn!("Peer is not available for next download chunk");
+                        return iced::Task::none();
+                    };
+
+                    let progress = Arc::new(RwLock::new(0));
+                    if let Err(e) = intervals.add_interval(DownloadPartRange {
+                        range: next_chunk.clone(),
+                        progress_lock: progress.clone(),
+                    }) {
+                        // Should never happen since we just got the chunk from `next_download_chunk`.
+                        // Log and do not proceed with this chunk.
+                        // TODO: Determine appropriate way to handle this error.
+                        tracing::error!("Failed to add download interval: {e}");
+                        return iced::Task::none();
+                    }
+
+                    let hash = t.base.hash;
+                    let cancellation_token = t.base.cancellation_token.clone();
+                    let file_path = t.base.path.clone();
+                    let next_chunk_clone = next_chunk.clone();
+
+                    tracing::debug!("Create new task for next multi-peer download chunk: Next chunk {next_chunk:?}");
+                    iced::Task::perform(
+                        async move {
+                            // Create a request stream to the peer.
+                            let request = crate::core::peer_connection_into_stream(
+                                &peer,
+                                hash,
+                                FileYeetCommandType::Sub,
+                            )
+                            .await;
+
+                            let request = if let Some(r) = request {
+                                PeerRequestStream::new(peer, r)
+                            } else {
+                                tracing::error!(
+                                    "Failed to create download request for multi-peer chunk"
+                                );
+                                return DownloadResult::Failure(
+                                    Arc::new("Failed to create download request".to_owned()),
+                                    RecoverableState::Recoverable(None),
+                                );
+                            };
+
+                            // Download the next chunk.
+                            partial_download(
+                                request,
+                                cancellation_token,
+                                progress,
+                                hash,
+                                next_chunk,
+                                file_path,
+                                None,
+                            )
+                            .await
+                        },
+                        move |r| {
+                            Message::MultiPeerDownloadTransferResulted(
+                                nonce,
+                                next_chunk_clone,
+                                connection_id,
+                                r,
+                            )
+                        },
+                    )
+                } else {
+                    // Check if all intervals are complete.
+                    if intervals.ranges().iter().any(|r| {
+                        // TODO: Use a `completed` flag in the struct for faster checking.
+                        *r.progress_lock.blocking_read() != r.end() - r.start()
+                    }) {
+                        // There are still chunks continuing to download.
+                        return iced::Task::none();
+                    }
+                    tracing::debug!("All multi-peer download chunks completed");
+
+                    // Download is complete, verify the file hash.
+                    let file_path = t.base.path.clone();
+                    let file_hash = t.base.hash;
+                    let file_size = t.base.file_size;
+                    let progress = Arc::new(RwLock::new(0.));
+                    t.progress = DownloadState::HashingFile(progress.clone());
+                    iced::Task::perform(
+                        async move {
+                            match crate::core::file_size_and_hash(&file_path, Some(&progress)).await
+                            {
+                                Ok((calc_file_size, calc_file_hash)) => {
+                                    if calc_file_hash == file_hash {
+                                        if calc_file_size == file_size {
+                                            DownloadResult::Success
+                                        } else {
+                                            DownloadResult::Failure(
+                                                Arc::new("File size does not match".to_owned()),
+                                                RecoverableState::NonRecoverable,
+                                            )
+                                        }
+                                    } else {
+                                        DownloadResult::Failure(
+                                            Arc::new("File hash does not match".to_owned()),
+                                            RecoverableState::NonRecoverable,
+                                        )
+                                    }
+                                }
+                                Err(e) => DownloadResult::Failure(
+                                    Arc::new(format!("Failed to hash file: {e}")),
+                                    RecoverableState::NonRecoverable,
+                                ),
+                            }
+                        },
+                        move |r| Message::DownloadTransferResulted(nonce, r),
+                    )
+                }
+            }
+
+            // TODO: Determine how to handle the recoverable enum.
+            DownloadResult::Failure(e, recoverable_state) => {
+                tracing::warn!("Multi-peer download chunk failed: {e}");
+
+                // Remove this peer from the download since something has gone wrong.
+                peers.remove(&connection_id);
+
+                if peers.is_empty() {
+                    // The download has failed when no peers are left to download from.
+                    // Set a temporary interval to hold the progress before replacing it below.
+                    let intervals =
+                        std::mem::replace(intervals, FileIntervals::new(t.base.file_size));
+
+                    // Convert the partial progress of the download.
+                    let intervals = match intervals.convert_ranges(|r| {
+                        let start = r.start();
+                        start..start + *r.progress_lock.blocking_read()
+                    }) {
+                        Ok(i) => Some(Arc::new(i)),
+                        Err(e) => {
+                            tracing::error!("Failed to convert multi-peer download intervals after failure: {e}");
+                            None
+                        }
+                    };
+
+                    // Set the download as failed with recoverable partial state.
+                    let err = "No peers remaining to complete the download".to_owned();
+                    tracing::warn!("{err}");
+                    t.progress = DownloadState::Done(DownloadResult::Failure(
+                        err.into(),
+                        RecoverableState::Recoverable(intervals),
+                    ));
+                } else {
+                    // Remove the failed interval so it can be retried later.
+                    if let Some(mut i) = intervals.remove_interval_at(range.start) {
+                        let bytes_downloaded = *i.progress_lock.blocking_read();
+                        if bytes_downloaded > 0 {
+                            // Attempt to save the partial progress of the interval.
+                            i.range.end = bytes_downloaded + i.start();
+                            if let Err(e) = intervals.add_interval(i) {
+                                // This should never happen since we just removed this interval.
+                                // Log but do not give up on this download since the interval may be retried.
+                                tracing::error!("Failed to re-add failed interval: {e}");
+                            } else {
+                                tracing::debug!("Retrying failed interval with partial progress");
+                            }
+                        } else {
+                            tracing::debug!("Retrying failed interval with no progress");
+                        }
+                    } else {
+                        tracing::warn!("Failed to remove interval after failure");
+                    }
+                }
+                iced::Task::none()
+            }
+
+            // The multi-peer download was cancelled. Mark the entire download as cancelled.
+            // This code may be run multiple times from different chunks for the same download.
+            DownloadResult::Cancelled => {
+                tracing::debug!("Multi-peer download chunk was cancelled");
+
+                // Mark the entire download as cancelled.
+                t.progress = DownloadState::Done(DownloadResult::Cancelled);
+                iced::Task::none()
+            }
+        }
     }
 
     /// Update the state after an upload transfer has concluded, successfully or not.
@@ -2966,7 +3246,7 @@ impl AppState {
             } else {
                 log_status_change::<LogWarnStatus>(
                     &mut self.status_manager,
-                    "No upload found to update result for nonce".to_owned(),
+                    "No upload found to update result".to_owned(),
                 );
             }
         } else {
@@ -3039,7 +3319,7 @@ impl AppState {
                             strategy: DownloadStrategy::SinglePeer(_),
                             ..
                         }
-                        | DownloadState::ResumingHash(_) => None,
+                        | DownloadState::HashingFile(_) => None,
 
                         // States where saved intervals are available.
                         DownloadState::Paused(intervals) => intervals,
@@ -3198,6 +3478,7 @@ impl LogStatusLevel for LogWarnStatus {
 
 /// Helper to log an error that we assign to the status message.
 /// This helper assumes that the status string is non-empty.
+#[inline]
 fn log_status_change<L: LogStatusLevel>(status_manager: &mut StatusManager, status: String) {
     L::log_status(&status);
 
@@ -3297,7 +3578,7 @@ enum PeerConnectionOrTarget {
     Target(quinn::Endpoint, SocketAddr),
 }
 
-/// Helper to get a task to hash a file and return the file size and hash.
+/// Helper to get a `Task` to hash a file and return the file size and hash.
 #[tracing::instrument(skip(cancellation, progress))]
 fn hash_publish_task(
     nonce: Nonce,
@@ -3307,12 +3588,13 @@ fn hash_publish_task(
 ) -> iced::Task<Message> {
     iced::Task::perform(
         async move {
+            tracing::info!("Determine the file size and hash for publish");
             tokio::select! {
                 // Allow cancelling the publish request thread.
                 () = cancellation.cancelled() => Err(PublishRequestResult::Cancelled),
 
                 // Get the file size and hash of the chosen file to publish.
-                r = crate::core::file_size_and_hash(path.as_ref(), Some(&progress)) => r.map_err(|e| {
+                r = crate::core::file_size_and_hash(&path, Some(&progress)) => r.map_err(|e| {
                     PublishRequestResult::Failure(Arc::new(e.into()))
                 })
             }
@@ -3352,6 +3634,109 @@ async fn try_peer_connection(
     .await
     .ok()
     .flatten()
+}
+
+/// Helper to perform a synchronous download of an entire file from a single peer.
+/// The file at `output_path` will be created (or truncated) before downloading.
+#[tracing::instrument(skip(peer_stream, cancellation_token, byte_progress, output_path))]
+async fn full_download(
+    peer_stream: PeerRequestStream,
+    cancellation_token: CancellationToken,
+    byte_progress: Arc<RwLock<u64>>,
+    hash: HashBytes,
+    file_size: u64,
+    output_path: Arc<PathBuf>,
+) -> DownloadResult {
+    let mut peer_stream_lock = peer_stream.bistream.lock().await;
+
+    tokio::select! {
+        // Let the transfer be cancelled. This is not an error if cancelled.
+        () = cancellation_token.cancelled() => DownloadResult::Cancelled,
+
+        // Await the file to be downloaded.
+        result = crate::core::download_from_peer(
+            hash,
+            &mut peer_stream_lock,
+            file_size,
+            &output_path,
+            Some(&byte_progress),
+        ) => {
+            match result {
+                Ok(()) => DownloadResult::Success,
+                Err(e) => {
+                    let recoverable = if e.is_recoverable() {
+                        // No file interval needs to be stored for synchronous download type.
+                        RecoverableState::Recoverable(None)
+                    } else {
+                        RecoverableState::NonRecoverable
+                    };
+                    DownloadResult::Failure(Arc::new(format!("Download failed: {e}")), recoverable)
+                }
+            }
+        }
+    }
+}
+
+/// Helper to create an output file with the desired size.
+/// The work is synchronous, but is not guaranteed to be fast.
+#[tracing::instrument()]
+fn create_sized_file(file_size: u64, output_path: &std::path::Path) -> Result<(), std::io::Error> {
+    let file = std::fs::File::create(output_path)?;
+    file.set_len(file_size)?;
+    tracing::debug!("Created output file with size");
+    Ok(())
+}
+
+/// Helper to perform a partial download from a single peer.
+/// The `output_path` must already exist and be writable.
+#[tracing::instrument(skip(peer_stream, cancellation_token, byte_progress, output_path))]
+async fn partial_download(
+    peer_stream: PeerRequestStream,
+    cancellation_token: CancellationToken,
+    byte_progress: Arc<RwLock<u64>>,
+    hash: HashBytes,
+    file_range: std::ops::Range<u64>,
+    output_path: Arc<PathBuf>,
+    hasher: Option<Hasher>,
+) -> DownloadResult {
+    let mut file = match tokio::fs::OpenOptions::new()
+        .write(true)
+        .open(output_path.as_ref())
+        .await
+    {
+        Ok(f) => f,
+        Err(e) => {
+            return DownloadResult::Failure(
+                Arc::new(format!("Failed to open the file: {e}")),
+                RecoverableState::Recoverable(None),
+            )
+        }
+    };
+
+    // Try to upload the file to the peer connection.
+    let mut request = peer_stream.bistream.lock().await;
+    tokio::select! {
+        () = cancellation_token.cancelled() => DownloadResult::Cancelled,
+
+        result = Box::pin(crate::core::download_partial_from_peer(
+            hash,
+            &mut request,
+            &mut file,
+            crate::core::DownloadOffsetState::new(file_range, hasher),
+            Some(&byte_progress),
+        )) => match result {
+            Ok(()) => DownloadResult::Success,
+            Err(e) => {
+                let recoverable = if e.is_recoverable() {
+                    // No file interval needs to be stored for synchronous download type.
+                    RecoverableState::Recoverable(None)
+                } else {
+                    RecoverableState::NonRecoverable
+                };
+                DownloadResult::Failure(Arc::new(format!("Download failed: {e}")), recoverable)
+            },
+        }
+    }
 }
 
 /// Add the nonce of a transaction to a peer's set of known transactions.

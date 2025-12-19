@@ -19,6 +19,9 @@ use tokio::{
 
 pub mod intervals;
 
+/// Type alias for SHA-256 hash state used by the client.
+pub type Hasher = sha2::Sha256;
+
 /// The name of the application.
 pub static APP_TITLE: &str = env!("CARGO_PKG_NAME");
 
@@ -146,7 +149,6 @@ pub async fn prepare_server_connection(
         .map_err(PrepareConnectionError::EndpointCreation)?;
 
     // Use an insecure client configuration when connecting to peers.
-    // TODO: Use a secure client configuration when connecting to the server.
     endpoint.set_default_client_config(configure_peer_verification());
 
     // Connect to the specified `file_yeet` server.
@@ -735,7 +737,7 @@ pub async fn peer_connection_into_stream(
                     tracing::warn!("Peer requested a file with an unexpected hash");
                     return None;
                 }
-                tracing::info!("New peer stream accepted");
+                tracing::debug!("New peer stream accepted");
             }
             r
         }
@@ -748,7 +750,7 @@ pub async fn peer_connection_into_stream(
                         tracing::warn!("Failed to write to peer stream: {e}");
                         return None;
                     }
-                    tracing::info!("New peer stream opened");
+                    tracing::debug!("New peer stream opened");
                 }
                 Err(e) => tracing::warn!("Failed to open a peer stream: {e}"),
             }
@@ -813,13 +815,14 @@ async fn connect_to_peer(
 }
 
 /// The range of bytes to download and an optional starting hash state.
+/// If no hasher is provided, no hash will be computed or verified.
 pub struct DownloadOffsetState {
     pub range: std::ops::Range<u64>,
-    pub hasher: Option<sha2::Sha256>,
+    pub hasher: Option<Hasher>,
 }
 impl DownloadOffsetState {
     /// Create a new download offset state with a specific range and optional hasher.
-    pub fn new(range: std::ops::Range<u64>, hasher: Option<sha2::Sha256>) -> Self {
+    pub fn new(range: std::ops::Range<u64>, hasher: Option<Hasher>) -> Self {
         Self { range, hasher }
     }
 }
@@ -857,6 +860,10 @@ impl DownloadError {
 }
 
 /// Download a slice of a file from the peer. Initiates the download by specifying the range of bytes to download.
+/// The caller is responsible for opening the file but this function will seek to the specified starting offset before writing.
+/// The caller may optionally provide a `RwLock<u64>` to track the number of bytes downloaded so far.
+/// If a hasher is provided in the `file_offsets`, the downloaded data will be hashed and verified against the expected hash.
+//  TODO: The `expected_hash` should be optional with the hash state since it is only used to verify the hash at the end.
 #[tracing::instrument(skip(peer_streams, file, file_offsets, byte_progress))]
 pub async fn download_partial_from_peer(
     expected_hash: HashBytes,
@@ -866,8 +873,8 @@ pub async fn download_partial_from_peer(
     byte_progress: Option<&RwLock<u64>>,
 ) -> Result<(), DownloadError> {
     // Determine the range of bytes to download and an existing hasher state.
-    let DownloadOffsetState { range, hasher } = file_offsets;
-    let mut hasher = hasher.unwrap_or_default();
+    let DownloadOffsetState { range, mut hasher } = file_offsets;
+    tracing::debug!("Downloading partial file from peer: Bytes {range:?}");
 
     // Seek to the requested offset.
     file.seek(std::io::SeekFrom::Start(range.start))
@@ -905,8 +912,10 @@ pub async fn download_partial_from_peer(
             // Write the bytes to the file and update the hash.
             let bb = &buf[..size];
 
-            // Update hash.
-            hasher.update(bb);
+            // Update hash if requested.
+            if let Some(hasher) = hasher.as_mut() {
+                hasher.update(bb);
+            }
 
             // Write the bytes to the file.
             file.write_all(bb).await.map_err(FileAccessError::Write)?;
@@ -917,7 +926,7 @@ pub async fn download_partial_from_peer(
 
             // Update the caller with the number of bytes written.
             if let Some(progress) = byte_progress.as_ref() {
-                *progress.write().await += size;
+                *progress.write().await = bytes_written;
             }
         }
     }
@@ -928,14 +937,16 @@ pub async fn download_partial_from_peer(
         tracing::debug!("Failed to close the peer stream gracefully: {e}");
     }
 
-    // Ensure the file hash is correct.
-    let downloaded_hash = HashBytes::new(hasher.finalize().into());
-    if expected_hash != downloaded_hash {
-        return Err(DownloadError::HashMismatch);
+    if let Some(hasher) = hasher.take() {
+        // Ensure the file hash is correct.
+        let downloaded_hash = HashBytes::new(hasher.finalize().into());
+        if expected_hash == downloaded_hash {
+            tracing::info!("Validated download hash");
+        } else {
+            return Err(DownloadError::HashMismatch);
+        }
     }
 
-    // Let the user know that the download is complete.
-    tracing::info!("Download complete");
     Ok(())
 }
 
@@ -961,7 +972,7 @@ pub async fn download_from_peer(
     tracing::info!("Downloading entire file from peer...");
 
     // Specify that we want to download the entire file.
-    let file_offsets = DownloadOffsetState::new(0..file_size, None);
+    let file_offsets = DownloadOffsetState::new(0..file_size, Some(Hasher::default()));
 
     // Open the file for writing, truncating if the file already exists.
     let mut file = tokio::fs::OpenOptions::new()
@@ -979,7 +990,11 @@ pub async fn download_from_peer(
         file_offsets,
         byte_progress,
     ))
-    .await
+    .await?;
+
+    // Let the user know that the download is complete.
+    tracing::info!("Download complete");
+    Ok(())
 }
 
 /// Errors that may occur when making file access attempts.
@@ -1004,12 +1019,11 @@ pub enum FileAccessError {
 
 /// Get access to a file with its size and its current hash state.
 /// The file read position will be after the last byte that was read into the hasher.
-#[tracing::instrument(skip(progress))]
 pub async fn file_size_and_hasher(
     file_path: &Path,
     progress: Option<&RwLock<f32>>,
-) -> Result<(tokio::fs::File, u64, sha2::Sha256), FileAccessError> {
-    let mut hasher = sha2::Sha256::new();
+) -> Result<(tokio::fs::File, u64, Hasher), FileAccessError> {
+    let mut hasher = Hasher::new();
     let mut file = tokio::fs::File::open(file_path)
         .await
         .map_err(FileAccessError::Open)?;
@@ -1029,7 +1043,6 @@ pub async fn file_size_and_hasher(
     let size_float = file_size as f32;
     let mut hash_byte_buffer = [0; 16_384];
     let mut bytes_hashed = 0;
-    let mut read_count = 0;
     while bytes_hashed < file_size {
         let n = file
             .read(&mut hash_byte_buffer)
@@ -1038,16 +1051,13 @@ pub async fn file_size_and_hasher(
         if n == 0 {
             break;
         }
-        read_count += 1;
 
         hasher.update(&hash_byte_buffer[..n]);
         bytes_hashed += n as u64;
 
         // Update the caller with the number of bytes read.
-        if read_count % 20 == 0 {
-            if let Some(progress) = progress.as_ref() {
-                *progress.write().await = bytes_hashed as f32 / size_float;
-            }
+        if let Some(progress) = progress.as_ref() {
+            *progress.write().await = bytes_hashed as f32 / size_float;
         }
     }
 
@@ -1116,7 +1126,7 @@ pub async fn read_publish_range(
         None => Err(ReadPubRangeError::RangeOverflow),
         Some(end) => Ok(end),
     }?;
-    tracing::info!("Peer requested upload range: {start_index}..{end_index} bytes");
+    tracing::info!("Peer requested upload range: Bytes {start_index}..{end_index}");
 
     Ok((start_index, upload_length))
 }
@@ -1543,6 +1553,7 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerCertVerification {
 /// # Panics
 /// If the conversion from `Duration` to `IdleTimeout` fails.
 fn configure_peer_verification() -> quinn::ClientConfig {
+    // TODO: Use a secure client configuration when connecting to the server.
     let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(
         rustls::ClientConfig::builder()
             .dangerous()
