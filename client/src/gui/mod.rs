@@ -2952,11 +2952,9 @@ impl AppState {
                         chunk.end = chunk.start + peer_share;
                     }
 
-                    let progress = Arc::new(RwLock::new(0));
-                    if let Err(e) = intervals.add_interval(DownloadPartRange {
-                        range: chunk.clone(),
-                        progress_lock: progress.clone(),
-                    }) {
+                    let interval = DownloadPartRange::new(chunk.clone());
+                    let progress = interval.progress_lock.clone();
+                    if let Err(e) = intervals.add_interval(interval) {
                         // Should never happen since we just got the chunk from `next_download_chunk`.
                         // Log and treat as though no chunk is available.
                         tracing::error!("Failed to add download interval: {e}");
@@ -3000,7 +2998,7 @@ impl AppState {
     fn update_multi_peer_download_transfer_resulted(
         &mut self,
         nonce: Nonce,
-        range: std::ops::Range<u64>,
+        old_range: std::ops::Range<u64>,
         connection_id: usize,
         result: DownloadResult,
     ) -> iced::Task<Message> {
@@ -3024,31 +3022,48 @@ impl AppState {
             ..
         } = &mut t.progress
         else {
-            log_status_change::<LogWarnStatus>(
-                &mut self.status_manager,
-                "Download not in multi-peer transferring state".to_owned(),
-            );
+            // Warn only if the download resulted in an unexpected state.
+            // Having multiple cancelled tasks is expected.
+            if !matches!(
+                t.progress,
+                DownloadState::Paused(_) | DownloadState::Done(_)
+            ) && !matches!(
+                result,
+                DownloadResult::Cancelled | DownloadResult::Failure(_, _)
+            ) {
+                log_status_change::<LogWarnStatus>(
+                    &mut self.status_manager,
+                    "Download not in multi-peer transferring state".to_owned(),
+                );
+            }
             return iced::Task::none();
         };
 
         match result {
             DownloadResult::Success => {
+                // Mark the interval as completed.
+                let old_interval = intervals.interval_at_mut(old_range.start);
+                if let Some(interval) = old_interval {
+                    interval.completed = true;
+                } else {
+                    // TODO: Determine appropriate way to handle this error.
+                    tracing::error!("Could not find interval to mark as completed for range");
+                }
+
                 if let Some(next_chunk) = intervals.next_download_chunk() {
-                    // Select a peer to download the next chunk from.
-                    // We should use the same peer if possible as this naturally balances load.
+                    // Use the same peer for the next chunk to naturally balance among peers.
                     let Some(peer) = peers.get(&connection_id).cloned() else {
-                        tracing::warn!("Peer is not available for next download chunk");
+                        // Should never happen since this peer just succeeded.
+                        // Log and do not proceed with this chunk.
+                        tracing::error!("Peer is not available for next download chunk");
                         return iced::Task::none();
                     };
 
-                    let progress = Arc::new(RwLock::new(0));
-                    if let Err(e) = intervals.add_interval(DownloadPartRange {
-                        range: next_chunk.clone(),
-                        progress_lock: progress.clone(),
-                    }) {
+                    let interval = DownloadPartRange::new(next_chunk.clone());
+                    let progress = interval.progress_lock.clone();
+                    if let Err(e) = intervals.add_interval(interval) {
                         // Should never happen since we just got the chunk from `next_download_chunk`.
                         // Log and do not proceed with this chunk.
-                        // TODO: Determine appropriate way to handle this error.
                         tracing::error!("Failed to add download interval: {e}");
                         return iced::Task::none();
                     }
@@ -3060,6 +3075,7 @@ impl AppState {
 
                     tracing::debug!("Create new task for next multi-peer download chunk: Next chunk {next_chunk:?}");
                     iced::Task::perform(
+                        // TODO: Proper instrumentation of this async block.
                         async move {
                             // Create a request stream to the peer.
                             let request = crate::core::peer_connection_into_stream(
@@ -3104,10 +3120,7 @@ impl AppState {
                     )
                 } else {
                     // Check if all intervals are complete.
-                    if intervals.ranges().iter().any(|r| {
-                        // TODO: Use a `completed` flag in the struct for faster checking.
-                        *r.progress_lock.blocking_read() != r.end() - r.start()
-                    }) {
+                    if !intervals.ranges().iter().all(|r| r.completed) {
                         // There are still chunks continuing to download.
                         return iced::Task::none();
                     }
@@ -3120,22 +3133,30 @@ impl AppState {
                     let progress = Arc::new(RwLock::new(0.));
                     t.progress = DownloadState::HashingFile(progress.clone());
                     iced::Task::perform(
+                        // TODO: Proper instrumentation of this async block.
                         async move {
                             match crate::core::file_size_and_hash(&file_path, Some(&progress)).await
                             {
                                 Ok((calc_file_size, calc_file_hash)) => {
                                     if calc_file_hash == file_hash {
                                         if calc_file_size == file_size {
+                                            tracing::info!(
+                                                "Successful multi-peer download of hash {file_hash}"
+                                            );
                                             DownloadResult::Success
                                         } else {
+                                            let err = "File size does not match".to_owned();
+                                            tracing::warn!("{err}");
                                             DownloadResult::Failure(
-                                                Arc::new("File size does not match".to_owned()),
+                                                Arc::new(err),
                                                 RecoverableState::NonRecoverable,
                                             )
                                         }
                                     } else {
+                                        let err = "File hash does not match".to_owned();
+                                        tracing::warn!("{err}");
                                         DownloadResult::Failure(
-                                            Arc::new("File hash does not match".to_owned()),
+                                            Arc::new(err),
                                             RecoverableState::NonRecoverable,
                                         )
                                     }
@@ -3151,8 +3172,7 @@ impl AppState {
                 }
             }
 
-            // TODO: Determine how to handle the recoverable enum.
-            DownloadResult::Failure(e, recoverable_state) => {
+            DownloadResult::Failure(e, _) => {
                 tracing::warn!("Multi-peer download chunk failed: {e}");
 
                 // Remove this peer from the download since something has gone wrong.
@@ -3165,34 +3185,32 @@ impl AppState {
                         std::mem::replace(intervals, FileIntervals::new(t.base.file_size));
 
                     // Convert the partial progress of the download.
-                    let intervals = match intervals.convert_ranges(|r| {
+                    let intervals = intervals.convert_ranges(|r| {
                         let start = r.start();
                         start..start + *r.progress_lock.blocking_read()
-                    }) {
-                        Ok(i) => Some(Arc::new(i)),
-                        Err(e) => {
-                            tracing::error!("Failed to convert multi-peer download intervals after failure: {e}");
-                            None
-                        }
-                    };
+                    })
+                    .map(|i| RecoverableState::Recoverable(Some(Arc::new(i))))
+                    .map_err(|e| {
+                        tracing::error!("Failed to convert multi-peer download intervals after failure: {e}");
+                    })
+                    .unwrap_or(RecoverableState::NonRecoverable);
 
                     // Set the download as failed with recoverable partial state.
                     let err = "No peers remaining to complete the download".to_owned();
                     tracing::warn!("{err}");
-                    t.progress = DownloadState::Done(DownloadResult::Failure(
-                        err.into(),
-                        RecoverableState::Recoverable(intervals),
-                    ));
+                    t.progress =
+                        DownloadState::Done(DownloadResult::Failure(err.into(), intervals));
                 } else {
                     // Remove the failed interval so it can be retried later.
-                    if let Some(mut i) = intervals.remove_interval_at(range.start) {
+                    if let Some(mut i) = intervals.remove_interval_at(old_range.start) {
                         let bytes_downloaded = *i.progress_lock.blocking_read();
                         if bytes_downloaded > 0 {
                             // Attempt to save the partial progress of the interval.
                             i.range.end = bytes_downloaded + i.start();
+                            i.completed = true;
                             if let Err(e) = intervals.add_interval(i) {
                                 // This should never happen since we just removed this interval.
-                                // Log but do not give up on this download since the interval may be retried.
+                                // Log but do not give up on this download since the interval will be retried.
                                 tracing::error!("Failed to re-add failed interval: {e}");
                             } else {
                                 tracing::debug!("Retrying failed interval with partial progress");
@@ -3207,12 +3225,11 @@ impl AppState {
                 iced::Task::none()
             }
 
-            // The multi-peer download was cancelled. Mark the entire download as cancelled.
-            // This code may be run multiple times from different chunks for the same download.
+            // The multi-peer download was cancelled.
             DownloadResult::Cancelled => {
-                tracing::debug!("Multi-peer download chunk was cancelled");
+                tracing::warn!("Multi-peer download chunk was cancelled");
 
-                // Mark the entire download as cancelled.
+                // Mark the entire download as cancelled, we verified above that the state is `Transferring`.
                 t.progress = DownloadState::Done(DownloadResult::Cancelled);
                 iced::Task::none()
             }
@@ -3240,6 +3257,7 @@ impl AppState {
                 // Remove successful uploads of partial-file ranges from the list.
                 if let UploadState::Done(UploadResult::Success(r)) = &t.progress {
                     if r.end != t.base.file_size {
+                        // TODO: Keep one completed upload item and aggregate the sizes.
                         uploads.remove(index);
                     }
                 }

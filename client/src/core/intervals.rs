@@ -100,6 +100,20 @@ impl<R: RangeData> FileIntervals<R> {
         Some(range)
     }
 
+    /// Get a mutable reference to the interval with the given range start.
+    /// Returns `None` if the interval was not found.
+    /// # Safety
+    /// Changing the start or end of the interval may invalidate the internal state of the `FileIntervals`.
+    /// Use with caution.
+    pub fn interval_at_mut(&mut self, range_start: u64) -> Option<&mut R> {
+        let index = self
+            .intervals
+            .binary_search_by_key(&range_start, RangeData::start)
+            .ok()?;
+
+        self.intervals.get_mut(index)
+    }
+
     /// Get the next empty range available.
     /// Returns `None` if there are no gaps.
     #[must_use]

@@ -124,8 +124,24 @@ pub struct DownloadSinglePeer {
 
 #[derive(Debug)]
 pub struct DownloadPartRange {
+    /// The byte range for this part.
     pub range: std::ops::Range<u64>,
+
+    /// An atomic lock for the progress of this range.
     pub progress_lock: Arc<RwLock<u64>>,
+
+    /// A bool to quickly check whether the progress is complete.
+    pub completed: bool,
+}
+impl DownloadPartRange {
+    /// Create a new download part range.
+    pub fn new(range: std::ops::Range<u64>) -> Self {
+        Self {
+            range,
+            progress_lock: Arc::new(RwLock::new(0)),
+            completed: false,
+        }
+    }
 }
 impl RangeData for DownloadPartRange {
     fn start(&self) -> u64 {
@@ -315,7 +331,7 @@ impl Transfer for DownloadTransfer {
             )
         };
 
-        // Try to get a transfer rate string or None.
+        // Try to get a transfer rate string or `None`.
         let rate = match &self.progress {
             DownloadState::Transferring { snapshot, .. } => Some(snapshot.human_readable.clone()),
             _ => None,
@@ -468,6 +484,13 @@ impl Transfer for DownloadTransfer {
                 strategy: DownloadStrategy::SinglePeer(DownloadSinglePeer { peer_string, .. }),
                 ..
             } => peer_string,
+
+            // Indicate that multiple peers are involved in multi-peer downloads.
+            // TODO: Add an active peers string to `DownloadMultiPeer`.
+            DownloadState::Transferring {
+                strategy: DownloadStrategy::MultiPeer(DownloadMultiPeer { .. }),
+                ..
+            } => "Multiple Peers",
 
             // Default to empty string for other states.
             _ => "",
