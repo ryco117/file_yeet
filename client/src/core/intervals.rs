@@ -1,9 +1,9 @@
 /// Maximum recommended download interval chunk size in bytes.
-pub const DOWNLOAD_CHUNK_INTERVAL_MAX: u64 = 256 * 1024 * 1024;
+pub const DOWNLOAD_CHUNK_INTERVAL_MAX: u64 = 128 * 1024 * 1024;
 
 /// Minimum recommended interval chunk size in bytes.
 /// The actual minimum should always be the remaining size if it is smaller than this.
-pub const DOWNLOAD_CHUNK_INTERVAL_MIN: u64 = 64 * 1024;
+pub const DOWNLOAD_CHUNK_INTERVAL_MIN: u64 = 16 * 1024;
 
 /// Trait defining a type containing range data.
 pub trait RangeData {
@@ -140,7 +140,8 @@ impl<R: RangeData> FileIntervals<R> {
         None
     }
 
-    /// Get the next download chunk range. Prefers to take the maximum chunk size, `DOWNLOAD_CHUNK_INTERVAL_MAX`.
+    /// Get the next download chunk range.
+    /// Prefers to take the maximum chunk size, `DOWNLOAD_CHUNK_INTERVAL_MAX`, over a larger size.
     /// Returns `None` if there are no gaps.
     #[must_use]
     pub fn next_download_chunk(&self) -> Option<std::ops::Range<u64>> {

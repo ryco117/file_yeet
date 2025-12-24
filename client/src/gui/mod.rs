@@ -2982,10 +2982,16 @@ impl AppState {
         let hash = t.base.hash;
         let output_path = t.base.path.clone();
 
+        // * Attempt to split the download chunks among the available peers. This is to maximize
+        //   concurrent utilization of all peers. Dividing by two allows faster peers to contribute more chunks.
+        //
+        // * If this division is smaller than the reasonable minimum, take that minimum instead.
+        //   This is to prevent zero-size or extremely small chunks from being requested.
         let peer_share = u64::max(
             (t.base.file_size / peer_streams.len() as u64) / 2,
             DOWNLOAD_CHUNK_INTERVAL_MIN,
         );
+
         let tasks = peer_streams.into_iter().filter_map(|request| {
             let mut chunk = intervals.next_download_chunk()?;
 
