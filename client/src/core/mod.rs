@@ -1481,13 +1481,33 @@ impl ConnectionsManager {
     /// Get the connection state of a peer.
     pub async fn get_connection_async(
         &self,
-        peer_address: &SocketAddr,
+        peer_address: SocketAddr,
     ) -> Option<quinn::Connection> {
-        if let Some(IncomingPeerState::Connected(c)) = self.map.read().await.get(peer_address) {
-            Some(c.clone())
-        } else {
-            None
+        if let hash_map::Entry::Occupied(e) = self.map.write().await.entry(peer_address) {
+            if let IncomingPeerState::Connected(c) = e.get() {
+                // Check if the connection is still alive.
+                if let Some(r) = c.close_reason() {
+                    if cfg!(debug_assertions) {
+                        tracing::warn!("Peer connection {peer_address} is already closed: {r}");
+                    } else {
+                        tracing::warn!("Peer connection is already closed: {r}");
+                    }
+                    e.remove();
+                } else {
+                    if cfg!(debug_assertions) {
+                        tracing::debug!(
+                            "Asynchronous get for peer connection {peer_address} is already established"
+                        );
+                    } else {
+                        tracing::debug!(
+                            "Asynchronous get for peer connection is already established"
+                        );
+                    }
+                    return Some(c.clone());
+                }
+            }
         }
+        None
     }
 }
 

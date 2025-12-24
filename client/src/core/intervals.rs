@@ -174,6 +174,11 @@ impl<R: RangeData> FileIntervals<R> {
             }
         }
 
+        // TODO: Allow for a merge function to optionally combine adjacent intervals.
+        //       This would reduce disk usage when saving completed intervals for a partial
+        //       download. Currently, all non-empty intervals are saved/retained, even if they can
+        //       be more optimally represented as a single interval.
+
         Ok(new_intervals)
     }
 

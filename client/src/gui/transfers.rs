@@ -131,6 +131,7 @@ pub struct DownloadPartRange {
     pub progress_lock: Arc<RwLock<u64>>,
 
     /// A bool to quickly check whether the progress is complete.
+    /// It should be true if and only if `progress_lock` equals the length of `range`.
     pub completed: bool,
 }
 impl DownloadPartRange {
@@ -140,6 +141,16 @@ impl DownloadPartRange {
             range,
             progress_lock: Arc::new(RwLock::new(0)),
             completed: false,
+        }
+    }
+
+    /// Create a new download part range which is already completed.
+    pub fn new_completed(range: std::ops::Range<u64>) -> Self {
+        let size = range.end - range.start;
+        Self {
+            range,
+            progress_lock: Arc::new(RwLock::new(size)),
+            completed: true,
         }
     }
 }
@@ -186,6 +197,7 @@ pub enum DownloadState {
     Paused(Option<FileIntervals<std::ops::Range<u64>>>),
 
     /// Hashing the output file for resuming a partial download or verifying a result.
+    //  TODO: Include a `progress_animation` field to allow for efficient reading of the hash progress.
     HashingFile(Arc<RwLock<f32>>),
 
     /// The transfer has completed.
@@ -651,12 +663,15 @@ impl Transfer for UploadTransfer {
 }
 
 /// Complete a download with the given result.
+/// Handles removing peer nonces from the active peers maps.
+#[tracing::instrument(skip(progress, result, peers))]
 pub fn update_download_result(
     progress: &mut DownloadState,
     result: DownloadResult,
     peers: &mut HashMap<SocketAddr, HashSet<Nonce>>,
     nonce: Nonce,
 ) {
+    // Avoid overwriting certain completed states.
     match progress {
         // Handle a paused transfer.
         DownloadState::Paused(_) => {
@@ -694,6 +709,7 @@ pub fn update_download_result(
 }
 
 /// Complete an upload with the given result.
+#[tracing::instrument(skip(progress, result, peers))]
 pub fn update_upload_result(
     progress: &mut UploadState,
     result: UploadResult,
@@ -714,7 +730,7 @@ pub fn update_upload_result(
     // If the upload was connected to a peer, remove the nonce from transactions.
     if let Some(connection) = progress.connection() {
         // Upload nonces should only be removed when not successful.
-        // This is to ensure healthy connections are not closed before peers have completed all their downloads.
+        // This is to ensure healthy connections are not closed before peers have completed all their downloads. (I.e., peers may be about to open a new request stream.)
         if matches!(result, UploadResult::Success(_)) {
             tracing::debug!("Not removing nonces for successful uploads");
         } else {
