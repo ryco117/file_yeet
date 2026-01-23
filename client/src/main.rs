@@ -81,7 +81,7 @@ fn main() {
 
     // Warn the user if this is a debug build.
     #[cfg(debug_assertions)]
-    println!("Debug build: YOUR & PEER PUBLIC IP ADDRESS may be included in your logs!");
+    println!("Debug build: YOUR & PEER'S PUBLIC IP ADDRESSES may be included in your logs!");
 
     // Parse command line arguments.
     let args = Cli::parse();
@@ -90,6 +90,7 @@ fn main() {
     #[allow(unused_variables)]
     let log_to_stdout = logging::init(&args);
     tracing::debug!("Initialized logging");
+    tracing::info!("Client Version: {}", env!("CARGO_PKG_VERSION"));
 
     // If no subcommand was provided, run the GUI.
     let Some(cmd) = args.cmd else {

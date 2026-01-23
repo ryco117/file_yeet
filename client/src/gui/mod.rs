@@ -3404,6 +3404,7 @@ impl AppState {
             downloads, uploads, ..
         }) = &mut self.connection_state
         {
+            tracing::debug!("Removing transfer");
             match transfer_type {
                 FileYeetCommandType::Sub => remove_transfer(downloads, nonce),
                 FileYeetCommandType::Pub => remove_transfer(uploads, nonce),
