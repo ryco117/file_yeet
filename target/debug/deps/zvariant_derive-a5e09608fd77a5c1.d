@@ -1,0 +1,10 @@
+/home/runner/work/file_yeet/file_yeet/target/debug/deps/zvariant_derive-a5e09608fd77a5c1.d: /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zvariant_derive-5.8.0/src/lib.rs /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zvariant_derive-5.8.0/src/dict.rs /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zvariant_derive-5.8.0/src/type.rs /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zvariant_derive-5.8.0/src/utils.rs /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zvariant_derive-5.8.0/src/value.rs /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zvariant_derive-5.8.0/src/../README.md
+
+/home/runner/work/file_yeet/file_yeet/target/debug/deps/libzvariant_derive-a5e09608fd77a5c1.so: /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zvariant_derive-5.8.0/src/lib.rs /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zvariant_derive-5.8.0/src/dict.rs /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zvariant_derive-5.8.0/src/type.rs /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zvariant_derive-5.8.0/src/utils.rs /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zvariant_derive-5.8.0/src/value.rs /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zvariant_derive-5.8.0/src/../README.md
+
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zvariant_derive-5.8.0/src/lib.rs:
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zvariant_derive-5.8.0/src/dict.rs:
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zvariant_derive-5.8.0/src/type.rs:
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zvariant_derive-5.8.0/src/utils.rs:
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zvariant_derive-5.8.0/src/value.rs:
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zvariant_derive-5.8.0/src/../README.md:

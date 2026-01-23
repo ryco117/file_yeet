@@ -2288,12 +2288,15 @@ impl AppState {
         } else {
             // Set the transfer state for a multi-peer download.
             // We add all connections to the transfer state since these connections were already added  to the peers manager.
+            let peers_map: HashMap<_, _> = peer_streams
+                .iter()
+                .map(|p| (p.connection.stable_id(), p.connection.clone()))
+                .collect();
+            let peers_string = DownloadMultiPeer::peers_to_string(&peers_map);
             transfer.progress =
                 DownloadState::new_transferring(DownloadStrategy::MultiPeer(DownloadMultiPeer {
-                    peers: peer_streams
-                        .iter()
-                        .map(|p| (p.connection.stable_id(), p.connection.clone()))
-                        .collect(),
+                    peers: peers_map,
+                    peers_string,
                     intervals: FileIntervals::new(file_size),
                 }));
 
@@ -2715,6 +2718,7 @@ impl AppState {
             t.progress =
                 DownloadState::new_transferring(DownloadStrategy::MultiPeer(DownloadMultiPeer {
                     peers: HashMap::new(),
+                    peers_string: String::new(),
                     intervals,
                 }));
 
@@ -2957,7 +2961,12 @@ impl AppState {
 
         // Get the intervals manager for this download.
         let DownloadState::Transferring {
-            strategy: DownloadStrategy::MultiPeer(DownloadMultiPeer { peers, intervals }),
+            strategy:
+                DownloadStrategy::MultiPeer(DownloadMultiPeer {
+                    peers,
+                    peers_string,
+                    intervals,
+                }),
             ..
         } = &mut t.progress
         else {
@@ -2977,6 +2986,7 @@ impl AppState {
                 (p.connection.stable_id(), p.connection.clone())
             })
             .collect();
+        *peers_string = DownloadMultiPeer::peers_to_string(peers);
 
         let cancellation_token = t.base.cancellation_token.clone();
         let hash = t.base.hash;
@@ -3049,7 +3059,12 @@ impl AppState {
         };
 
         let DownloadState::Transferring {
-            strategy: DownloadStrategy::MultiPeer(DownloadMultiPeer { peers, intervals }),
+            strategy:
+                DownloadStrategy::MultiPeer(DownloadMultiPeer {
+                    peers,
+                    peers_string,
+                    intervals,
+                }),
             ..
         } = &mut t.progress
         else {
@@ -3209,6 +3224,8 @@ impl AppState {
                 // Remove this peer from the download since something has gone wrong.
                 if let Some(connection) = peers.remove(&connection_id) {
                     remove_nonce_for_peer(&connection, active_peers, nonce);
+                    // Update the peers_string after removing a peer.
+                    *peers_string = DownloadMultiPeer::peers_to_string(peers);
                 } else {
                     tracing::warn!("Failed to remove peer from multi-peer download after failure");
                 }

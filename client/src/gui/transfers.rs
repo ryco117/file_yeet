@@ -167,7 +167,18 @@ impl RangeData for DownloadPartRange {
 #[derive(Debug)]
 pub struct DownloadMultiPeer {
     pub peers: HashMap<usize, quinn::Connection>,
+    pub peers_string: String,
     pub intervals: FileIntervals<DownloadPartRange>,
+}
+impl DownloadMultiPeer {
+    /// Create a comma-separated string of peer addresses.
+    pub fn peers_to_string(peers: &HashMap<usize, quinn::Connection>) -> String {
+        peers
+            .values()
+            .map(|conn| conn.remote_address().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
 }
 
 /// The strategy used for the download transfer.
@@ -497,12 +508,11 @@ impl Transfer for DownloadTransfer {
                 ..
             } => peer_string,
 
-            // Indicate that multiple peers are involved in multi-peer downloads.
-            // TODO: Add an active peers string to `DownloadMultiPeer`.
+            // Use the comma-separated peers string for multi-peer downloads.
             DownloadState::Transferring {
-                strategy: DownloadStrategy::MultiPeer(DownloadMultiPeer { .. }),
+                strategy: DownloadStrategy::MultiPeer(DownloadMultiPeer { peers_string, .. }),
                 ..
-            } => "Multiple Peers",
+            } => peers_string,
 
             // Default to empty string for other states.
             _ => "",

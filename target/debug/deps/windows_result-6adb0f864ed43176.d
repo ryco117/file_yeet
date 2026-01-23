@@ -1,0 +1,11 @@
+/home/runner/work/file_yeet/file_yeet/target/debug/deps/windows_result-6adb0f864ed43176.d: /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/windows-result-0.4.1/src/lib.rs /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/windows-result-0.4.1/src/bindings.rs /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/windows-result-0.4.1/src/error.rs /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/windows-result-0.4.1/src/hresult.rs /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/windows-result-0.4.1/src/bool.rs /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/windows-result-0.4.1/src/../readme.md /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/windows-result-0.4.1/src/../windows-result.natvis
+
+/home/runner/work/file_yeet/file_yeet/target/debug/deps/libwindows_result-6adb0f864ed43176.rmeta: /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/windows-result-0.4.1/src/lib.rs /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/windows-result-0.4.1/src/bindings.rs /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/windows-result-0.4.1/src/error.rs /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/windows-result-0.4.1/src/hresult.rs /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/windows-result-0.4.1/src/bool.rs /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/windows-result-0.4.1/src/../readme.md /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/windows-result-0.4.1/src/../windows-result.natvis
+
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/windows-result-0.4.1/src/lib.rs:
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/windows-result-0.4.1/src/bindings.rs:
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/windows-result-0.4.1/src/error.rs:
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/windows-result-0.4.1/src/hresult.rs:
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/windows-result-0.4.1/src/bool.rs:
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/windows-result-0.4.1/src/../readme.md:
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/windows-result-0.4.1/src/../windows-result.natvis:
