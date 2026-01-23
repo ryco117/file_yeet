@@ -167,7 +167,23 @@ impl RangeData for DownloadPartRange {
 #[derive(Debug)]
 pub struct DownloadMultiPeer {
     pub peers: HashMap<usize, quinn::Connection>,
+    pub peers_string: String,
     pub intervals: FileIntervals<DownloadPartRange>,
+}
+impl DownloadMultiPeer {
+    /// Generate a comma-separated string of peer addresses from the peers HashMap.
+    pub fn generate_peers_string(peers: &HashMap<usize, quinn::Connection>) -> String {
+        peers
+            .values()
+            .enumerate()
+            .fold(String::new(), |mut acc, (i, conn)| {
+                if i > 0 {
+                    acc.push_str(", ");
+                }
+                acc.push_str(&conn.remote_address().to_string());
+                acc
+            })
+    }
 }
 
 /// The strategy used for the download transfer.
@@ -497,12 +513,11 @@ impl Transfer for DownloadTransfer {
                 ..
             } => peer_string,
 
-            // Indicate that multiple peers are involved in multi-peer downloads.
-            // TODO: Add an active peers string to `DownloadMultiPeer`.
+            // Use the comma-separated peers string for multi-peer downloads.
             DownloadState::Transferring {
-                strategy: DownloadStrategy::MultiPeer(DownloadMultiPeer { .. }),
+                strategy: DownloadStrategy::MultiPeer(DownloadMultiPeer { peers_string, .. }),
                 ..
-            } => "Multiple Peers",
+            } => peers_string,
 
             // Default to empty string for other states.
             _ => "",
@@ -518,7 +533,8 @@ impl Transfer for DownloadTransfer {
                 ),
             ),
             widget::row!(
-                widget::text(peer_str).size(12),
+                widget::scrollable(widget::text(peer_str).size(12))
+                    .direction(text_horizontal_scrollbar()),
                 widget::scrollable(
                     widget::text(self.base.path.to_string_lossy())
                         .size(12)
