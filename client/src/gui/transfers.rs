@@ -37,20 +37,47 @@ pub enum RecoverableState {
     NonRecoverable,
 }
 
-/// The result of a file download with a peer.
+/// The result of a file download with a single peer.
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum DownloadResult {
     /// The transfer succeeded.
     #[error("Transfer succeeded")]
     Success,
 
-    /// The transfer failed. Boolean field is `true` when the failure is recoverable.
+    /// The transfer failed.
+    /// `RecoverableState` indicates which ranges of the file can be recovered, if any.
     #[error("{0}")]
     Failure(Arc<String>, RecoverableState),
 
     /// The transfer was cancelled.
     #[error("Transfer cancelled")]
     Cancelled,
+}
+
+/// The result of a file download with multiple peers.
+#[derive(Clone, Debug, thiserror::Error)]
+pub enum MultiPeerDownloadResult {
+    /// The transfer succeeded.
+    #[error("Transfer succeeded")]
+    Success,
+
+    /// The transfer failed.
+    #[error("{0}")]
+    Failure(Arc<String>),
+
+    /// The transfer was cancelled.
+    #[error("Transfer cancelled")]
+    Cancelled,
+}
+
+impl From<DownloadResult> for MultiPeerDownloadResult {
+    fn from(value: DownloadResult) -> Self {
+        match value {
+            DownloadResult::Success => MultiPeerDownloadResult::Success,
+            DownloadResult::Failure(msg, _) => MultiPeerDownloadResult::Failure(msg),
+            DownloadResult::Cancelled => MultiPeerDownloadResult::Cancelled,
+        }
+    }
 }
 
 /// The result of a file upload with a peer.
@@ -171,7 +198,7 @@ pub struct DownloadMultiPeer {
     pub intervals: FileIntervals<DownloadPartRange>,
 }
 impl DownloadMultiPeer {
-    /// Generate a comma-separated string of peer addresses from the peers HashMap.
+    /// Generate a comma-separated string of peer addresses from the peers `HashMap`.
     pub fn generate_peers_string(peers: &HashMap<usize, quinn::Connection>) -> String {
         peers
             .values()
@@ -213,8 +240,10 @@ pub enum DownloadState {
     Paused(Option<FileIntervals<std::ops::Range<u64>>>),
 
     /// Hashing the output file for resuming a partial download or verifying a result.
-    //  TODO: Include a `progress_animation` field to allow for efficient reading of the hash progress.
-    HashingFile(Arc<RwLock<f32>>),
+    HashingFile {
+        progress_animation: f32,
+        progress: Arc<RwLock<f32>>,
+    },
 
     /// The transfer has completed.
     Done(DownloadResult),
@@ -318,35 +347,44 @@ impl Transfer for DownloadTransfer {
         &self.base
     }
     fn update_animation(&mut self) {
-        if let DownloadState::Transferring {
-            strategy,
-            progress_animation,
-            snapshot,
-            ..
-        } = &mut self.progress
-        {
-            // Get the total bytes transferred at the current moment.
-            let bytes_transferred = match strategy {
-                DownloadStrategy::SinglePeer(DownloadSinglePeer { progress_lock, .. }) => {
-                    *progress_lock.blocking_read()
+        match &mut self.progress {
+            DownloadState::Transferring {
+                strategy,
+                progress_animation,
+                snapshot,
+                ..
+            } => {
+                // Get the total bytes transferred at the current moment.
+                let bytes_transferred = match strategy {
+                    DownloadStrategy::SinglePeer(DownloadSinglePeer { progress_lock, .. }) => {
+                        *progress_lock.blocking_read()
+                    }
+                    DownloadStrategy::MultiPeer(DownloadMultiPeer { intervals, .. }) => intervals
+                        .ranges()
+                        .iter()
+                        .fold(0u64, |acc, r| acc + *r.progress_lock.blocking_read()),
+                };
+
+                // Update the progress bar with the fraction of the file downloaded.
+                *progress_animation = bytes_transferred as f32 / self.base.file_size as f32;
+
+                // Update the transfer speed in human readable units.
+                if snapshot
+                    .instant
+                    .elapsed()
+                    .gt(&TRANSFER_SPEED_UPDATE_INTERVAL)
+                {
+                    snapshot.update(bytes_transferred);
                 }
-                DownloadStrategy::MultiPeer(DownloadMultiPeer { intervals, .. }) => intervals
-                    .ranges()
-                    .iter()
-                    .fold(0u64, |acc, r| acc + *r.progress_lock.blocking_read()),
-            };
-
-            // Update the progress bar with the fraction of the file downloaded.
-            *progress_animation = bytes_transferred as f32 / self.base.file_size as f32;
-
-            // Update the transfer speed in human readable units.
-            if snapshot
-                .instant
-                .elapsed()
-                .gt(&TRANSFER_SPEED_UPDATE_INTERVAL)
-            {
-                snapshot.update(bytes_transferred);
             }
+            DownloadState::HashingFile {
+                progress_animation,
+                progress,
+            } => {
+                // Update the progress animation with the current hash progress.
+                *progress_animation = *progress.blocking_read();
+            }
+            _ => {}
         }
     }
     fn draw(&self, mouse_move_elapsed: &Duration) -> iced::Element<'_, Message> {
@@ -432,9 +470,11 @@ impl Transfer for DownloadTransfer {
             .spacing(6)
             .into(),
 
-            DownloadState::HashingFile(progress_lock) => widget::row!(
+            DownloadState::HashingFile {
+                progress_animation, ..
+            } => widget::row!(
                 "Hashing file...",
-                widget::progress_bar(0.0..=1., *progress_lock.blocking_read()).girth(24),
+                widget::progress_bar(0.0..=1., *progress_animation).girth(24),
                 tooltip_button(
                     "Cancel",
                     Message::CancelOrPauseTransfer(

@@ -25,7 +25,9 @@ use tracing::Instrument as _;
 use crate::{
     core::{
         humanize_bytes,
-        intervals::{FileIntervals, RangeData as _, DOWNLOAD_CHUNK_INTERVAL_MIN},
+        intervals::{
+            self, merge_adjacent_ranges, FileIntervals, RangeData as _, DOWNLOAD_CHUNK_INTERVAL_MIN,
+        },
         peer_connection_into_stream, udp_holepunch, ConnectionsManager, FileYeetCommandType,
         Hasher, PortMappingConfig, PrepareConnectionError, PreparedConnection,
         ReadSubscribingPeerError, SubscribeError, HASH_EXT_REGEX, MAX_PEER_COMMUNICATION_SIZE,
@@ -36,8 +38,8 @@ use crate::{
         transfers::{
             update_download_result, update_upload_result, DownloadMultiPeer, DownloadPartRange,
             DownloadResult, DownloadSinglePeer, DownloadState, DownloadStrategy, DownloadTransfer,
-            RecoverableState, Transfer, TransferBase, TransferSnapshot, UploadResult, UploadState,
-            UploadTransfer,
+            MultiPeerDownloadResult, RecoverableState, Transfer, TransferBase, TransferSnapshot,
+            UploadResult, UploadState, UploadTransfer,
         },
     },
     settings::{
@@ -424,7 +426,7 @@ pub enum Message {
 
     /// The result of a chunk download from a peer in a multi-peer download.
     /// `usize` is the connection ID in the multi-peer download.
-    MultiPeerDownloadTransferResulted(Nonce, std::ops::Range<u64>, usize, DownloadResult),
+    MultiPeerDownloadTransferResulted(Nonce, std::ops::Range<u64>, usize, MultiPeerDownloadResult),
 
     /// An attempt to resume a multi-peer download from saved state has failed.
     SaveFailedMultiPeerDownloadResume(Nonce, Arc<String>),
@@ -2593,10 +2595,13 @@ impl AppState {
                                         }),
                                     ..
                                 } => intervals
-                                    .convert_ranges(|r| {
-                                        let start = r.start();
-                                        start..start + *r.progress_lock.blocking_read()
-                                    })
+                                    .convert_ranges(
+                                        |r| {
+                                            let start = r.start();
+                                            start..start + *r.progress_lock.blocking_read()
+                                        },
+                                        merge_adjacent_ranges,
+                                    )
                                     .map_or_else(
                                         |e| {
                                             tracing::error!(
@@ -2683,7 +2688,10 @@ impl AppState {
         let progress_lock = Arc::new(RwLock::new(0.));
         let paused_progress = std::mem::replace(
             &mut t.progress,
-            DownloadState::HashingFile(progress_lock.clone()),
+            DownloadState::HashingFile {
+                progress_animation: 0.,
+                progress: progress_lock.clone(),
+            },
         );
 
         t.base.cancellation_token = CancellationToken::new();
@@ -2707,7 +2715,9 @@ impl AppState {
 
         if let Some(intervals) = intervals {
             // Convert the saved progress into the download part ranges used during transfers.
-            let Ok(intervals) = intervals.convert_ranges(DownloadPartRange::new_completed) else {
+            let Ok(intervals) =
+                intervals.convert_ranges(DownloadPartRange::new_completed, intervals::never_merge)
+            else {
                 // This should never happen since the ranges are not changing during conversion.
                 tracing::error!("Failed to convert saved intervals to download part ranges");
                 return iced::Task::none();
@@ -3031,7 +3041,9 @@ impl AppState {
                     output_path.clone(),
                     None,
                 ),
-                move |r| Message::MultiPeerDownloadTransferResulted(nonce, chunk, stable_id, r),
+                move |r| {
+                    Message::MultiPeerDownloadTransferResulted(nonce, chunk, stable_id, r.into())
+                },
             ))
         });
         iced::Task::batch(tasks)
@@ -3044,7 +3056,7 @@ impl AppState {
         nonce: Nonce,
         old_range: std::ops::Range<u64>,
         connection_id: usize,
-        result: DownloadResult,
+        result: MultiPeerDownloadResult,
     ) -> iced::Task<Message> {
         let ConnectionState::Connected(ConnectedState {
             peers: active_peers,
@@ -3081,7 +3093,7 @@ impl AppState {
                 DownloadState::Paused(_) | DownloadState::Done(_)
             ) && !matches!(
                 result,
-                DownloadResult::Cancelled | DownloadResult::Failure(_, _)
+                MultiPeerDownloadResult::Cancelled | MultiPeerDownloadResult::Failure(_)
             ) {
                 log_status_change::<LogWarnStatus>(
                     &mut self.status_manager,
@@ -3092,7 +3104,7 @@ impl AppState {
         };
 
         match result {
-            DownloadResult::Success => {
+            MultiPeerDownloadResult::Success => {
                 // Mark the interval as completed.
                 if let Some(interval) = intervals.interval_at_mut(old_range.start) {
                     interval.completed = true;
@@ -3126,7 +3138,6 @@ impl AppState {
 
                     tracing::debug!("Create new task for next multi-peer download chunk: Next chunk {next_chunk:?}");
                     iced::Task::perform(
-                        // TODO: Proper instrumentation of this async block.
                         async move {
                             // Create a request stream to the peer.
                             let request = crate::core::peer_connection_into_stream(
@@ -3136,16 +3147,17 @@ impl AppState {
                             )
                             .await;
 
-                            let request = if let Some(r) = request {
-                                PeerRequestStream::new(peer, r)
-                            } else {
-                                tracing::error!(
-                                    "Failed to create download request for multi-peer chunk"
-                                );
-                                return DownloadResult::Failure(
-                                    Arc::new("Failed to create download request".to_owned()),
-                                    RecoverableState::Recoverable(None),
-                                );
+                            let request = match request {
+                                Ok(r) => PeerRequestStream::new(peer, r),
+                                Err(e) => {
+                                    tracing::error!(
+                                        "Failed to create download request for multi-peer chunk: {e}"
+                                    );
+                                    return DownloadResult::Failure(
+                                        Arc::new("Failed to create download request".to_owned()),
+                                        RecoverableState::Recoverable(None),
+                                    );
+                                }
                             };
 
                             // Download the next chunk.
@@ -3159,13 +3171,14 @@ impl AppState {
                                 None,
                             )
                             .await
-                        },
+                        }
+                        .instrument(tracing::info_span!("multi_peer_download_next_chunk")),
                         move |r| {
                             Message::MultiPeerDownloadTransferResulted(
                                 nonce,
                                 next_chunk_clone,
                                 connection_id,
-                                r,
+                                r.into(),
                             )
                         },
                     )
@@ -3182,9 +3195,11 @@ impl AppState {
                     let file_hash = t.base.hash;
                     let file_size = t.base.file_size;
                     let progress = Arc::new(RwLock::new(0.));
-                    t.progress = DownloadState::HashingFile(progress.clone());
+                    t.progress = DownloadState::HashingFile {
+                        progress_animation: 0.,
+                        progress: progress.clone(),
+                    };
                     iced::Task::perform(
-                        // TODO: Proper instrumentation of this async block.
                         async move {
                             match crate::core::file_size_and_hash(&file_path, Some(&progress)).await
                             {
@@ -3217,14 +3232,14 @@ impl AppState {
                                     RecoverableState::NonRecoverable,
                                 ),
                             }
-                        },
+                        }
+                        .instrument(tracing::info_span!("multi_peer_download_verify")),
                         move |r| Message::DownloadTransferResulted(nonce, r),
                     )
                 }
             }
 
-            // TODO: Multi-peer chunks don't have a real recoverable state. A different enum should be used for multi-peer download results.
-            DownloadResult::Failure(e, _) => {
+            MultiPeerDownloadResult::Failure(e) => {
                 tracing::warn!("Multi-peer download chunk failed: {e}");
 
                 // Remove this peer from the download since something has gone wrong.
@@ -3243,10 +3258,13 @@ impl AppState {
                         std::mem::replace(intervals, FileIntervals::new(t.base.file_size));
 
                     // Convert the partial progress of the download.
-                    let recovered_intervals = intervals.convert_ranges(|r| {
-                        let start = r.start();
-                        start..start + *r.progress_lock.blocking_read()
-                    })
+                    let recovered_intervals = intervals.convert_ranges(
+                        |r| {
+                            let start = r.start();
+                            start..start + *r.progress_lock.blocking_read()
+                        },
+                        merge_adjacent_ranges,
+                    )
                     .map(|i| RecoverableState::Recoverable(Some(Arc::new(i))))
                     .map_err(|e| {
                         tracing::error!("Failed to convert multi-peer download intervals after failure: {e}");
@@ -3288,8 +3306,8 @@ impl AppState {
             }
 
             // The multi-peer download was cancelled.
-            DownloadResult::Cancelled => {
-                tracing::warn!("Multi-peer download chunk was cancelled");
+            MultiPeerDownloadResult::Cancelled => {
+                tracing::info!("Multi-peer download chunk was cancelled");
 
                 // Mark the entire download as cancelled
                 // We verified above that the current state is `Transferring`.
@@ -3342,10 +3360,13 @@ impl AppState {
             intervals,
             FileIntervals::new(t.base.file_size),
         )
-        .convert_ranges(|r| {
-            let start = r.start();
-            start..start + *r.progress_lock.blocking_read()
-        }) {
+        .convert_ranges(
+            |r| {
+                let start = r.start();
+                start..start + *r.progress_lock.blocking_read()
+            },
+            merge_adjacent_ranges,
+        ) {
             // Saved download intervals.
             Ok(i) => RecoverableState::Recoverable(Some(Arc::new(i))),
 
@@ -3469,7 +3490,7 @@ impl AppState {
                             strategy: DownloadStrategy::SinglePeer(_),
                             ..
                         }
-                        | DownloadState::HashingFile(_) => None,
+                        | DownloadState::HashingFile { .. } => None,
 
                         // States where saved intervals are available.
                         DownloadState::Paused(intervals) => intervals,
@@ -3487,10 +3508,13 @@ impl AppState {
                                 DownloadStrategy::MultiPeer(DownloadMultiPeer { intervals, .. }),
                             ..
                         } => intervals
-                            .convert_ranges(|r| {
-                                let start = r.start();
-                                start..start + *r.progress_lock.blocking_read()
-                            })
+                            .convert_ranges(
+                                |r| {
+                                    let start = r.start();
+                                    start..start + *r.progress_lock.blocking_read()
+                                },
+                                merge_adjacent_ranges,
+                            )
                             .map_or_else(
                                 |e| {
                                     tracing::error!("Failed to convert multi-peer intervals: {e}");
@@ -3825,7 +3849,6 @@ fn hash_publish_task(
 
 /// Try to establish a peer connection for a command type.
 /// Either starts from an existing connection or attempts to holepunch.
-//  TODO: Consider returning a `Result` instead of an `Option` to handle errors.
 #[tracing::instrument(skip(peer))]
 async fn try_peer_connection(
     peer: PeerConnectionOrTarget,
@@ -3835,9 +3858,13 @@ async fn try_peer_connection(
     use PeerConnectionOrTarget::{Connection, Target};
     tokio::time::timeout(PEER_CONNECT_TIMEOUT, async move {
         match peer {
-            Connection(c) => peer_connection_into_stream(&c, hash, cmd)
-                .await
-                .map(|s| (c, s)),
+            Connection(c) => match peer_connection_into_stream(&c, hash, cmd).await {
+                Ok(s) => Some((c, s)),
+                Err(e) => {
+                    tracing::error!("Failed to open stream on existing connection: {e}");
+                    None
+                }
+            },
 
             Target(e, peer) => udp_holepunch(cmd, hash, e, peer).await,
         }

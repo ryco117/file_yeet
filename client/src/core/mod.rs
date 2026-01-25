@@ -699,7 +699,7 @@ pub async fn udp_holepunch(
         };
 
     for (connection, managed_connection) in connections {
-        if let Some(peer_streams) = peer_connection_into_stream(&connection, hash, cmd).await {
+        if let Ok(peer_streams) = peer_connection_into_stream(&connection, hash, cmd).await {
             // Let the user know that a connection is established. A bi-directional stream is ready to use.
             tracing::info!("Peer connection established");
 
@@ -714,28 +714,44 @@ pub async fn udp_holepunch(
     None
 }
 
+/// Errors that may occur when turning a peer connection into a bi-directional stream.
+#[derive(Debug, thiserror::Error)]
+pub enum ConnectionIntoStreamError {
+    /// Failed to establish a QUIC connection to the peer.
+    #[error("Failed to establish a QUIC connection to the peer: {0}")]
+    ConnectionFailed(#[from] quinn::ConnectionError),
+
+    /// Failed to read exact bytes from the peer stream. Only occurs with `FileYeetCommandType::Pub`.
+    #[error("Failed to read from the peer stream: {0}")]
+    ReadExactFailed(#[from] quinn::ReadExactError),
+
+    /// The requested hash from the peer does not match the expected hash. Only occurs with `FileYeetCommandType::Pub`.
+    #[error("Requested hash from the peer does not match the expected hash")]
+    HashMismatch,
+
+    /// Failed to write to the peer stream. Only occurs with `FileYeetCommandType::Sub`.
+    #[error("Failed to write to the peer stream: {0}")]
+    WriteFailed(#[from] quinn::WriteError),
+}
+
 /// Try to finalize a peer connection attempt by turning it into a bi-directional stream.
 #[tracing::instrument(skip_all)]
 pub async fn peer_connection_into_stream(
     connection: &quinn::Connection,
     expected_hash: HashBytes,
     cmd: FileYeetCommandType,
-) -> Option<BiStream> {
-    let streams = match cmd {
+) -> Result<BiStream, ConnectionIntoStreamError> {
+    match cmd {
         FileYeetCommandType::Pub => {
             // Let the downloading peer initiate a bi-directional stream.
             let mut r = connection.accept_bi().await;
             if let Ok(s) = &mut r {
                 let mut requested_hash = HashBytes::default();
-                if let Err(e) = s.1.read_exact(&mut requested_hash.bytes).await {
-                    tracing::warn!("Failed to read hash from peer: {e}");
-                    return None;
-                }
+                s.1.read_exact(&mut requested_hash.bytes).await?;
 
                 // Ensure the requested hash matches the expected file hash.
                 if requested_hash != expected_hash {
-                    tracing::warn!("Peer requested a file with an unexpected hash");
-                    return None;
+                    return Err(ConnectionIntoStreamError::HashMismatch);
                 }
                 tracing::debug!("New peer stream accepted");
             }
@@ -744,24 +760,15 @@ pub async fn peer_connection_into_stream(
         FileYeetCommandType::Sub => {
             // Open a bi-directional stream to the publishing peer.
             let mut r = connection.open_bi().await;
-            match &mut r {
-                Ok(s) => {
-                    if let Err(e) = s.0.write_all(&expected_hash.bytes).await {
-                        tracing::warn!("Failed to write to peer stream: {e}");
-                        return None;
-                    }
-                    tracing::debug!("New peer stream opened");
-                }
-                Err(e) => tracing::warn!("Failed to open a peer stream: {e}"),
+            if let Ok(s) = &mut r {
+                s.0.write_all(&expected_hash.bytes).await?;
+                tracing::debug!("New peer stream opened");
             }
             r
         }
-    };
-    if let Ok(streams) = streams {
-        Some(streams.into())
-    } else {
-        None
     }
+    .map(std::convert::Into::into)
+    .map_err(std::convert::Into::into)
 }
 
 /// Make an outgoing connection attempt to a peer at the given address.

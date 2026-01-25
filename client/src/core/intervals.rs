@@ -36,6 +36,34 @@ pub enum AddIntervalError {
     ZeroSize(u64, u64),
 }
 
+/// Result of attempting to merge two adjacent ranges.
+pub enum MergeAdjacentResult<R: RangeData> {
+    /// The ranges were merged into one.
+    Merged(R),
+
+    /// The ranges were not merged, returned without change.
+    NotMerged(R, R),
+}
+
+/// Default merge function that merges ranges purely based on adjacency.
+/// I.e, if the end of the first range equals the start of the second range,
+/// then they are merged into one range.
+pub fn merge_adjacent_ranges(
+    r1: std::ops::Range<u64>,
+    r2: std::ops::Range<u64>,
+) -> MergeAdjacentResult<std::ops::Range<u64>> {
+    if r1.end() == r2.start() {
+        MergeAdjacentResult::Merged(r1.start()..r2.end())
+    } else {
+        MergeAdjacentResult::NotMerged(r1, r2)
+    }
+}
+
+/// Generic merge function that never merges ranges.
+pub fn never_merge<R: RangeData>(r1: R, r2: R) -> MergeAdjacentResult<R> {
+    MergeAdjacentResult::NotMerged(r1, r2)
+}
+
 /// Helper for managing file intervals.
 #[derive(Clone, Debug)]
 pub struct FileIntervals<R: RangeData> {
@@ -153,34 +181,67 @@ impl<R: RangeData> FileIntervals<R> {
     }
 
     /// Convert the ranges to another type. Filters out zero-size ranges (after conversion) without error.
+    /// A merge function is provided to determine which intervals can be merged into a contiguous range.
     /// # Errors
     /// Returns an error if adding any of the converted ranges fails.
-    pub fn convert_ranges<S, F>(self, f: F) -> Result<FileIntervals<S>, AddIntervalError>
+    pub fn convert_ranges<S, F, M>(
+        self,
+        convert: F,
+        merge: M,
+    ) -> Result<FileIntervals<S>, AddIntervalError>
     where
         S: RangeData,
         F: Fn(R) -> S,
+        M: Fn(S, S) -> MergeAdjacentResult<S>,
     {
+        // Helper to add a range, filtering out zero-size ranges.
+        fn add_range<S: RangeData>(
+            manager: &mut FileIntervals<S>,
+            range: S,
+        ) -> Result<(), AddIntervalError> {
+            match manager.add_interval(range) {
+                Ok(()) | Err(AddIntervalError::ZeroSize(_, _)) => Ok(()),
+                Err(e) => Err(e),
+            }
+        }
+
         let Self {
             intervals,
             total_size,
             ..
         } = self;
 
-        // Map the intervals to the new type.
-        let mut new_intervals = FileIntervals::new(total_size);
-        for range in intervals.into_iter().map(f) {
-            match new_intervals.add_interval(range) {
-                Ok(()) | Err(AddIntervalError::ZeroSize(_, _)) => {}
-                Err(e) => return Err(e),
+        // Create iterator over the converted intervals.
+        let mut new_intervals = intervals.into_iter().map(convert);
+
+        // Start with the first interval, or return an empty set.
+        let Some(mut current_range) = new_intervals.next() else {
+            return Ok(FileIntervals::new(total_size));
+        };
+
+        // Use the merge function to attempt to merge adjacent ranges.
+        let mut new_intervals_manager = FileIntervals::new(total_size);
+        for next_range in new_intervals {
+            match merge(current_range, next_range) {
+                // Ranges were merged.
+                MergeAdjacentResult::Merged(merged_range) => {
+                    // Make the current range this result and continue attempting to merge.
+                    current_range = merged_range;
+                }
+
+                // Ranges were not merged.
+                MergeAdjacentResult::NotMerged(r1, r2) => {
+                    // Add the first range and continue trying to merge the second.
+                    add_range(&mut new_intervals_manager, r1)?;
+                    current_range = r2;
+                }
             }
         }
 
-        // TODO: Allow for a merge function to optionally combine adjacent intervals.
-        //       This would reduce disk usage when saving completed intervals for a partial
-        //       download. Currently, all non-empty intervals are saved/retained, even if they can
-        //       be more optimally represented as a single interval.
+        // Add the final current range.
+        add_range(&mut new_intervals_manager, current_range)?;
 
-        Ok(new_intervals)
+        Ok(new_intervals_manager)
     }
 
     /// Extract the ranges as a vector, consuming `self`.
