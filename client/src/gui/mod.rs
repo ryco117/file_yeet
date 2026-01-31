@@ -234,12 +234,6 @@ impl ConnectedState {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub enum CancelOrPause {
-    Cancel,
-    Pause,
-}
-
 /// The state of the connection to a `file_yeet` server.
 #[derive(Debug, Default)]
 #[allow(clippy::large_enum_variant)]
@@ -403,8 +397,11 @@ pub enum Message {
     /// Remove a publish item.
     RemovePublish(Nonce),
 
-    /// Cancel or pause a transfer that is in-progress.
-    CancelOrPauseTransfer(Nonce, FileYeetCommandType, CancelOrPause),
+    /// Cancel a transfer that is in-progress.
+    CancelTransfer(Nonce, FileYeetCommandType),
+
+    /// Pause a download that is in-progress.
+    PauseDownload(Nonce),
 
     /// Update a download's `publish_on_success` toggle.
     PublishOnSuccessToggle(Nonce, bool),
@@ -647,9 +644,10 @@ impl AppState {
             Message::CancelPublish(nonce) => self.update_cancel_publish(nonce),
             Message::RetryPublish(nonce) => self.update_retry_publish(nonce),
             Message::RemovePublish(nonce) => self.update_remove_publish(nonce),
-            Message::CancelOrPauseTransfer(nonce, transfer_type, cancel_or_pause) => {
-                self.update_cancel_or_pause(nonce, transfer_type, cancel_or_pause)
+            Message::CancelTransfer(nonce, transfer_type) => {
+                self.update_cancel_transfer(nonce, transfer_type)
             }
+            Message::PauseDownload(nonce) => self.update_pause_download(nonce),
             Message::PublishOnSuccessToggle(nonce, publish_on_success) => {
                 self.update_publish_on_success_toggle(nonce, publish_on_success)
             }
@@ -2529,14 +2527,12 @@ impl AppState {
         iced::Task::none()
     }
 
-    /// Update the state after a transfer was cancelled or paused.
-    //  TODO: Separate into dedicated functions for cancelling and pausing transfers. Can't pause uploads.
+    /// Update the state after a transfer was cancelled.
     #[tracing::instrument(skip(self))]
-    fn update_cancel_or_pause(
+    fn update_cancel_transfer(
         &mut self,
         nonce: Nonce,
         transfer_type: FileYeetCommandType,
-        cancel_or_pause: CancelOrPause,
     ) -> iced::Task<Message> {
         let ConnectionState::Connected(ConnectedState {
             peers,
@@ -2554,97 +2550,94 @@ impl AppState {
                 binary_find_nonce_mut(downloads, nonce).map(|(_, t)| {
                     // Cancel the download's tasks.
                     t.base.cancellation_token.cancel();
+                    tracing::debug!("Cancelled download {}", t.base.hash_hex);
 
-                    match cancel_or_pause {
-                        CancelOrPause::Cancel => {
-                            tracing::debug!("Cancelled download {}", t.base.hash_hex);
-
-                            // Mark the download as cancelled.
-                            update_download_result(
-                                &mut t.progress,
-                                DownloadResult::Cancelled,
-                                peers,
-                                nonce,
-                            );
-                        }
-                        CancelOrPause::Pause => {
-                            tracing::debug!("Paused download {}", t.base.hash_hex);
-
-                            // Default to no saved intervals.
-                            let progress =
-                                std::mem::replace(&mut t.progress, DownloadState::Paused(None));
-                            let intervals = match progress {
-                                // Retain existing paused intervals. This shouldn't happen ever.
-                                DownloadState::Paused(intervals) => {
-                                    tracing::error!("Download is already paused");
-                                    intervals
-                                }
-
-                                // Get the currently saved intervals for this download.
-                                DownloadState::Transferring(DownloadTransferringState {
-                                    strategy:
-                                        DownloadStrategy::MultiPeer(DownloadMultiPeer {
-                                            intervals, ..
-                                        }),
-                                    ..
-                                }) => intervals
-                                    .convert_ranges(
-                                        |r| {
-                                            let start = r.start();
-                                            start..start + *r.progress_lock.blocking_read()
-                                        },
-                                        merge_adjacent_ranges,
-                                    )
-                                    .map_or_else(
-                                        |e| {
-                                            tracing::error!(
-                                                "Failed to convert multi-peer intervals: {e}"
-                                            );
-                                            None
-                                        },
-                                        Some,
-                                    ),
-
-                                // Already set the `Paused` intervals to `None`, return.
-                                _ => return,
-                            };
-                            t.progress = DownloadState::Paused(intervals);
-                        }
-                    }
+                    // Mark the download as cancelled.
+                    update_download_result(
+                        &mut t.progress,
+                        DownloadResult::Cancelled,
+                        peers,
+                        nonce,
+                    );
                 })
             }
             FileYeetCommandType::Pub => {
                 binary_find_nonce_mut(uploads, nonce).map(|(_, t)| {
                     // Cancel the upload's tasks.
                     t.base.cancellation_token.cancel();
+                    tracing::debug!("Cancelled upload {}", t.base.hash_hex);
 
-                    match cancel_or_pause {
-                        CancelOrPause::Cancel => {
-                            tracing::debug!("Cancelled upload {}", t.base.hash_hex);
-
-                            // Mark the upload as cancelled.
-                            update_upload_result(
-                                &mut t.progress,
-                                UploadResult::Cancelled,
-                                peers,
-                                nonce,
-                            );
-                        }
-                        CancelOrPause::Pause => {
-                            tracing::error!(
-                                "Unexpected attempt to pause an upload, only cancel is expected"
-                            );
-                        }
-                    }
+                    // Mark the upload as cancelled.
+                    update_upload_result(&mut t.progress, UploadResult::Cancelled, peers, nonce);
                 })
             }
         }
         .unwrap_or_else(|| {
             log_status_change::<LogWarnStatus>(
                 &mut self.status_manager,
-                format!("No transfer found to {cancel_or_pause:?}"),
+                "No transfer found to cancel".to_owned(),
             );
         });
+        iced::Task::none()
+    }
+
+    /// Update the state after a download was paused. Only downloads can be paused.
+    #[tracing::instrument(skip(self))]
+    fn update_pause_download(&mut self, nonce: Nonce) -> iced::Task<Message> {
+        let ConnectionState::Connected(ConnectedState { downloads, .. }) =
+            &mut self.connection_state
+        else {
+            tracing::warn!("No connected state to pause download");
+            return iced::Task::none();
+        };
+
+        let Some((_, t)) = binary_find_nonce_mut(downloads, nonce) else {
+            log_status_change::<LogWarnStatus>(
+                &mut self.status_manager,
+                "No transfer found to pause".to_owned(),
+            );
+            return iced::Task::none();
+        };
+
+        // Cancel the download's tasks.
+        t.base.cancellation_token.cancel();
+        tracing::debug!("Paused download {}", t.base.hash_hex);
+
+        // Default to no saved intervals.
+        let progress = std::mem::replace(&mut t.progress, DownloadState::Paused(None));
+        let intervals = match progress {
+            // Retain existing paused intervals. This shouldn't happen ever.
+            DownloadState::Paused(intervals) => {
+                tracing::error!("Download is already paused");
+                intervals
+            }
+
+            // Get the currently saved intervals for this download.
+            DownloadState::Transferring(DownloadTransferringState {
+                strategy: DownloadStrategy::MultiPeer(DownloadMultiPeer { intervals, .. }),
+                ..
+            }) => intervals
+                .convert_ranges(
+                    |r| {
+                        let start = r.start();
+                        start..start + *r.progress_lock.blocking_read()
+                    },
+                    merge_adjacent_ranges,
+                )
+                .map_or_else(
+                    |e| {
+                        tracing::error!("Failed to convert multi-peer intervals: {e}");
+                        None
+                    },
+                    Some,
+                ),
+
+            // Already set the `Paused` intervals to `None`, return.
+            _ => return iced::Task::none(),
+        };
+
+        // Update with the correct intervals.
+        t.progress = DownloadState::Paused(intervals);
         iced::Task::none()
     }
 
