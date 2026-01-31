@@ -288,40 +288,39 @@ pub struct AppState {
 }
 
 /// The messages that can be sent to the update loop of the application.
-//  TODO: Message docs should be descriptive of what the message does, not necessarily how it was triggered. Messages can have multiple sources
 #[derive(Clone, Debug)]
 pub enum Message {
-    /// The `Id` of the main (oldest) window, if one exists.
+    /// Update the `Id` of the main (oldest) window.
     MainWindowId(Option<window::Id>),
 
-    /// The server text field was changed.
+    /// Update the server address setting.
     ServerAddressChanged(String),
 
-    /// The text field for the internal port was changed.
+    /// Update the internal port text setting.
     InternalPortTextChanged(String),
 
-    /// The port mapping radio button was changed.
+    /// Update the port mapping setting selection.
     PortMappingRadioChanged(PortMappingSetting),
 
-    /// The port forward text field was changed.
+    /// Update the port forward text setting.
     PortForwardTextChanged(String),
 
-    /// The gateway text field was changed.
+    /// Update the gateway text setting.
     GatewayTextChanged(String),
 
-    /// The connect button was clicked.
+    /// Initiate a connection to the server.
     ConnectClicked,
 
-    /// A moment in time has passed, update the animations.
+    /// Update animations based on elapsed time.
     AnimationTick,
 
-    /// Toggle showing the status message history.
+    /// Toggle the visibility of the status message history.
     ToggleStatusHistory,
 
-    /// The result of a server connection attempt.
+    /// Handle the result of a server connection attempt.
     ConnectResulted(Result<crate::core::PreparedConnection, Arc<PrepareConnectionError>>),
 
-    /// The port mapping has been updated.
+    /// Update the current port mapping state.
     PortMappingUpdated(Option<crab_nat::PortMapping>),
 
     /// Copy the server address to the clipboard.
@@ -330,25 +329,25 @@ pub enum Message {
     /// Leave the server and disconnect.
     SafelyLeaveServer,
 
-    /// All async actions to leave a server have completed.
+    /// Complete the server disconnection process without further asynchronous actions.
     LeftServer,
 
-    /// A peer has requested a new transfer from an existing connection.
+    /// Handle an incoming transfer request from a peer.
     PeerRequestedTransfer((HashBytes, PeerRequestStream)),
 
-    /// The transfer view radio buttons were changed.
+    /// Update the active transfer view.
     TransferViewChanged(TransferView),
 
-    /// The hash input field was changed.
+    /// Update the hash input field value.
     HashInputChanged(String),
 
-    /// The publish button was clicked.
+    /// Initiate file selection dialog for publishing.
     PublishClicked,
 
-    /// Initiate publishing of the chosen file or publish item.
+    /// Begin publishing the selected file or existing publish item.
     PublishChosenItem(CreateOrExistingPublish),
 
-    /// Cancelled choosing a file path to publish.
+    /// Handle cancellation of file selection for publishing.
     PublishPathCancelled,
 
     /// Create or update a publish item with a known hash. The hash may be from disk or freshly calculated.
@@ -359,46 +358,46 @@ pub enum Message {
         new_hash: bool,
     },
 
-    /// The result of a publish request.
+    /// Handle the result of a publish request to the server.
     PublishRequestResulted(Nonce, PublishRequestResult),
 
-    /// The result of trying to receive a peer from the server.
+    /// Handle the result of receiving a subscribing peer from the server.
     PublishPeerReceived(Nonce, Result<SocketAddr, Arc<ReadSubscribingPeerError>>),
 
-    /// The result of trying to connect to a peer to publish to.
+    /// Handle the result of connecting to a peer for publishing.
     PublishPeerConnectResulted(Nonce, Option<PeerRequestStream>),
 
-    /// The subscribe button was clicked or the hash field was submitted.
+    /// Initiate a subscription to download a file by hash.
     SubscribeStarted,
 
-    /// The file path to save to, if chosen, and the hash text of the file.
+    /// Begin a download with the selected file path and hash.
     SubscribePathChosen(Option<PathBuf>, String),
 
-    /// A download is being recreated from the open transfers at last close.
+    /// Recreate a download from the saved transfer state.
     SubscribeRecreated(SavedDownload),
 
-    /// A subscribe request to the server has resulted.
+    /// Handle the result of a subscribe request to the server.
     SubscribePeersResult(Result<IncomingSubscribePeers, Arc<SubscribeError>>),
 
-    /// A subscribe connection attempt was completed.
+    /// Handle the result of a connection attempt to peers for subscription.
     SubscribePeerConnectResulted(Nonce, Vec<PeerRequestStream>),
 
-    // A download was accepted, initiate the download.
+    /// Accept and begin a pending download.
     AcceptDownload(Nonce),
 
-    // A download was rejected, remove the download.
+    /// Reject and remove a pending download.
     RejectDownload(Nonce),
 
-    /// Copy a hash to the clipboard.
+    /// Copy a publish hash to the clipboard.
     CopyHash(Nonce),
 
-    /// Rehash a file that was previously published.
+    /// Recalculate the hash of a published file.
     RehashPublish(Nonce),
 
     /// Cancel publishing a file.
     CancelPublish(Nonce),
 
-    /// Retry publishing a file.
+    /// Retry a failed publish attempt.
     RetryPublish(Nonce),
 
     /// Remove a publish item.
@@ -407,47 +406,47 @@ pub enum Message {
     /// Cancel or pause a transfer that is in-progress.
     CancelOrPauseTransfer(Nonce, FileYeetCommandType, CancelOrPause),
 
-    /// Change a download's `publish_on_success` toggle.
+    /// Update a download's `publish_on_success` toggle.
     PublishOnSuccessToggle(Nonce, bool),
 
-    /// The resume button was pressed for a paused (or recoverable) download.
+    /// Resume a paused or recoverable download.
     ResumePausedDownload(Nonce),
 
-    /// A resume attempt to get a partial file hash completed.
+    /// Handle the result of hashing a partial file for resume.
     ResumeFromPartialHashFile(
         Nonce,
         Result<(Hasher, u64, PeerRequestStream), Option<Arc<String>>>,
     ),
 
-    /// The result of a download attempt.
+    /// Handle the result of a download transfer.
     DownloadTransferResulted(Nonce, DownloadResult),
 
-    /// The result of an attempt to initialize a multi-peer download by allocating the output file.
+    /// Handle the result of preparing a multi-peer download.
     PrepareMultiPeerDownloadResulted(
         Nonce,
         Result<nonempty::NonEmpty<PeerRequestStream>, Arc<std::io::Error>>,
     ),
 
-    /// The result of a chunk download from a peer in a multi-peer download.
+    /// Handle the result of a chunk download in a multi-peer transfer.
     /// `usize` is the connection ID in the multi-peer download.
     MultiPeerDownloadTransferResulted(Nonce, std::ops::Range<u64>, usize, MultiPeerDownloadResult),
 
-    /// An attempt to resume a multi-peer download from saved state has failed.
+    /// Handle a failed multi-peer download resume attempt.
     SaveFailedMultiPeerDownloadResume(Nonce, Arc<String>),
 
-    /// The result of an upload attempt.
+    /// Handle the result of an upload transfer.
     UploadTransferResulted(Nonce, UploadResult),
 
-    /// Open the file using the system launcher for that file type.
+    /// Open the file using the system's default application.
     OpenFile(Arc<PathBuf>),
 
-    /// A completed transfer is being removed from its list.
+    /// Remove a completed transfer from the transfer list.
     RemoveFromTransfers(Nonce, FileYeetCommandType),
 
-    /// An unhandled event occurred.
+    /// Handle an event not processed by the iced framework.
     UnhandledEvent(iced::window::Id, iced::Event),
 
-    /// Exit the application immediately. Ensure we aren't waiting for async tasks forever.
+    /// Exit the application immediately without waiting for asynchronous tasks.
     ForceExit,
 }
 
@@ -528,21 +527,17 @@ impl AppState {
     #[tracing::instrument(skip_all)]
     pub fn update(&mut self, message: Message) -> iced::Task<Message> {
         match message {
-            // Set the ID of the main window.
             Message::MainWindowId(id) => {
                 tracing::debug!("Main window ID set to {id:?}");
                 self.main_window = id;
                 iced::Task::none()
             }
-
-            // Handle the server address being changed.
             Message::ServerAddressChanged(address) => {
                 tracing::debug!("Server address changed to {address}");
                 self.options.server_address = address;
                 self.save_on_exit = true;
                 iced::Task::none()
             }
-
             Message::InternalPortTextChanged(text) => {
                 tracing::debug!("Internal port text changed to {text}");
                 self.options.internal_port_text = text;
@@ -559,29 +554,20 @@ impl AppState {
             Message::ToggleStatusHistory => self.update_show_status_logs(),
             Message::ConnectResulted(r) => self.update_connect_resulted(r),
             Message::PortMappingUpdated(mapping) => self.update_port_mapping(mapping),
-
-            // Copy the connected server address to the clipboard.
             Message::CopyServer => {
                 tracing::debug!("Copying server address to clipboard");
                 iced::clipboard::write(self.options.server_address.clone())
             }
-
             Message::SafelyLeaveServer => self.safely_close(CloseType::Connections),
-
-            // All async actions to leave a server have completed.
             Message::LeftServer => {
                 tracing::debug!("Left server, now disconnected");
                 self.safely_closing = false;
                 self.connection_state = ConnectionState::Disconnected;
                 iced::Task::none()
             }
-
-            // A peer has requested a new transfer from an existing connection.
             Message::PeerRequestedTransfer((hash, peer_request)) => {
                 self.update_peer_requested_transfer(hash, peer_request)
             }
-
-            // The transfer view radio buttons were changed.
             Message::TransferViewChanged(view) => {
                 if let ConnectionState::Connected(connected_state) = &mut self.connection_state {
                     tracing::debug!("Transfer view changed to {view:?}");
@@ -591,8 +577,6 @@ impl AppState {
                 }
                 iced::Task::none()
             }
-
-            // Handle the hash input being changed.
             Message::HashInputChanged(hash) => {
                 if let ConnectionState::Connected(ConnectedState { hash_input, .. }) =
                     &mut self.connection_state
@@ -604,8 +588,6 @@ impl AppState {
                 }
                 iced::Task::none()
             }
-
-            // Handle the publish button being clicked by picking a file to publish.
             Message::PublishClicked => {
                 tracing::debug!("Publish button clicked");
 
@@ -628,7 +610,6 @@ impl AppState {
                     },
                 )
             }
-
             Message::PublishChosenItem(publish) => self.update_publish_chosen_item(publish),
             Message::PublishPathCancelled => {
                 tracing::debug!("Publish choice cancelled");
@@ -686,8 +667,6 @@ impl AppState {
                 self.update_save_failed_multi_peer_download_resume(nonce, e)
             }
             Message::UploadTransferResulted(nonce, r) => self.update_upload_resulted(nonce, r),
-
-            // Handle the `Open` button being pressed.
             Message::OpenFile(path) => {
                 tracing::debug!("Opening file: {}", path.to_string_lossy());
                 open::that(path.as_ref()).unwrap_or_else(|e| {
@@ -698,12 +677,9 @@ impl AppState {
                 });
                 iced::Task::none()
             }
-
             Message::RemoveFromTransfers(nonce, transfer_type) => {
                 self.update_remove_from_transfers(nonce, transfer_type)
             }
-
-            // Handle an event that iced did not handle itself.
             Message::UnhandledEvent(window, event) => match event {
                 // Check for a close window request to allow safe closing.
                 iced::Event::Window(window::Event::CloseRequested) => {
@@ -739,8 +715,6 @@ impl AppState {
                 // Silently ignore all other events.
                 _ => iced::Task::none(),
             },
-
-            // Exit the application immediately.
             Message::ForceExit => {
                 tracing::debug!("Force exit requested");
                 self.main_window.map_or_else(
@@ -3470,7 +3444,7 @@ impl AppState {
 
             // Remove successful uploads of partial-file ranges from the list.
             // TODO: Make a new type like `UploadResultDisplay` to avoid needing an aggregate param
-            //       in the tupe here, which is always zero/unused. Other solution is to add the
+            //       in the tuple here, which is always zero/unused. Other solution is to add the
             //       aggregate to the `UploadState::Done` variant.
             UploadResult::Success(r, _) => {
                 let data = if let Some((index, t)) = binary_find_nonce(uploads, nonce) {
