@@ -83,9 +83,10 @@ impl From<DownloadResult> for MultiPeerDownloadResult {
 /// The result of a file upload with a peer.
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum UploadResult {
-    /// The transfer succeeded at uploading the specified range.
+    /// The transfer succeeded at uploading the specified range. The number of additional bytes
+    /// from other chunks uploaded to this peer are tracked.
     #[error("Transfer succeeded")]
-    Success(std::ops::Range<u64>),
+    Success(std::ops::Range<u64>, u64),
 
     /// The transfer failed with the specified error message.
     #[error("{0}")]
@@ -220,6 +221,24 @@ pub enum DownloadStrategy {
     MultiPeer(DownloadMultiPeer),
 }
 
+/// The state of a download transfer in progress.
+#[derive(Debug)]
+pub struct DownloadTransferringState {
+    pub strategy: DownloadStrategy,
+    pub progress_animation: f32,
+    pub snapshot: TransferSnapshot,
+}
+impl DownloadTransferringState {
+    /// Create a new `DownloadTransferringState`.
+    pub fn new(strategy: DownloadStrategy) -> Self {
+        Self {
+            strategy,
+            progress_animation: 0.,
+            snapshot: TransferSnapshot::new(),
+        }
+    }
+}
+
 /// The state of a download transfer with a peer.
 #[derive(Debug)]
 pub enum DownloadState {
@@ -230,11 +249,7 @@ pub enum DownloadState {
     Consent(nonempty::NonEmpty<PeerRequestStream>),
 
     /// The transfer is in progress.
-    Transferring {
-        strategy: DownloadStrategy,
-        progress_animation: f32,
-        snapshot: TransferSnapshot,
-    },
+    Transferring(DownloadTransferringState),
 
     /// The transfer has been paused.
     Paused(Option<FileIntervals<std::ops::Range<u64>>>),
@@ -255,27 +270,23 @@ impl DownloadState {
         match self {
             // Connections in these states.
             DownloadState::Consent(peers) => Box::new(peers.iter().map(|p| &p.connection)),
-            DownloadState::Transferring {
+            DownloadState::Transferring(DownloadTransferringState {
                 strategy: DownloadStrategy::SinglePeer(DownloadSinglePeer { peer, .. }),
                 ..
-            } => Box::new(std::iter::once(peer)),
-            DownloadState::Transferring {
+            }) => Box::new(std::iter::once(peer)),
+            DownloadState::Transferring(DownloadTransferringState {
                 strategy: DownloadStrategy::MultiPeer(DownloadMultiPeer { peers, .. }),
                 ..
-            } => Box::new(peers.values()),
+            }) => Box::new(peers.values()),
 
             // No connections in the remaining states.
             _ => Box::new(std::iter::empty()),
         }
     }
 
-    /// Helper to create a new `DownloadState::Transferring {}` state.
+    /// Helper to create a new `DownloadState::Transferring` state.
     pub fn new_transferring(strategy: DownloadStrategy) -> Self {
-        DownloadState::Transferring {
-            strategy,
-            progress_animation: 0.,
-            snapshot: TransferSnapshot::new(),
-        }
+        DownloadState::Transferring(DownloadTransferringState::new(strategy))
     }
 }
 
@@ -336,6 +347,7 @@ pub trait Transfer {
 pub struct DownloadTransfer {
     pub base: TransferBase,
     pub progress: DownloadState,
+    pub publish_on_success: bool,
 }
 impl NonceItem for DownloadTransfer {
     fn nonce(&self) -> Nonce {
@@ -348,12 +360,12 @@ impl Transfer for DownloadTransfer {
     }
     fn update_animation(&mut self) {
         match &mut self.progress {
-            DownloadState::Transferring {
+            DownloadState::Transferring(DownloadTransferringState {
                 strategy,
                 progress_animation,
                 snapshot,
                 ..
-            } => {
+            }) => {
                 // Get the total bytes transferred at the current moment.
                 let bytes_transferred = match strategy {
                     DownloadStrategy::SinglePeer(DownloadSinglePeer { progress_lock, .. }) => {
@@ -399,7 +411,9 @@ impl Transfer for DownloadTransfer {
 
         // Try to get a transfer rate string or `None`.
         let rate = match &self.progress {
-            DownloadState::Transferring { snapshot, .. } => Some(snapshot.human_readable.clone()),
+            DownloadState::Transferring(DownloadTransferringState { snapshot, .. }) => {
+                Some(snapshot.human_readable.clone())
+            }
             _ => None,
         };
 
@@ -420,30 +434,40 @@ impl Transfer for DownloadTransfer {
             .spacing(12)
             .into(),
 
-            DownloadState::Transferring {
+            DownloadState::Transferring(DownloadTransferringState {
                 progress_animation: p,
                 ..
-            } => widget::row!(
+            }) => widget::row!(
                 "Transferring...",
                 widget::progress_bar(0.0..=1., *p).girth(24),
-                tooltip_button(
-                    "Pause",
-                    Message::CancelOrPauseTransfer(
-                        self.base.nonce,
-                        FileYeetCommandType::Sub,
-                        CancelOrPause::Pause,
-                    ),
-                    "Pause the download, it can be safely resumed",
-                ),
-                tooltip_button(
-                    "Cancel",
-                    Message::CancelOrPauseTransfer(
-                        self.base.nonce,
-                        FileYeetCommandType::Sub,
-                        CancelOrPause::Cancel,
-                    ),
-                    "Cancel the download, abandoning progress",
-                ),
+                widget::column!(
+                    widget::row!(
+                        tooltip_button(
+                            "Pause",
+                            Message::CancelOrPauseTransfer(
+                                self.base.nonce,
+                                FileYeetCommandType::Sub,
+                                CancelOrPause::Pause,
+                            ),
+                            "Pause the download, it can be safely resumed",
+                        ),
+                        tooltip_button(
+                            "Cancel",
+                            Message::CancelOrPauseTransfer(
+                                self.base.nonce,
+                                FileYeetCommandType::Sub,
+                                CancelOrPause::Cancel,
+                            ),
+                            "Cancel the download, abandoning progress",
+                        ),
+                    )
+                    .spacing(8),
+                    widget::checkbox(self.publish_on_success)
+                        .label("Reyeet on success")
+                        .on_toggle(|b| Message::PublishOnSuccessToggle(self.base.nonce, b))
+                        .size(10),
+                )
+                .align_x(iced::Alignment::End),
             )
             .spacing(6)
             .align_y(iced::Alignment::Center)
@@ -505,7 +529,7 @@ impl Transfer for DownloadTransfer {
                     match r {
                         DownloadResult::Success => {
                             let publish_button = tooltip_button(
-                                "Publish",
+                                "Reyeet",
                                 Message::PublishFileHashed {
                                     publish: CreateOrExistingPublish::Create(
                                         self.base.path.clone(),
@@ -548,16 +572,16 @@ impl Transfer for DownloadTransfer {
 
         let peer_str = match &self.progress {
             // Use the only active peer's string in single-peer downloads.
-            DownloadState::Transferring {
+            DownloadState::Transferring(DownloadTransferringState {
                 strategy: DownloadStrategy::SinglePeer(DownloadSinglePeer { peer_string, .. }),
                 ..
-            } => peer_string,
+            }) => peer_string,
 
             // Use the comma-separated peers string for multi-peer downloads.
-            DownloadState::Transferring {
+            DownloadState::Transferring(DownloadTransferringState {
                 strategy: DownloadStrategy::MultiPeer(DownloadMultiPeer { peers_string, .. }),
                 ..
-            } => peers_string,
+            }) => peers_string,
 
             // Default to empty string for other states.
             _ => "",
@@ -675,8 +699,9 @@ impl Transfer for UploadTransfer {
                     Message::RemoveFromTransfers(self.base.nonce, FileYeetCommandType::Pub),
                     "Remove from list, file is untouched",
                 );
-                let text_string = if let UploadResult::Success(r) = result {
-                    humanize_bytes(r.end - r.start)
+                // TODO: Store `size_string` in `UploadState::Done` to avoid recomputing it.
+                let size_string = if let UploadResult::Success(r, a) = result {
+                    humanize_bytes(r.end - r.start + a)
                 } else {
                     String::new()
                 };
@@ -687,7 +712,7 @@ impl Transfer for UploadTransfer {
                         _ => None,
                     });
 
-                (widget::row!(result_text, remove), text_string)
+                (widget::row!(result_text, remove), size_string)
             }
         };
 
@@ -740,14 +765,14 @@ pub fn update_download_result(
         }
 
         // Handle a transfer that is already done.
-        DownloadState::Done(done) => {
+        DownloadState::Done(done_state) => {
             // If we are cancelling twice, this is a more forgivable double-result.
             if matches!(result, DownloadResult::Cancelled)
-                && matches!(done, DownloadResult::Cancelled)
+                && matches!(done_state, DownloadResult::Cancelled)
             {
                 tracing::debug!("Download already marked as cancelled");
             } else {
-                tracing::warn!("Download already marked as done: {done}");
+                tracing::warn!("Download already marked as done: {done_state}");
             }
             return;
         }
@@ -787,7 +812,7 @@ pub fn update_upload_result(
     if let Some(connection) = progress.connection() {
         // Upload nonces should only be removed when not successful.
         // This is to ensure healthy connections are not closed before peers have completed all their downloads. (I.e., peers may be about to open a new request stream.)
-        if matches!(result, UploadResult::Success(_)) {
+        if matches!(result, UploadResult::Success(_, _)) {
             tracing::debug!("Not removing nonces for successful uploads");
         } else {
             remove_nonce_for_peer(connection, peers, nonce);

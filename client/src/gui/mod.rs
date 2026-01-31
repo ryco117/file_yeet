@@ -38,8 +38,8 @@ use crate::{
         transfers::{
             update_download_result, update_upload_result, DownloadMultiPeer, DownloadPartRange,
             DownloadResult, DownloadSinglePeer, DownloadState, DownloadStrategy, DownloadTransfer,
-            MultiPeerDownloadResult, RecoverableState, Transfer, TransferBase, TransferSnapshot,
-            UploadResult, UploadState, UploadTransfer,
+            DownloadTransferringState, MultiPeerDownloadResult, RecoverableState, Transfer,
+            TransferBase, TransferSnapshot, UploadResult, UploadState, UploadTransfer,
         },
     },
     settings::{
@@ -288,6 +288,7 @@ pub struct AppState {
 }
 
 /// The messages that can be sent to the update loop of the application.
+//  TODO: Message docs should be descriptive of what the message does, not necessarily how it was triggered. Messages can have multiple sources
 #[derive(Clone, Debug)]
 pub enum Message {
     /// The `Id` of the main (oldest) window, if one exists.
@@ -405,6 +406,9 @@ pub enum Message {
 
     /// Cancel or pause a transfer that is in-progress.
     CancelOrPauseTransfer(Nonce, FileYeetCommandType, CancelOrPause),
+
+    /// Change a download's `publish_on_success` toggle.
+    PublishOnSuccessToggle(Nonce, bool),
 
     /// The resume button was pressed for a paused (or recoverable) download.
     ResumePausedDownload(Nonce),
@@ -664,6 +668,9 @@ impl AppState {
             Message::RemovePublish(nonce) => self.update_remove_publish(nonce),
             Message::CancelOrPauseTransfer(nonce, transfer_type, cancel_or_pause) => {
                 self.update_cancel_or_pause(nonce, transfer_type, cancel_or_pause)
+            }
+            Message::PublishOnSuccessToggle(nonce, publish_on_success) => {
+                self.update_publish_on_success_toggle(nonce, publish_on_success)
             }
             Message::ResumePausedDownload(nonce) => self.update_resume_paused(nonce),
             Message::ResumeFromPartialHashFile(nonce, result) => {
@@ -1273,7 +1280,7 @@ impl AppState {
             }
         };
 
-        tracing::info!("Trying connection to server {server_address}:{port}");
+        tracing::debug!("Trying connection to server {server_address}:{port}");
 
         // Set the state to `Stalling` before starting the connection attempt.
         self.connection_state = ConnectionState::new_stalling();
@@ -1495,7 +1502,7 @@ impl AppState {
                 publishes.push(publish);
 
                 if cfg!(debug_assertions) && !is_nonce_sorted(publishes) {
-                    tracing::warn!("Publishes not sorted by nonce after adding new publish");
+                    tracing::error!("Publishes not sorted by nonce after adding new publish");
                     sort_nonce(publishes);
                 }
 
@@ -1537,7 +1544,10 @@ impl AppState {
         new_hash: bool,
     ) -> iced::Task<Message> {
         let ConnectionState::Connected(ConnectedState {
-            server, publishes, ..
+            server,
+            publishes,
+            transfer_view,
+            ..
         }) = &mut self.connection_state
         else {
             tracing::warn!("Publish file hashed while not connected");
@@ -1545,6 +1555,7 @@ impl AppState {
         };
 
         // Ensure we don't publish the same file twice.
+        // TODO: Also check for duplicate hashes in existing publishes which have had their hash computed.
         if let CreateOrExistingPublish::Create(p) = &publish {
             if publishes.iter().any(|pi| {
                 if pi.path.as_ref().eq(p.as_ref()) {
@@ -1562,7 +1573,10 @@ impl AppState {
                     // Duplicate file hash.
                     log_status_change::<LogWarnStatus>(
                         &mut self.status_manager,
-                        format!("Already publishing hash {hash}"),
+                        format!(
+                            "Already publishing hash {hash} for {}",
+                            pi.path.to_string_lossy()
+                        ),
                     );
                     true
                 } else {
@@ -1603,9 +1617,12 @@ impl AppState {
                 publishes.push(publish);
 
                 if cfg!(debug_assertions) && !is_nonce_sorted(publishes) {
-                    tracing::warn!("Publishes not sorted by nonce after adding new publish");
+                    tracing::error!("Publishes not sorted by nonce after adding new publish");
                     sort_nonce(publishes);
                 }
+
+                // Since we have added a new publish, make them the current view.
+                *transfer_view = TransferView::Publishes;
 
                 (nonce, cancellation_token, &publishes.last().unwrap().path)
             }
@@ -1651,7 +1668,7 @@ impl AppState {
         let server = server.clone();
         iced::Task::perform(
             async move {
-                tracing::info!("Attempting to publish file");
+                tracing::debug!("Attempting to publish file");
                 tokio::select! {
                     // Allow cancelling the publish request thread.
                     () = cancellation_token.cancelled() => PublishRequestResult::Cancelled,
@@ -1691,7 +1708,7 @@ impl AppState {
                     }),
                     Some((_, publish)),
                 ) => {
-                    tracing::debug!("Publish request succeeded");
+                    tracing::info!("Publish request succeeded for {hash}");
                     publish.state = PublishState::Publishing(Publish {
                         server_streams,
                         hash,
@@ -1849,7 +1866,7 @@ impl AppState {
         });
 
         if cfg!(debug_assertions) && !is_nonce_sorted(uploads) {
-            tracing::warn!("Uploads not sorted by nonce after adding new upload");
+            tracing::error!("Uploads not sorted by nonce after adding new upload");
             sort_nonce(uploads);
         }
 
@@ -1883,7 +1900,7 @@ impl AppState {
                     requested_size.write().await.replace(l);
                 } else {
                     tracing::info!("The requested upload size is zero, skipping upload");
-                    return UploadResult::Success((start_index)..(start_index + upload_length));
+                    return UploadResult::Success((start_index)..(start_index + upload_length), 0);
                 }
 
                 // Prepare a reader for the file to upload.
@@ -1898,7 +1915,7 @@ impl AppState {
                         reader,
                         Some(&progress_lock),
                     )) => match result {
-                        Ok(()) => UploadResult::Success((start_index)..(start_index + upload_length)),
+                        Ok(()) => UploadResult::Success((start_index)..(start_index + upload_length), 0),
                         Err(e) => UploadResult::Failure(Arc::new(format!("Upload failed: {e}"))),
                     }
                 }
@@ -2076,10 +2093,11 @@ impl AppState {
                 cancellation_token: CancellationToken::new(),
             },
             progress: DownloadState::Paused(saved_intervals),
+            publish_on_success: false,
         });
 
         if cfg!(debug_assertions) && !is_nonce_sorted(downloads) {
-            tracing::warn!("Downloads not sorted by nonce after adding new download");
+            tracing::error!("Downloads not sorted by nonce after adding new download");
             sort_nonce(downloads);
         }
 
@@ -2140,6 +2158,7 @@ impl AppState {
                                 cancellation_token: cancellation_token.clone(),
                             },
                             progress: DownloadState::Connecting,
+                            publish_on_success: false,
                         };
 
                         // New connection attempt for this peer with result command identified by the nonce.
@@ -2165,7 +2184,7 @@ impl AppState {
                 downloads.append(&mut new_transfers);
 
                 if cfg!(debug_assertions) && !is_nonce_sorted(downloads) {
-                    tracing::warn!("Downloads not sorted by nonce after adding new downloads");
+                    tracing::error!("Downloads not sorted by nonce after adding new downloads");
                     sort_nonce(downloads);
                 }
 
@@ -2467,7 +2486,7 @@ impl AppState {
             &mut self.connection_state
         {
             if let Some((_, publish)) = binary_find_nonce_mut(publishes, nonce) {
-                tracing::debug!("Cancelling the publish task");
+                tracing::info!("Cancelling publish for {}", publish.path.to_string_lossy());
                 publish.cancellation_token.cancel();
                 publish.state = PublishState::Cancelled(publish.state.hash_and_file_size());
             } else {
@@ -2537,7 +2556,7 @@ impl AppState {
     }
 
     /// Update the state after a transfer was cancelled or paused.
-    //  TODO: Separate into dedicated functions for cancelling and pausing transfers.
+    //  TODO: Separate into dedicated functions for cancelling and pausing transfers. Can't pause uploads.
     #[tracing::instrument(skip(self))]
     fn update_cancel_or_pause(
         &mut self,
@@ -2588,13 +2607,13 @@ impl AppState {
                                 }
 
                                 // Get the currently saved intervals for this download.
-                                DownloadState::Transferring {
+                                DownloadState::Transferring(DownloadTransferringState {
                                     strategy:
                                         DownloadStrategy::MultiPeer(DownloadMultiPeer {
                                             intervals, ..
                                         }),
                                     ..
-                                } => intervals
+                                }) => intervals
                                     .convert_ranges(
                                         |r| {
                                             let start = r.start();
@@ -2652,6 +2671,32 @@ impl AppState {
                 format!("No transfer found to {cancel_or_pause:?}"),
             );
         });
+        iced::Task::none()
+    }
+
+    /// Set the `publish_on_success` toggle for the given download.
+    #[tracing::instrument(skip(self))]
+    fn update_publish_on_success_toggle(
+        &mut self,
+        nonce: Nonce,
+        publish_on_success: bool,
+    ) -> iced::Task<Message> {
+        let ConnectionState::Connected(ConnectedState { downloads, .. }) =
+            &mut self.connection_state
+        else {
+            tracing::warn!("No connected state to update `publish_on_success` toggle");
+            return iced::Task::none();
+        };
+
+        if let Some((_, download)) = binary_find_nonce_mut(downloads, nonce) {
+            tracing::debug!("Setting `publish_on_success` for download to {publish_on_success}");
+            download.publish_on_success = publish_on_success;
+        } else {
+            log_status_change::<LogWarnStatus>(
+                &mut self.status_manager,
+                "No download found to update toggle".to_owned(),
+            );
+        }
         iced::Task::none()
     }
 
@@ -2843,16 +2888,19 @@ impl AppState {
             // Resume the download with the partial hash
             Ok((digest, start_index, request)) => {
                 let progress = Arc::new(RwLock::new(start_index));
-                let progress_animation = start_index as f32 / t.base.file_size as f32;
-                t.progress = DownloadState::Transferring {
-                    strategy: DownloadStrategy::SinglePeer(DownloadSinglePeer {
+                let mut download_transferring = DownloadTransferringState::new(
+                    DownloadStrategy::SinglePeer(DownloadSinglePeer {
                         peer_string: request.connection.remote_address().to_string(),
                         peer: request.connection.clone(),
                         progress_lock: progress.clone(),
                     }),
-                    progress_animation,
-                    snapshot: TransferSnapshot::new(),
-                };
+                );
+
+                // Resuming from partial file, update progress accordingly.
+                download_transferring.progress_animation =
+                    start_index as f32 / t.base.file_size as f32;
+
+                t.progress = DownloadState::Transferring(download_transferring);
                 let cancellation_token = t.base.cancellation_token.clone();
                 let path = t.base.path.clone();
                 let hash = t.base.hash;
@@ -2905,25 +2953,39 @@ impl AppState {
         nonce: Nonce,
         result: DownloadResult,
     ) -> iced::Task<Message> {
-        if let ConnectionState::Connected(ConnectedState {
+        let ConnectionState::Connected(ConnectedState {
             peers, downloads, ..
         }) = &mut self.connection_state
-        {
-            // Log a warning if the transfer failed.
-            if let DownloadResult::Failure(e, _) = &result {
-                tracing::warn!("Transfer failed: {e}");
-            }
+        else {
+            tracing::warn!("No connected state to update transfer result");
+            return iced::Task::none();
+        };
 
-            if let Some((_, t)) = binary_find_nonce_mut(downloads, nonce) {
-                update_download_result(&mut t.progress, result, peers, nonce);
-            } else {
-                log_status_change::<LogWarnStatus>(
-                    &mut self.status_manager,
-                    "No download found to update result".to_owned(),
-                );
+        // Log a warning if the transfer failed.
+        if let DownloadResult::Failure(e, _) = &result {
+            tracing::warn!("Transfer failed: {e}");
+        }
+
+        if let Some((_, t)) = binary_find_nonce_mut(downloads, nonce) {
+            update_download_result(&mut t.progress, result, peers, nonce);
+
+            if t.publish_on_success
+                && matches!(t.progress, DownloadState::Done(DownloadResult::Success))
+            {
+                // Automatically publish the file after a successful download.
+                tracing::debug!("Automatically publishing file after successful download");
+                return iced::Task::done(Message::PublishFileHashed {
+                    publish: CreateOrExistingPublish::Create(t.base.path.clone()),
+                    hash: t.base.hash,
+                    file_size: t.base.file_size,
+                    new_hash: true,
+                });
             }
         } else {
-            tracing::warn!("No connected state to update transfer result");
+            log_status_change::<LogWarnStatus>(
+                &mut self.status_manager,
+                "No download found to update result".to_owned(),
+            );
         }
         iced::Task::none()
     }
@@ -2970,7 +3032,7 @@ impl AppState {
         };
 
         // Get the intervals manager for this download.
-        let DownloadState::Transferring {
+        let DownloadState::Transferring(DownloadTransferringState {
             strategy:
                 DownloadStrategy::MultiPeer(DownloadMultiPeer {
                     peers,
@@ -2978,7 +3040,7 @@ impl AppState {
                     intervals,
                 }),
             ..
-        } = &mut t.progress
+        }) = &mut t.progress
         else {
             log_status_change::<LogWarnStatus>(
                 &mut self.status_manager,
@@ -3076,7 +3138,7 @@ impl AppState {
             return iced::Task::none();
         };
 
-        let DownloadState::Transferring {
+        let DownloadState::Transferring(DownloadTransferringState {
             strategy:
                 DownloadStrategy::MultiPeer(DownloadMultiPeer {
                     peers,
@@ -3084,7 +3146,7 @@ impl AppState {
                     intervals,
                 }),
             ..
-        } = &mut t.progress
+        }) = &mut t.progress
         else {
             // Warn only if the download resulted in an unexpected state.
             // Having multiple cancelled tasks is expected.
@@ -3345,10 +3407,10 @@ impl AppState {
             return iced::Task::none();
         };
 
-        let DownloadState::Transferring {
+        let DownloadState::Transferring(DownloadTransferringState {
             strategy: DownloadStrategy::MultiPeer(DownloadMultiPeer { intervals, .. }),
             ..
-        } = &mut t.progress
+        }) = &mut t.progress
         else {
             tracing::warn!("Download not in multi-peer transferring state");
             return iced::Task::none();
@@ -3395,32 +3457,63 @@ impl AppState {
         nonce: Nonce,
         result: UploadResult,
     ) -> iced::Task<Message> {
-        if let ConnectionState::Connected(ConnectedState { peers, uploads, .. }) =
+        let ConnectionState::Connected(ConnectedState { peers, uploads, .. }) =
             &mut self.connection_state
-        {
+        else {
+            tracing::warn!("No connected state to update transfer result");
+            return iced::Task::none();
+        };
+
+        match &result {
             // Log a warning if the transfer failed.
-            if let UploadResult::Failure(e) = &result {
-                tracing::warn!("Transfer failed: {e}");
-            }
+            UploadResult::Failure(e) => tracing::warn!("Transfer failed: {e}"),
 
-            if let Some((index, t)) = binary_find_nonce_mut(uploads, nonce) {
-                update_upload_result(&mut t.progress, result, peers, nonce);
+            // Remove successful uploads of partial-file ranges from the list.
+            // TODO: Make a new type like `UploadResultDisplay` to avoid needing an aggregate param
+            //       in the tupe here, which is always zero/unused. Other solution is to add the
+            //       aggregate to the `UploadState::Done` variant.
+            UploadResult::Success(r, _) => {
+                let data = if let Some((index, t)) = binary_find_nonce(uploads, nonce) {
+                    Some((index, t.base.hash, t.base.file_size, t.peer_string.clone()))
+                } else {
+                    None
+                };
+                if let Some((index, hash, file_size, peer_string)) = data {
+                    // Look for another successful upload of the same file to this peer and
+                    // aggregate the bytes shared.
+                    for other_upload in uploads.iter_mut() {
+                        let UploadState::Done(UploadResult::Success(_, aggregate)) =
+                            &mut other_upload.progress
+                        else {
+                            continue;
+                        };
 
-                // Remove successful uploads of partial-file ranges from the list.
-                if let UploadState::Done(UploadResult::Success(r)) = &t.progress {
-                    if r.end != t.base.file_size {
-                        // TODO: Keep one completed upload item and aggregate the sizes.
-                        uploads.remove(index);
+                        if other_upload.base.hash == hash
+                            && other_upload.base.file_size == file_size
+                            && other_upload.peer_string == peer_string
+                            && other_upload.base.nonce != nonce
+                        {
+                            // Add our successful range to the aggregate of the other upload.
+                            *aggregate += r.end - r.start;
+
+                            // Remove this upload entry.
+                            uploads.remove(index);
+                            return iced::Task::none();
+                        }
                     }
                 }
-            } else {
-                log_status_change::<LogWarnStatus>(
-                    &mut self.status_manager,
-                    "No upload found to update result".to_owned(),
-                );
             }
+
+            UploadResult::Cancelled => {}
+        }
+
+        if let Some((_, t)) = binary_find_nonce_mut(uploads, nonce) {
+            update_upload_result(&mut t.progress, result, peers, nonce);
         } else {
-            tracing::warn!("No connected state to update transfer result");
+            log_status_change::<LogWarnStatus>(
+                &mut self.status_manager,
+                "No upload found to update result".to_owned(),
+            );
         }
         iced::Task::none()
     }
@@ -3486,10 +3579,10 @@ impl AppState {
                     // Ensure all downloads that were in-progress are saved.
                     let intervals = match d.progress {
                         // States where no save progress is available or needed.
-                        DownloadState::Transferring {
+                        DownloadState::Transferring(DownloadTransferringState {
                             strategy: DownloadStrategy::SinglePeer(_),
                             ..
-                        }
+                        })
                         | DownloadState::HashingFile { .. } => None,
 
                         // States where saved intervals are available.
@@ -3503,11 +3596,11 @@ impl AppState {
                                 (*arc).clone()
                             })
                         }),
-                        DownloadState::Transferring {
+                        DownloadState::Transferring(DownloadTransferringState {
                             strategy:
                                 DownloadStrategy::MultiPeer(DownloadMultiPeer { intervals, .. }),
                             ..
-                        } => intervals
+                        }) => intervals
                             .convert_ranges(
                                 |r| {
                                     let start = r.start();

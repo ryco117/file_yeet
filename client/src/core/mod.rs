@@ -135,7 +135,7 @@ pub async fn prepare_server_connection(
     // Get the server address info.
     let server_socket = file_yeet_shared::get_server_or_default(server_address, server_port)
         .map_err(PrepareConnectionError::ServerAddress)?;
-    tracing::info!("Connecting to server {server_socket:?}");
+    tracing::debug!("Connecting to server {server_socket:?}");
 
     // Determine the local socket address to bind to. Use an unspecified address since we don't have any preference.
     let bind_port = internal_port.map_or(0, NonZeroU16::get);
