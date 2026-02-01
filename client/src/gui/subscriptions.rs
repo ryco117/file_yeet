@@ -5,7 +5,6 @@ use file_yeet_shared::{BiStream, HashBytes, ReadIpPortError, GOODBYE_CODE, GOODB
 use iced::Subscription;
 use tokio::io::AsyncWriteExt as _;
 use tokio_util::sync::CancellationToken;
-use tracing::Instrument as _;
 
 use crate::{
     core::{ConnectionsManager, ReadSubscribingPeerError},
@@ -67,46 +66,46 @@ impl std::hash::Hash for PortMappingData {
 }
 
 /// Helper to manage port mapping renewals over PCP/NAT-PMP.
+#[tracing::instrument(skip_all)]
+async fn port_mapping_renewal_task(
+    mut mapping: PortMapping,
+    mut output: futures_channel::mpsc::Sender<Message>,
+) {
+    let mut last_lifetime = mapping.lifetime() as u64;
+    let mut interval = crate::core::new_renewal_interval(last_lifetime).await;
+    loop {
+        // Ensure a reasonable wait time before each renewal attempt.
+        interval.tick().await;
+
+        match crate::core::renew_port_mapping(&mut mapping).await {
+            Ok(changed) if changed => {
+                if let Err(e) = output.try_send(Message::PortMappingUpdated(Some(mapping.clone())))
+                {
+                    let e = e.into_send_error();
+                    tracing::error!("Failed to send port mapping update: {e}");
+                }
+
+                // Update interval if the lifetime has changed.
+                let lifetime = mapping.lifetime() as u64;
+                if lifetime != last_lifetime {
+                    last_lifetime = lifetime;
+                    interval = crate::core::new_renewal_interval(lifetime).await;
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to renew port mapping: {e}");
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Helper to create a stream for port mapping renewal updates.
 fn port_mapping_loop(
     port_mapping: &PortMappingData,
 ) -> impl futures_util::stream::Stream<Item = Message> {
-    let mut mapping = port_mapping.mapping.clone();
-    iced::stream::channel(
-        2,
-        move |mut output: futures_channel::mpsc::Sender<Message>| {
-            async move {
-                let mut last_lifetime = mapping.lifetime() as u64;
-                let mut interval = crate::core::new_renewal_interval(last_lifetime).await;
-                loop {
-                    // Ensure a reasonable wait time before each renewal attempt.
-                    interval.tick().await;
-
-                    match crate::core::renew_port_mapping(&mut mapping).await {
-                        Ok(changed) if changed => {
-                            if let Err(e) =
-                                output.try_send(Message::PortMappingUpdated(Some(mapping.clone())))
-                            {
-                                let e = e.into_send_error();
-                                tracing::error!("Failed to send port mapping update: {e}");
-                            }
-
-                            // Update interval if the lifetime has changed.
-                            let lifetime = mapping.lifetime() as u64;
-                            if lifetime != last_lifetime {
-                                last_lifetime = lifetime;
-                                interval = crate::core::new_renewal_interval(lifetime).await;
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to renew port mapping: {e}");
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            .instrument(tracing::info_span!("Port mapping renewal loop"))
-        },
-    )
+    let mapping = port_mapping.mapping.clone();
+    iced::stream::channel(2, move |output| port_mapping_renewal_task(mapping, output))
 }
 
 /// For the given publish, await peers that desire to receive the file.

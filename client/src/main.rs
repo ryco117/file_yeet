@@ -207,8 +207,7 @@ fn main() {
         match cmd {
             // Try to hash and publish the file to the rendezvous server.
             FileYeetCommand::Pub { file_path } => {
-                if let Err(e) = publish_command(&prepared_connection, bb, file_path, manager).await
-                {
+                if let Err(e) = publish_command(&prepared_connection, file_path, manager).await {
                     tracing::error!("Failed to publish the file: {e}");
                 }
             }
@@ -260,7 +259,6 @@ struct Manager<'a> {
 #[tracing::instrument(skip_all)]
 async fn publish_command(
     prepared_connection: &PreparedConnection,
-    bb: bytes::BytesMut,
     file_path: String,
     manager: Manager<'_>,
 ) -> anyhow::Result<()> {
@@ -292,7 +290,7 @@ async fn publish_command(
             tracing::info!("Ctrl-C detected, cancelling the publish");
             cancellation_token.cancel();
         }
-        r = publish_loop(endpoint, server_connection, bb, hash, file_size, file_path, manager) => return r
+        r = publish_loop(endpoint, server_connection, hash, file_size, file_path, manager) => return r
     }
 
     Ok(())
@@ -468,7 +466,6 @@ async fn subscribe_command(
 async fn publish_loop(
     endpoint: &quinn::Endpoint,
     server_connection: &quinn::Connection,
-    bb: bytes::BytesMut,
     hash: HashBytes,
     file_size: u64,
     file_path: &Path,
@@ -476,7 +473,7 @@ async fn publish_loop(
 ) -> anyhow::Result<()> {
     // Create a bi-directional stream to the server.
     let mut server_streams: BiStream =
-        crate::core::publish(server_connection, bb, hash, file_size).await?;
+        crate::core::publish(server_connection, hash, file_size).await?;
 
     // Enter a loop to listen for the server to send peer addresses.
     loop {

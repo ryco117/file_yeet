@@ -13,14 +13,11 @@ use std::{
 };
 
 use circular_buffer::CircularBuffer;
-use file_yeet_shared::{
-    BiStream, HashBytes, DEFAULT_PORT, GOODBYE_CODE, GOODBYE_MESSAGE, MAX_SERVER_COMMUNICATION_SIZE,
-};
+use file_yeet_shared::{BiStream, HashBytes, DEFAULT_PORT, GOODBYE_CODE, GOODBYE_MESSAGE};
 use futures_util::FutureExt as _;
 use iced::{widget, window, Element};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
-use tracing::Instrument as _;
 
 use crate::{
     core::{
@@ -1584,7 +1581,6 @@ impl AppState {
         let (nonce, cancellation_token, path) = match publish {
             CreateOrExistingPublish::Create(path) => {
                 let publish = PublishItem::new(path, Arc::new(RwLock::new(1.)));
-                let cancellation_token = publish.cancellation_token.clone();
                 let nonce = publish.nonce;
                 publishes.push(publish);
 
@@ -1596,13 +1592,20 @@ impl AppState {
                 // Since we have added a new publish, make them the current view.
                 *transfer_view = TransferView::Publishes;
 
-                (nonce, cancellation_token, &publishes.last().unwrap().path)
+                let Some((_, publish)) = binary_find_nonce(publishes, nonce) else {
+                    log_status_change::<LogErrorStatus>(
+                        &mut self.status_manager,
+                        "Newly created publish not found".to_owned(),
+                    );
+                    return iced::Task::none();
+                };
+                (nonce, &publish.cancellation_token, &publish.path)
             }
 
             CreateOrExistingPublish::Existing(nonce) => {
                 let publish = binary_find_nonce(publishes, nonce);
                 if let Some((_, publish)) = publish {
-                    (nonce, publish.cancellation_token.clone(), &publish.path)
+                    (nonce, &publish.cancellation_token, &publish.path)
                 } else {
                     log_status_change::<LogWarnStatus>(
                         &mut self.status_manager,
@@ -1637,26 +1640,8 @@ impl AppState {
             self.save_on_exit = true;
         }
 
-        let server = server.clone();
         iced::Task::perform(
-            async move {
-                tracing::debug!("Attempting to publish file");
-                tokio::select! {
-                    // Allow cancelling the publish request thread.
-                    () = cancellation_token.cancelled() => PublishRequestResult::Cancelled,
-
-                    r = async move {
-                        // Create a memory buffer with sufficient capacity for the publish request.
-                        let bb = bytes::BytesMut::with_capacity(MAX_SERVER_COMMUNICATION_SIZE);
-
-                        // Create a bi-directional stream to the server for this publish request.
-                        match crate::core::publish(&server, bb, hash, file_size).await {
-                            Ok(b) => PublishRequestResult::Success(IncomingPublishSession::new(b, hash, file_size)),
-                            Err(e) => PublishRequestResult::Failure(Arc::new(e.into())),
-                        }
-                    } => r,
-                }
-            }.instrument(tracing::info_span!("Publish request to server", %hash)),
+            publish_request_to_server(cancellation_token.clone(), server.clone(), hash, file_size),
             move |r| Message::PublishRequestResulted(nonce, r),
         )
     }
@@ -3160,52 +3145,20 @@ impl AppState {
                         return iced::Task::none();
                     }
 
-                    let hash = t.base.hash;
-                    let cancellation_token = t.base.cancellation_token.clone();
-                    let file_path = t.base.path.clone();
-                    let next_chunk_clone = next_chunk.clone();
-
                     tracing::debug!("Create new task for next multi-peer download chunk: Next chunk {next_chunk:?}");
                     iced::Task::perform(
-                        async move {
-                            // Create a request stream to the peer.
-                            let request = crate::core::peer_connection_into_stream(
-                                &peer,
-                                hash,
-                                FileYeetCommandType::Sub,
-                            )
-                            .await;
-
-                            let request = match request {
-                                Ok(r) => PeerRequestStream::new(peer, r),
-                                Err(e) => {
-                                    tracing::error!(
-                                        "Failed to create download request for multi-peer chunk: {e}"
-                                    );
-                                    return DownloadResult::Failure(
-                                        Arc::new("Failed to create download request".to_owned()),
-                                        RecoverableState::Recoverable(None),
-                                    );
-                                }
-                            };
-
-                            // Download the next chunk.
-                            partial_download(
-                                request,
-                                cancellation_token,
-                                progress,
-                                hash,
-                                next_chunk,
-                                file_path,
-                                None,
-                            )
-                            .await
-                        }
-                        .instrument(tracing::info_span!("multi_peer_download_next_chunk")),
+                        multi_peer_download_next_chunk(
+                            peer,
+                            t.base.hash,
+                            t.base.cancellation_token.clone(),
+                            progress,
+                            next_chunk.clone(),
+                            t.base.path.clone(),
+                        ),
                         move |r| {
                             Message::MultiPeerDownloadTransferResulted(
                                 nonce,
-                                next_chunk_clone,
+                                next_chunk,
                                 connection_id,
                                 r.into(),
                             )
@@ -3229,40 +3182,7 @@ impl AppState {
                         progress: progress.clone(),
                     };
                     iced::Task::perform(
-                        async move {
-                            match crate::core::file_size_and_hash(&file_path, Some(&progress)).await
-                            {
-                                Ok((calc_file_size, calc_file_hash)) => {
-                                    if calc_file_hash == file_hash {
-                                        if calc_file_size == file_size {
-                                            tracing::info!(
-                                                "Successful multi-peer download of hash {file_hash}"
-                                            );
-                                            DownloadResult::Success
-                                        } else {
-                                            let err = "File size does not match".to_owned();
-                                            tracing::warn!("{err}");
-                                            DownloadResult::Failure(
-                                                Arc::new(err),
-                                                RecoverableState::NonRecoverable,
-                                            )
-                                        }
-                                    } else {
-                                        let err = "File hash does not match".to_owned();
-                                        tracing::warn!("{err}");
-                                        DownloadResult::Failure(
-                                            Arc::new(err),
-                                            RecoverableState::NonRecoverable,
-                                        )
-                                    }
-                                }
-                                Err(e) => DownloadResult::Failure(
-                                    Arc::new(format!("Failed to hash file: {e}")),
-                                    RecoverableState::NonRecoverable,
-                                ),
-                            }
-                        }
-                        .instrument(tracing::info_span!("multi_peer_download_verify")),
+                        multi_peer_download_verify(file_path, file_hash, file_size, progress),
                         move |r| Message::DownloadTransferResulted(nonce, r),
                     )
                 }
@@ -4105,6 +4025,95 @@ fn remove_nonce_for_peer(
 enum CloseType {
     Connections,
     Application,
+}
+
+/// Helper to publish a file to the server and get an incoming publish session.
+#[tracing::instrument(skip(cancellation_token, server))]
+async fn publish_request_to_server(
+    cancellation_token: CancellationToken,
+    server: quinn::Connection,
+    hash: HashBytes,
+    file_size: u64,
+) -> PublishRequestResult {
+    tracing::debug!("Attempting to publish file");
+    tokio::select! {
+        // Allow cancelling the publish request thread.
+        () = cancellation_token.cancelled() => PublishRequestResult::Cancelled,
+
+        // Create a bi-directional stream to the server for this publish request.
+        r = crate::core::publish(&server, hash, file_size) => match r {
+            Ok(b) => PublishRequestResult::Success(IncomingPublishSession::new(b, hash, file_size)),
+            Err(e) => PublishRequestResult::Failure(Arc::new(e.into())),
+        },
+    }
+}
+
+#[tracing::instrument(skip(peer, cancellation_token, progress, file_path))]
+async fn multi_peer_download_next_chunk(
+    peer: quinn::Connection,
+    hash: HashBytes,
+    cancellation_token: CancellationToken,
+    progress: Arc<RwLock<u64>>,
+    range: std::ops::Range<u64>,
+    file_path: Arc<PathBuf>,
+) -> DownloadResult {
+    // Create a request stream to the peer.
+    let request =
+        crate::core::peer_connection_into_stream(&peer, hash, FileYeetCommandType::Sub).await;
+
+    let request = match request {
+        Ok(r) => PeerRequestStream::new(peer, r),
+        Err(e) => {
+            tracing::error!("Failed to create download request for multi-peer chunk: {e}");
+            return DownloadResult::Failure(
+                Arc::new("Failed to create download request".to_owned()),
+                RecoverableState::Recoverable(None),
+            );
+        }
+    };
+
+    // Download the next chunk.
+    partial_download(
+        request,
+        cancellation_token,
+        progress,
+        hash,
+        range,
+        file_path,
+        None,
+    )
+    .await
+}
+
+#[tracing::instrument(skip(file_path, progress))]
+async fn multi_peer_download_verify(
+    file_path: Arc<PathBuf>,
+    file_hash: HashBytes,
+    file_size: u64,
+    progress: Arc<RwLock<f32>>,
+) -> DownloadResult {
+    match crate::core::file_size_and_hash(&file_path, Some(&progress)).await {
+        Ok((calc_file_size, calc_file_hash)) => {
+            if calc_file_hash == file_hash {
+                if calc_file_size == file_size {
+                    tracing::info!("Successful multi-peer download of hash {file_hash}");
+                    DownloadResult::Success
+                } else {
+                    let err = "File size does not match".to_owned();
+                    tracing::warn!("{err}");
+                    DownloadResult::Failure(Arc::new(err), RecoverableState::NonRecoverable)
+                }
+            } else {
+                let err = "File hash does not match".to_owned();
+                tracing::warn!("{err}");
+                DownloadResult::Failure(Arc::new(err), RecoverableState::NonRecoverable)
+            }
+        }
+        Err(e) => DownloadResult::Failure(
+            Arc::new(format!("Failed to hash file: {e}")),
+            RecoverableState::NonRecoverable,
+        ),
+    }
 }
 
 const INVALID_PORT_FORWARD: &str = "Invalid port forward. Defaults to no port mappings";

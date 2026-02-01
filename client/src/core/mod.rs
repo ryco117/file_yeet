@@ -518,10 +518,9 @@ pub enum PublishError {
 }
 
 /// Perform a publish request to the server.
-#[tracing::instrument(skip(server_connection, bb))]
+#[tracing::instrument(skip(server_connection))]
 pub async fn publish(
     server_connection: &quinn::Connection,
-    mut bb: bytes::BytesMut,
     hash: HashBytes,
     file_size: u64,
 ) -> Result<BiStream, PublishError> {
@@ -529,13 +528,14 @@ pub async fn publish(
     let mut server_streams: BiStream = server_connection.open_bi().await?.into();
 
     // Format a publish request.
-    bb.clear();
+    let mut send_buffer = [0u8; 2 + file_yeet_shared::HASH_BYTE_COUNT + 8];
+    let mut bb = &mut send_buffer[..];
     bb.put_u16(file_yeet_shared::ClientApiRequest::Publish as u16);
     bb.put(&hash.bytes[..]);
     bb.put_u64(file_size);
 
     // Send the server a publish request.
-    server_streams.send.write_all(&bb).await?;
+    server_streams.send.write_all(&send_buffer).await?;
 
     Ok(server_streams)
 }
