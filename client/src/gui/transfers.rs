@@ -83,10 +83,9 @@ impl From<DownloadResult> for MultiPeerDownloadResult {
 /// The result of a file upload with a peer.
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum UploadResult {
-    /// The transfer succeeded at uploading the specified range. The number of additional bytes
-    /// from other chunks uploaded to this peer are tracked.
+    /// The transfer succeeded at uploading the specified range.
     #[error("Transfer succeeded")]
-    Success(std::ops::Range<u64>, u64),
+    Success(std::ops::Range<u64>),
 
     /// The transfer failed with the specified error message.
     #[error("{0}")]
@@ -303,7 +302,11 @@ pub enum UploadState {
     },
 
     /// The transfer has completed.
-    Done(UploadResult),
+    Done {
+        result: UploadResult,
+        byte_count: u64,
+        size_string: String,
+    },
 }
 impl UploadState {
     /// If the progress state contains a peer connection, return it.
@@ -316,7 +319,7 @@ impl UploadState {
             } => Some(connection),
 
             // No connection in remaining states.
-            UploadState::Done(_) => None,
+            UploadState::Done { .. } => None,
         }
     }
 }
@@ -670,21 +673,19 @@ impl Transfer for UploadTransfer {
                 .spacing(6)
                 .align_y(iced::Alignment::Center);
 
-                (progress, snapshot.human_readable.clone())
+                (progress, &snapshot.human_readable)
             }
 
-            UploadState::Done(result) => {
+            UploadState::Done {
+                result,
+                size_string,
+                ..
+            } => {
                 let remove = tooltip_button(
                     "Remove",
                     Message::RemoveFromTransfers(self.base.nonce, FileYeetCommandType::Pub),
                     "Remove from list, file is untouched",
                 );
-                // TODO: Store `size_string` in `UploadState::Done` to avoid recomputing it.
-                let size_string = if let UploadResult::Success(r, a) = result {
-                    humanize_bytes(r.end - r.start + a)
-                } else {
-                    String::new()
-                };
                 let result_text = widget::text(result.to_string())
                     .width(iced::Length::Fill)
                     .color_maybe(match result {
@@ -778,7 +779,7 @@ pub fn update_upload_result(
     nonce: Nonce,
 ) {
     // Handle a transfer that is already done.
-    if let UploadState::Done(done) = progress {
+    if let UploadState::Done { result: done, .. } = progress {
         // If we are cancelling twice, this is a more forgivable double-result.
         if matches!(result, UploadResult::Cancelled) && matches!(done, UploadResult::Cancelled) {
             tracing::debug!("Upload already marked as cancelled");
@@ -792,7 +793,7 @@ pub fn update_upload_result(
     if let Some(connection) = progress.connection() {
         // Upload nonces should only be removed when not successful.
         // This is to ensure healthy connections are not closed before peers have completed all their downloads. (I.e., peers may be about to open a new request stream.)
-        if matches!(result, UploadResult::Success(_, _)) {
+        if matches!(result, UploadResult::Success(_)) {
             tracing::debug!("Not removing nonces for successful uploads");
         } else {
             remove_nonce_for_peer(connection, peers, nonce);
@@ -800,5 +801,17 @@ pub fn update_upload_result(
     }
 
     // Mark the transfer as done.
-    *progress = UploadState::Done(result);
+    let (byte_count, size_string) = match &result {
+        UploadResult::Success(range) => {
+            let byte_count = range.end - range.start;
+            let size_string = humanize_bytes(byte_count);
+            (byte_count, size_string)
+        }
+        _ => (0, String::new()),
+    };
+    *progress = UploadState::Done {
+        result,
+        byte_count,
+        size_string,
+    };
 }

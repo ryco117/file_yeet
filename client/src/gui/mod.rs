@@ -1857,7 +1857,7 @@ impl AppState {
                     requested_size.write().await.replace(l);
                 } else {
                     tracing::info!("The requested upload size is zero, skipping upload");
-                    return UploadResult::Success((start_index)..(start_index + upload_length), 0);
+                    return UploadResult::Success((start_index)..(start_index + upload_length));
                 }
 
                 // Prepare a reader for the file to upload.
@@ -1872,7 +1872,7 @@ impl AppState {
                         reader,
                         Some(&progress_lock),
                     )) => match result {
-                        Ok(()) => UploadResult::Success((start_index)..(start_index + upload_length), 0),
+                        Ok(()) => UploadResult::Success((start_index)..(start_index + upload_length)),
                         Err(e) => UploadResult::Failure(Arc::new(format!("Upload failed: {e}"))),
                     }
                 }
@@ -3356,10 +3356,7 @@ impl AppState {
             UploadResult::Failure(e) => tracing::warn!("Transfer failed: {e}"),
 
             // Remove successful uploads of partial-file ranges from the list.
-            // TODO: Make a new type like `UploadResultDisplay` to avoid needing an aggregate param
-            //       in the tuple here, which is always zero/unused. Other solution is to add the
-            //       aggregate to the `UploadState::Done` variant.
-            UploadResult::Success(r, _) => {
+            UploadResult::Success(r) => {
                 let data = if let Some((index, t)) = binary_find_nonce(uploads, nonce) {
                     Some((index, t.base.hash, t.base.file_size, t.peer_string.clone()))
                 } else {
@@ -3369,8 +3366,11 @@ impl AppState {
                     // Look for another successful upload of the same file to this peer and
                     // aggregate the bytes shared.
                     for other_upload in uploads.iter_mut() {
-                        let UploadState::Done(UploadResult::Success(_, aggregate)) =
-                            &mut other_upload.progress
+                        let UploadState::Done {
+                            result: UploadResult::Success(_),
+                            byte_count,
+                            size_string,
+                        } = &mut other_upload.progress
                         else {
                             continue;
                         };
@@ -3380,8 +3380,9 @@ impl AppState {
                             && other_upload.peer_string == peer_string
                             && other_upload.base.nonce != nonce
                         {
-                            // Add our successful range to the aggregate of the other upload.
-                            *aggregate += r.end - r.start;
+                            // Add our successful range to athe byte count and update the size string.
+                            *byte_count += r.end - r.start;
+                            *size_string = humanize_bytes(*byte_count);
 
                             // Remove this upload entry.
                             uploads.remove(index);
