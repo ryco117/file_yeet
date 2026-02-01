@@ -70,6 +70,9 @@ const MAX_SHUTDOWN_WAIT: Duration = Duration::from_secs(3);
 /// The red used to display errors to the user.
 const ERROR_RED_COLOR: iced::Color = iced::Color::from_rgb(1., 0.35, 0.45);
 
+/// The yellow used to display warnings to the user.
+const WARN_YELLOW_COLOR: iced::Color = iced::Color::from_rgb(1., 0.85, 0.35);
+
 /// Font capable of rendering emojis.
 pub static EMOJI_FONT: &[u8] = include_bytes!("../../NotoEmoji-Regular.ttf");
 
@@ -259,8 +262,8 @@ impl ConnectionState {
 /// Manages the status message and its history.
 #[derive(Default)]
 struct StatusManager {
-    pub message: Option<String>,
-    pub history: CircularBuffer<MAX_LOG_HISTORY_LINES, String>,
+    pub message: Option<(String, LogLevel)>,
+    pub history: CircularBuffer<MAX_LOG_HISTORY_LINES, (String, LogLevel)>,
     pub history_visible: bool,
 }
 
@@ -765,7 +768,7 @@ impl AppState {
                 self.status_manager
                     .history
                     .iter()
-                    .map(|t| widget::text(t).color(ERROR_RED_COLOR).into()),
+                    .map(|(t, l)| widget::text(t).color(l.color()).into()),
             )
             .spacing(6);
             widget::column![
@@ -809,10 +812,10 @@ impl AppState {
 
         // Always display the status bar at the bottom.
         let status_bar = widget::row![
-            if let Some(status_manager) = &self.status_manager.message {
+            if let Some((status, level)) = &self.status_manager.message {
                 Element::from(
-                    widget::text(status_manager)
-                        .color(ERROR_RED_COLOR)
+                    widget::text(status)
+                        .color(level.color())
                         .width(iced::Length::Fill)
                         .height(iced::Length::Shrink),
                 )
@@ -1938,7 +1941,7 @@ impl AppState {
         })
     }
 
-    /// Update the state after the publish button was clicked. Begins a subscribe request.
+    /// Update the state after the download button was clicked. Begins a subscribe request.
     #[tracing::instrument(skip(self))]
     fn update_subscribe_path_chosen(
         &mut self,
@@ -1967,7 +1970,6 @@ impl AppState {
         };
 
         // Ensure there are no downloads or publishes using this path.
-        // TODO: Use `HashSet`s to more efficiently track these file paths.
         if downloads.iter().any(|d| path.eq(d.base.path.as_ref())) {
             log_status_change::<LogWarnStatus>(
                 &mut self.status_manager,
@@ -3017,7 +3019,6 @@ impl AppState {
         };
 
         // Register all peers for this download.
-        // TODO: Optionally add peers now (and insert nonce for active peers) or consider this already done.
         *peers = peer_streams
             .iter()
             .map(|p| {
@@ -3032,12 +3033,12 @@ impl AppState {
         let output_path = t.base.path.clone();
 
         // * Attempt to split the download chunks among the available peers. This is to maximize
-        //   concurrent utilization of all peers. Dividing by two allows faster peers to contribute more chunks.
+        //   concurrent utilization of all peers. Dividing by four allows faster peers to contribute more chunks.
         //
         // * If this division is smaller than the reasonable minimum, take that minimum instead.
         //   This is to prevent zero-size or extremely small chunks from being requested.
         let peer_share = u64::max(
-            (t.base.file_size / peer_streams.len() as u64) / 2,
+            (t.base.file_size / peer_streams.len() as u64) / 4,
             DOWNLOAD_CHUNK_INTERVAL_MIN,
         );
 
@@ -3632,17 +3633,36 @@ fn horizontal_line<'c>() -> iced::Element<'c, Message> {
 /// This avoids needing to `match` an enum each log status call.
 trait LogStatusLevel {
     fn log_status(status: &str);
+    fn log_level() -> LogLevel;
+}
+enum LogLevel {
+    Error,
+    Warn,
+}
+impl LogLevel {
+    fn color(&self) -> iced::Color {
+        match self {
+            LogLevel::Error => ERROR_RED_COLOR,
+            LogLevel::Warn => WARN_YELLOW_COLOR,
+        }
+    }
 }
 struct LogErrorStatus;
 impl LogStatusLevel for LogErrorStatus {
     fn log_status(status: &str) {
         tracing::error!("{status}");
     }
+    fn log_level() -> LogLevel {
+        LogLevel::Error
+    }
 }
 struct LogWarnStatus;
 impl LogStatusLevel for LogWarnStatus {
     fn log_status(status: &str) {
         tracing::warn!("{status}");
+    }
+    fn log_level() -> LogLevel {
+        LogLevel::Warn
     }
 }
 
@@ -3657,7 +3677,7 @@ fn log_status_change<L: LogStatusLevel>(status_manager: &mut StatusManager, stat
         status_manager.history.push_back(old_status);
     }
 
-    status_manager.message = Some(status);
+    status_manager.message = Some((status, L::log_level()));
 }
 
 /// Helper to get a consistent horizontal scrollbar for text overflow.
