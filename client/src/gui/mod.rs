@@ -1512,6 +1512,30 @@ impl AppState {
         file_size: u64,
         new_hash: bool,
     ) -> iced::Task<Message> {
+        fn check_duplicate_hash(
+            pi: &PublishItem,
+            hash: &HashBytes,
+            status_manager: &mut StatusManager,
+        ) -> bool {
+            if pi
+                .state
+                .hash_and_file_size()
+                .is_some_and(|(h, _)| h == *hash)
+            {
+                // Duplicate file hash.
+                log_status_change::<LogWarnStatus>(
+                    status_manager,
+                    format!(
+                        "Already publishing hash {hash} for {}",
+                        pi.path.to_string_lossy()
+                    ),
+                );
+                true
+            } else {
+                false
+            }
+        }
+
         let ConnectionState::Connected(ConnectedState {
             server,
             publishes,
@@ -1524,7 +1548,6 @@ impl AppState {
         };
 
         // Ensure we don't publish the same file twice.
-        // TODO: Also check for duplicate hashes in existing publishes which have had their hash computed.
         if let CreateOrExistingPublish::Create(p) = &publish {
             if publishes.iter().any(|pi| {
                 if pi.path.as_ref().eq(p.as_ref()) {
@@ -1534,22 +1557,8 @@ impl AppState {
                         PUBLISH_PATH_EXISTS.to_owned(),
                     );
                     true
-                } else if pi
-                    .state
-                    .hash_and_file_size()
-                    .is_some_and(|(h, _)| h == hash)
-                {
-                    // Duplicate file hash.
-                    log_status_change::<LogWarnStatus>(
-                        &mut self.status_manager,
-                        format!(
-                            "Already publishing hash {hash} for {}",
-                            pi.path.to_string_lossy()
-                        ),
-                    );
-                    true
                 } else {
-                    false
+                    check_duplicate_hash(pi, &hash, &mut self.status_manager)
                 }
             }) {
                 return iced::Task::none();
@@ -1605,6 +1614,12 @@ impl AppState {
             CreateOrExistingPublish::Existing(nonce) => {
                 let publish = binary_find_nonce(publishes, nonce);
                 if let Some((_, publish)) = publish {
+                    // Check existing publishes for duplicate hashes.
+                    // `check_duplicate_hash` will log a warning if a duplicate is found.
+                    publishes
+                        .iter()
+                        .any(|pi| check_duplicate_hash(pi, &hash, &mut self.status_manager));
+
                     (nonce, &publish.cancellation_token, &publish.path)
                 } else {
                     log_status_change::<LogWarnStatus>(
