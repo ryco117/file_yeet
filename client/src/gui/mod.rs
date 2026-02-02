@@ -35,8 +35,9 @@ use crate::{
         transfers::{
             update_download_result, update_upload_result, DownloadMultiPeer, DownloadPartRange,
             DownloadResult, DownloadSinglePeer, DownloadState, DownloadStrategy, DownloadTransfer,
-            DownloadTransferringState, MultiPeerDownloadResult, RecoverableState, Transfer,
-            TransferBase, TransferSnapshot, UploadResult, UploadState, UploadTransfer,
+            DownloadTransferringState, MultiPeerDownloadResult, MultiPeerDownloadResumeError,
+            RecoverableState, Transfer, TransferBase, TransferSnapshot, UploadResult, UploadState,
+            UploadTransfer,
         },
     },
     settings::{
@@ -429,7 +430,7 @@ pub enum Message {
     MultiPeerDownloadTransferResulted(Nonce, std::ops::Range<u64>, usize, MultiPeerDownloadResult),
 
     /// Handle a failed multi-peer download resume attempt.
-    SaveFailedMultiPeerDownloadResume(Nonce, Arc<String>),
+    SaveFailedMultiPeerDownloadResume(Nonce, MultiPeerDownloadResumeError),
 
     /// Handle the result of an upload transfer.
     UploadTransferResulted(Nonce, UploadResult),
@@ -2757,19 +2758,20 @@ impl AppState {
                     {
                         Ok(peers) => peers,
                         Err(e) => {
-                            // TODO: Handle no peers available to resume.
+                            // TODO: Handle subscribe failed correctly. Some failures may indicate
+                            // server connection has broken.
                             return Message::SaveFailedMultiPeerDownloadResume(
                                 nonce,
-                                Arc::new(format!("{e}")),
+                                Arc::new(e).into(),
                             );
                         }
                     };
 
                 let Some(peers) = group_peers_by_size(peers).remove(&final_file_size) else {
-                    // TODO: Handle no peers with matching file size to resume.
+                    // TODO: Handle no peers with matching hash and file size to resume.
                     return Message::SaveFailedMultiPeerDownloadResume(
                         nonce,
-                        Arc::new("No reachable peers".into()),
+                        MultiPeerDownloadResumeError::NoPeersAvailable,
                     );
                 };
 
@@ -2780,7 +2782,7 @@ impl AppState {
                 } else {
                     Message::SaveFailedMultiPeerDownloadResume(
                         nonce,
-                        Arc::new("No reachable peers".into()),
+                        MultiPeerDownloadResumeError::NoPeersReachable,
                     )
                 }
             };
@@ -2854,7 +2856,7 @@ impl AppState {
         };
 
         match result {
-            // Resume the download with the partial hash
+            // Resume the download with the partial hash.
             Ok((digest, start_index, request)) => {
                 let progress = Arc::new(RwLock::new(start_index));
                 let mut download_transferring = DownloadTransferringState::new(
@@ -3292,7 +3294,7 @@ impl AppState {
     fn update_save_failed_multi_peer_download_resume(
         &mut self,
         nonce: Nonce,
-        error: Arc<String>,
+        error: MultiPeerDownloadResumeError,
     ) -> iced::Task<Message> {
         let ConnectionState::Connected(ConnectedState {
             peers, downloads, ..
@@ -3346,7 +3348,7 @@ impl AppState {
 
         update_download_result(
             &mut t.progress,
-            DownloadResult::Failure(error, recovered_intervals),
+            DownloadResult::Failure(Arc::new(error.to_string()), recovered_intervals),
             peers,
             nonce,
         );
@@ -3770,7 +3772,7 @@ fn open_download_streams(
         }
     });
 
-    // Join all the connection attempts for this hash/size into a single future.
+    // Join all the connection attempts for this hash into a single future.
     futures_util::future::join_all(futures).then(async |results| results.into_iter().flatten())
 }
 
@@ -3974,10 +3976,9 @@ async fn partial_download(
         () = cancellation_token.cancelled() => DownloadResult::Cancelled,
 
         result = Box::pin(crate::core::download_partial_from_peer(
-            hash,
             &mut request,
             &mut file,
-            crate::core::DownloadOffsetState::new(file_range, hasher),
+            crate::core::DownloadOffsetState::new(file_range, hasher.map(|h| (h, hash))),
             Some(&byte_progress),
         )) => match result {
             Ok(()) => DownloadResult::Success,

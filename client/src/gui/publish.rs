@@ -16,7 +16,7 @@ use crate::{
 
 /// The result of a file publish request.
 #[derive(Debug, thiserror::Error)]
-pub enum PublishFileFailure {
+pub enum PublishFileError {
     #[error("{0}")]
     FileAccess(#[from] FileAccessError),
 
@@ -31,7 +31,7 @@ pub enum PublishFileFailure {
 #[derive(Clone, Debug)]
 pub enum PublishRequestResult {
     Success(IncomingPublishSession),
-    Failure(Arc<PublishFileFailure>),
+    Failure(Arc<PublishFileError>),
     Cancelled,
 }
 
@@ -55,7 +55,7 @@ pub enum PublishState {
     Publishing(Publish),
 
     /// The publish request has encountered an unrecoverable error.
-    Failure(Arc<PublishFileFailure>, Option<(HashBytes, u64)>),
+    Failure(Arc<PublishFileError>, Option<(HashBytes, u64)>),
 
     /// The publish request was cancelled by the user.
     Cancelled(Option<(HashBytes, u64)>),

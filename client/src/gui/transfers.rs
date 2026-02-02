@@ -16,7 +16,7 @@ use crate::{
     core::{
         humanize_bytes,
         intervals::{FileIntervals, RangeData},
-        FileYeetCommandType,
+        FileYeetCommandType, SubscribeError,
     },
     gui::{
         remove_nonce_for_peer, text_horizontal_scrollbar, timed_tooltip, CreateOrExistingPublish,
@@ -78,6 +78,19 @@ impl From<DownloadResult> for MultiPeerDownloadResult {
             DownloadResult::Cancelled => MultiPeerDownloadResult::Cancelled,
         }
     }
+}
+
+/// The distinct failures that can occur when attempting to resume a multi-peer download.
+#[derive(Clone, Debug, thiserror::Error)]
+pub enum MultiPeerDownloadResumeError {
+    #[error("Failed to initiate download: {0}")]
+    Subscribe(#[from] Arc<SubscribeError>),
+
+    #[error("No peers are available")]
+    NoPeersAvailable,
+
+    #[error("No peers are reachable")]
+    NoPeersReachable,
 }
 
 /// The result of a file upload with a peer.
