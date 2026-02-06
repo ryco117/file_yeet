@@ -13,7 +13,9 @@ use std::{
 };
 
 use circular_buffer::CircularBuffer;
-use file_yeet_shared::{BiStream, HashBytes, DEFAULT_PORT, GOODBYE_CODE, GOODBYE_MESSAGE};
+use file_yeet_shared::{
+    BiStream, HashBytes, ReadIpPortError, DEFAULT_PORT, GOODBYE_CODE, GOODBYE_MESSAGE,
+};
 use futures_util::FutureExt as _;
 use iced::{widget, window, Element};
 use tokio::sync::RwLock;
@@ -663,7 +665,7 @@ impl AppState {
             Message::MultiPeerDownloadTransferResulted(nonce, range, connection_id, result) => self
                 .update_multi_peer_download_transfer_resulted(nonce, range, connection_id, result),
             Message::SaveFailedMultiPeerDownloadResume(nonce, e) => {
-                self.update_save_failed_multi_peer_download_resume(nonce, e)
+                self.update_save_failed_multi_peer_download_resume(nonce, &e)
             }
             Message::UploadTransferResulted(nonce, r) => self.update_upload_resulted(nonce, r),
             Message::OpenFile(path) => {
@@ -1695,7 +1697,34 @@ impl AppState {
                 }
                 (PublishRequestResult::Failure(e), Some((_, publish))) => {
                     tracing::error!("Publish request failed: {e}");
+
+                    // Check if this error indicates we lost connection to the server.
+                    let should_disconnect = match e.as_ref() {
+                        publish::PublishFileError::Publish(publish_error) => match publish_error {
+                            crate::core::PublishError::Connection(_) => true,
+                            crate::core::PublishError::SendRequest(write_error) => {
+                                should_disconnect_on_write_error(write_error)
+                            }
+                        },
+                        publish::PublishFileError::SocketRead(read_error) => {
+                            should_disconnect_on_read_ip_port_error(read_error)
+                        }
+                        // File access errors don't indicate lost connection.
+                        publish::PublishFileError::FileAccess(_) => false,
+                    } && !self.safely_closing;
+
+                    if should_disconnect {
+                        log_status_change::<LogErrorStatus>(
+                            &mut self.status_manager,
+                            format!("Lost connection to server: {e}"),
+                        );
+                    }
+
                     publish.state = PublishState::Failure(e, publish.state.hash_and_file_size());
+
+                    if should_disconnect {
+                        return iced::Task::done(Message::SafelyLeaveServer);
+                    }
                 }
                 (PublishRequestResult::Cancelled, Some((_, publish))) => {
                     tracing::debug!("Publish request cancelled");
@@ -1768,7 +1797,24 @@ impl AppState {
             // An error occurred while receiving the peer address.
             (Err(e), _) => {
                 tracing::warn!("Error receiving peer: {e}");
-                iced::Task::none()
+
+                // Check if this error indicates we lost connection to the server.
+                let should_disconnect = match e.as_ref() {
+                    ReadSubscribingPeerError::ReadSocket(read_ip_port_error) => {
+                        should_disconnect_on_read_ip_port_error(read_ip_port_error)
+                    }
+                    ReadSubscribingPeerError::SelfAddress => false,
+                };
+
+                if should_disconnect && !self.safely_closing {
+                    log_status_change::<LogErrorStatus>(
+                        &mut self.status_manager,
+                        format!("Lost connection to server: {e}"),
+                    );
+                    iced::Task::done(Message::SafelyLeaveServer)
+                } else {
+                    iced::Task::none()
+                }
             }
 
             // No publish item matching the nonce was found.
@@ -2166,11 +2212,39 @@ impl AppState {
                 iced::Task::batch(connect_commands)
             }
             Err(e) => {
-                log_status_change::<LogErrorStatus>(
-                    &mut self.status_manager,
-                    format!("Error subscribing to the server: {e}"),
-                );
-                iced::Task::none()
+                // Check if this error indicates we lost connection to the server.
+                let should_disconnect = match e.as_ref() {
+                    SubscribeError::Connection(_) => true,
+                    SubscribeError::SendRequest(write_error) => {
+                        should_disconnect_on_write_error(write_error)
+                    }
+                    SubscribeError::ReadSizeFailedWithError(read_error) => {
+                        should_disconnect_on_read_error(read_error)
+                    }
+                    SubscribeError::ReadResponse(read_error) => {
+                        should_disconnect_on_read_ip_port_error(read_error)
+                    }
+
+                    // These errors don't indicate a lost connection.
+                    // TODO: Consider matching on the `ErrorKind` enum for an educated guess.
+                    SubscribeError::ReadSizeFailedWithKind(_) | SubscribeError::ParseAddress(_) => {
+                        false
+                    }
+                };
+
+                if should_disconnect && !self.safely_closing {
+                    log_status_change::<LogErrorStatus>(
+                        &mut self.status_manager,
+                        format!("Lost connection to server: {e}"),
+                    );
+                    iced::Task::done(Message::SafelyLeaveServer)
+                } else {
+                    log_status_change::<LogErrorStatus>(
+                        &mut self.status_manager,
+                        format!("Error subscribing to the server: {e}"),
+                    );
+                    iced::Task::none()
+                }
             }
         }
     }
@@ -3294,7 +3368,7 @@ impl AppState {
     fn update_save_failed_multi_peer_download_resume(
         &mut self,
         nonce: Nonce,
-        error: MultiPeerDownloadResumeError,
+        error: &MultiPeerDownloadResumeError,
     ) -> iced::Task<Message> {
         let ConnectionState::Connected(ConnectedState {
             peers, downloads, ..
@@ -3680,6 +3754,64 @@ fn log_status_change<L: LogStatusLevel>(status_manager: &mut StatusManager, stat
     }
 
     status_manager.message = Some((status, L::log_level()));
+}
+
+/// Check if a `quinn::ReadError` indicates the server connection is lost and we should disconnect.
+fn should_disconnect_on_read_error(error: &quinn::ReadError) -> bool {
+    match error {
+        // Connection was lost - check the underlying ConnectionError.
+        quinn::ReadError::ConnectionLost(_) => true,
+
+        // Stream was reset - this is a stream-specific error, not a connection error.
+        quinn::ReadError::Reset(_)
+        // Stream was closed - this is expected behavior for some operations.
+        | quinn::ReadError::ClosedStream
+        // Zero-RTT rejected - this is a handshake issue, not a disconnection.
+        | quinn::ReadError::ZeroRttRejected
+        // Illegal order of stream data - stream corruption but not disconnection.
+        | quinn::ReadError::IllegalOrderedRead => false,
+    }
+}
+
+/// Check if a `quinn::WriteError` indicates the server connection is lost and we should disconnect.
+fn should_disconnect_on_write_error(error: &quinn::WriteError) -> bool {
+    match error {
+        // Connection was lost - check the underlying ConnectionError.
+        quinn::WriteError::ConnectionLost(_) => true,
+
+        // Stream was stopped - this is a stream-specific error, not a connection error.
+        quinn::WriteError::Stopped(_)
+        // Stream was closed - this is expected behavior for some operations.
+        | quinn::WriteError::ClosedStream
+        // Zero-RTT rejected - this is a handshake issue, not a disconnection.
+        | quinn::WriteError::ZeroRttRejected => false,
+    }
+}
+
+/// Check if a `ReadIpPortError` indicates the server connection is lost and we should disconnect.
+fn should_disconnect_on_read_ip_port_error(error: &ReadIpPortError) -> bool {
+    fn should_disconnect_on_read_exact_error(error: &quinn::ReadExactError) -> bool {
+        // `ReadExactError` contains either `ReadError` or `FinishedEarly`.
+        // Check if it contains a ReadError that indicates disconnection.
+        match error {
+            quinn::ReadExactError::ReadError(read) => should_disconnect_on_read_error(read),
+            quinn::ReadExactError::FinishedEarly(_) => true,
+        }
+    }
+
+    match error {
+        file_yeet_shared::ReadIpPortError::ReadIp(error) => {
+            should_disconnect_on_read_exact_error(error)
+        }
+        file_yeet_shared::ReadIpPortError::ReadPort(io_error) => {
+            // Check if this io::Error wraps a quinn ReadExactError.
+            io_error
+                .get_ref()
+                .and_then(|e| e.downcast_ref::<quinn::ReadExactError>())
+                .is_some_and(should_disconnect_on_read_exact_error)
+        }
+        file_yeet_shared::ReadIpPortError::UnspecifiedAddress => false,
+    }
 }
 
 /// Helper to get a consistent horizontal scrollbar for text overflow.
