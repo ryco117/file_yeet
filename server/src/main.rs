@@ -82,6 +82,7 @@ async fn main() {
 
     // Initialize logging.
     tracing_subscriber::fmt::init();
+    tracing::info!("Server Version: {}", env!("CARGO_PKG_VERSION"));
 
     // Determine which address to bind to.
     let SocketAddrHelper {
@@ -385,26 +386,6 @@ async fn handle_quic_connection(
                     }
                 });
             }
-
-            // Handle the client's request to be introduced to a specific peer over a certain file hash.
-            ClientApiRequest::Introduction => {
-                let cancel = cancellation_token.clone();
-                let port = *client_preferred_port.read().await;
-                let publishers = publishers.clone();
-                task_master.spawn(async move {
-                    tokio::select! {
-                        // Allow the server to cancel the task.
-                        () = cancel.cancelled() => {}
-
-                        // Handle the client's request to be introduced to a specific peer.
-                        r = handle_introduction(client_streams, socket_addr.ip(), port, &publishers) => {
-                            if let Err(e) = r {
-                                tracing::error!("Failed to handle introduction request: {e}");
-                            }
-                        }
-                    }
-                });
-            }
         }
     }
 }
@@ -667,62 +648,6 @@ async fn handle_subscribe(
         tracing::debug!("No peers to introduce");
     } else {
         tracing::debug!("Introduced {n} peers");
-    }
-
-    Ok(())
-}
-
-/// Handle a client request to be introduced to a specific client regarding a file they are publishing.
-#[tracing::instrument(skip_all)]
-async fn handle_introduction(
-    mut client_streams: BiStream,
-    client_ip: IpAddr,
-    client_preferred_port: u16,
-    clients: &PublishersRef,
-) -> Result<(), ClientRequestError> {
-    let mut hash = HashBytes::default();
-    client_streams
-        .recv
-        .read_exact(&mut hash.bytes)
-        .await
-        .map_err(|_| {
-            ClientRequestError::IoError(std::io::Error::from(std::io::ErrorKind::UnexpectedEof))
-        })?;
-
-    // Read the requested IP address and port from the stream.
-    let (requested_peer_ip, requested_peer_port) =
-        file_yeet_shared::read_ip_and_port(&mut client_streams.recv)
-            .await
-            .map_err(|_| {
-                ClientRequestError::IoError(std::io::Error::from(std::io::ErrorKind::UnexpectedEof))
-            })?;
-
-    // Attempt to get the clients from the file-hash map.
-    let read_lock = clients.read().await;
-    let Some(client_list) = read_lock.get(&hash).filter(|v| !v.is_empty()) else {
-        tracing::debug!("Failed to find client for hash {hash}");
-        return Ok(());
-    };
-
-    let client_ip = file_yeet_shared::ipv6_mapped(client_ip);
-    for pub_client in client_list.values() {
-        // Get read access on client lock.
-        let pub_client = pub_client.publisher.read().await;
-        let publishing_ip = pub_client.peer_ip;
-        let publishing_port = &pub_client.preferred_port;
-
-        if publishing_ip.eq(&requested_peer_ip)
-            && *publishing_port.read().await == requested_peer_port
-        {
-            // Feed the subscribing client's socket address to the task that handles communicating with the publisher.
-            if let Ok(()) = pub_client
-                .stream
-                .send((client_ip, client_preferred_port))
-                .await
-            {
-                tracing::debug!("Introduced publisher {publishing_ip}");
-            }
-        }
     }
 
     Ok(())

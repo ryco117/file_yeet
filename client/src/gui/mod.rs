@@ -3472,7 +3472,7 @@ impl AppState {
                             && other_upload.peer_string == peer_string
                             && other_upload.base.nonce != nonce
                         {
-                            // Add our successful range to athe byte count and update the size string.
+                            // Add our successful range to the byte count and update the size string.
                             *byte_count += r.end - r.start;
                             *size_string = humanize_bytes(*byte_count);
 
@@ -3529,6 +3529,11 @@ impl AppState {
     /// Try to safely close.
     #[tracing::instrument(skip(self))]
     fn safely_close(&mut self, close_type: CloseType) -> iced::Task<Message> {
+        if self.safely_closing {
+            tracing::warn!("Already safely closing, ignoring additional close request");
+            return iced::Task::none();
+        }
+        self.safely_closing = true;
         tracing::debug!("Safely leaving server");
 
         // If connected, close the connection and save the current state.
@@ -3626,7 +3631,6 @@ impl AppState {
             // Set the state to `Stalling` before waiting for the safe close to complete.
             self.connection_state = ConnectionState::new_stalling();
 
-            self.safely_closing = true;
             let port_mapping_timeout = Duration::from_millis(500);
             iced::Task::perform(
                 tokio::time::timeout(port_mapping_timeout, async move {

@@ -118,9 +118,6 @@ pub enum ClientApiRequest {
 
     /// Specify a file hash that this client wants to subscribe to.
     Subscribe,
-
-    /// Request to be introduced to a specific peer over a certain file hash.
-    Introduction,
 }
 impl std::fmt::Display for ClientApiRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -129,18 +126,15 @@ impl std::fmt::Display for ClientApiRequest {
             ClientApiRequest::PortOverride => "PORT_OVERRIDE",
             ClientApiRequest::Publish => "PUBLISH",
             ClientApiRequest::Subscribe => "SUBSCRIBE",
-            ClientApiRequest::Introduction => "INTRODUCTION",
         };
         write!(f, "REQ: {str}")
     }
 }
 
 /// Helper to get either the socket address corresponding to the user's input, or the default of IPv4 localhost.
-/// If `server_address` is empty, will use the `localhost` address for the server.
+/// If `server_address` is `None` or empty, will use the `localhost` address for the server.
 /// # Errors
-/// If there is `Some(..)` non-empty server address, then it must be of the format `hostname:port`
-/// to be able to parse into a socket address using `ToSocketAddrs`. If the address cannot be parsed, it will
-/// fail with a `std::io::Error` instead of using the default.
+/// If there is `Some(..)` non-empty server address, then it must be able to parse into a socket address using `ToSocketAddrs`.
 pub fn get_server_or_default(
     server_address: Option<&str>,
     port: NonZeroU16,

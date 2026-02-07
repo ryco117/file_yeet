@@ -942,6 +942,8 @@ pub async fn download_partial_from_peer(
         tracing::debug!("Failed to close the peer stream gracefully: {e}");
     }
 
+    // TODO: Allow updating the hash state without validating the output hash at the end.
+    //       This behavior is not currently needed but the core operation should be general enough to support it if desired.
     if let Some((hasher, expected_hash)) = hasher.take() {
         // Ensure the file hash is correct.
         let downloaded_hash = HashBytes::new(hasher.finalize().into());
