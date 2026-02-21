@@ -15,10 +15,18 @@ The command line arguments for the server
 Usage: file_yeet_server [OPTIONS]
 
 Options:
-  -b, --bind-ip <BIND_IP>      The IP address the server will bind to. The default is local for testing
-  -p, --bind-port <BIND_PORT>  The port the server will bind to [default: 7828]
-  -h, --help                   Print help
-  -V, --version                Print version
+  -b, --bind-ip <BIND_IP>
+          The IP address the server will bind to. The default is local for testing
+  -p, --bind-port <BIND_PORT>
+          The port the server will bind to [default: 7828]
+  -m, --max-connections <MAX_CONNECTIONS>
+          Optional limit to the number of connections the server will accept. Must be a positive integer less than 2^32
+  -v, --verbose
+          Enable verbose logging
+  -h, --help
+          Print help
+  -V, --version
+          Print version
 ```
 
 #### Docker
@@ -27,7 +35,7 @@ An official container build is available at `ryco117/file_yeet_server:latest`. H
 ```bash
 docker build -t file_yeet_server:local .
 ```
-**Note**: The docker container must be run with `--net=host` to ensure that the container has visibility of the client's IP address, instead of a docker intermediary.
+**Note**: The docker container must be run with `--net=host` to ensure that the container executable has visibility of the client's IP address, instead of a docker intermediary address.
 
 
 ### Client
