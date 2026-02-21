@@ -913,7 +913,7 @@ impl AppState {
         let gateway = widget::row!(
             "Gateway address:",
             widget::text_input(
-                "Gateway address (e.g. 192.168.1.1), or leave empty",
+                "Gateway address (e.g. 192.168.1.1), or leave empty to auto-detect a default",
                 self.options.gateway_address.as_deref().unwrap_or_default()
             )
             .on_input(Message::GatewayTextChanged)
@@ -4114,7 +4114,7 @@ async fn partial_download(
         result = Box::pin(crate::core::download_partial_from_peer(
             &mut request,
             &mut file,
-            crate::core::DownloadOffsetState::new(file_range, hasher.map(|h| (h, hash))),
+            crate::core::DownloadOffsetState::new(file_range, hasher.map(|h| (h, Some(hash)))),
             Some(&byte_progress),
         )) => match result {
             Ok(()) => DownloadResult::Success,

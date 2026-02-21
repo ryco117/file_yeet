@@ -825,11 +825,11 @@ async fn connect_to_peer(
 /// If no hasher is provided, no hash will be computed or verified.
 pub struct DownloadOffsetState {
     pub range: std::ops::Range<u64>,
-    pub hasher: Option<(Hasher, HashBytes)>,
+    pub hasher: Option<(Hasher, Option<HashBytes>)>,
 }
 impl DownloadOffsetState {
     /// Create a new download offset state with a specific range and optional hasher.
-    pub fn new(range: std::ops::Range<u64>, hasher: Option<(Hasher, HashBytes)>) -> Self {
+    pub fn new(range: std::ops::Range<u64>, hasher: Option<(Hasher, Option<HashBytes>)>) -> Self {
         Self { range, hasher }
     }
 }
@@ -869,7 +869,8 @@ impl DownloadError {
 /// Download a slice of a file from the peer. Initiates the download by specifying the range of bytes to download.
 /// The caller is responsible for opening the file but this function will seek to the specified starting offset before writing.
 /// The caller may optionally provide a `RwLock<u64>` to track the number of bytes downloaded so far.
-/// If a hasher is provided in the `file_offsets`, the downloaded data will be hashed and verified against the expected hash.
+/// If a hasher is provided in the `file_offsets`, the downloaded data will update the hash state.
+/// Furthermore, if an expected hash is provided in the `file_offsets` then the final hash will be verified against it and an error will be returned if there is a mismatch.
 #[tracing::instrument(skip(peer_streams, file, file_offsets, byte_progress))]
 pub async fn download_partial_from_peer(
     peer_streams: &mut BiStream,
@@ -942,9 +943,7 @@ pub async fn download_partial_from_peer(
         tracing::debug!("Failed to close the peer stream gracefully: {e}");
     }
 
-    // TODO: Allow updating the hash state without validating the output hash at the end.
-    //       This behavior is not currently needed but the core operation should be general enough to support it if desired.
-    if let Some((hasher, expected_hash)) = hasher.take() {
+    if let Some((hasher, Some(expected_hash))) = hasher.take() {
         // Ensure the file hash is correct.
         let downloaded_hash = HashBytes::new(hasher.finalize().into());
         if expected_hash == downloaded_hash {
@@ -980,7 +979,7 @@ pub async fn download_from_peer(
 
     // Specify that we want to download the entire file.
     let file_offsets =
-        DownloadOffsetState::new(0..file_size, Some((Hasher::default(), expected_hash)));
+        DownloadOffsetState::new(0..file_size, Some((Hasher::default(), Some(expected_hash))));
 
     // Open the file for writing, truncating if the file already exists.
     let mut file = tokio::fs::OpenOptions::new()

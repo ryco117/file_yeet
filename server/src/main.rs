@@ -70,6 +70,10 @@ struct Cli {
     /// Must be a positive integer less than 2^32.
     #[arg(short, long)]
     max_connections: Option<NonZeroU32>,
+
+    /// Enable verbose logging.
+    #[arg(short, long)]
+    verbose: bool,
 }
 
 /// A mapping between file hashes and the addresses of connected peers that are publishing the file.
@@ -81,7 +85,12 @@ async fn main() {
     let args = Cli::parse();
 
     // Initialize logging.
-    tracing_subscriber::fmt::init();
+    if cfg!(debug_assertions) || args.verbose {
+        tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG)
+    } else {
+        tracing_subscriber::fmt().with_max_level(tracing::Level::INFO)
+    }
+    .init();
     tracing::info!("Server Version: {}", env!("CARGO_PKG_VERSION"));
 
     // Determine which address to bind to.
@@ -162,6 +171,7 @@ async fn handle_incoming_clients_loop(
     task_master: TaskTracker,
     max_connections: Option<NonZeroU32>,
 ) {
+    tracing::debug!("Starting incoming clients loop");
     while let Some(connecting) = local_end.accept().await {
         // Check if the server has reached the maximum number of connections.
         if max_connections.is_some_and(|m| {
@@ -276,6 +286,7 @@ async fn handle_quic_connection(
         .await
         .map_err(ClientRequestError::IncomingClientFailed)?;
     let socket_addr = connection.remote_address();
+    tracing::debug!("Connection established from {socket_addr}");
 
     let session = Arc::new(RwLock::new(ClientSession::new(
         &connection,
@@ -397,7 +408,9 @@ async fn socket_ping(
     peer_ip: IpAddr,
     preferred_port: &RwLock<u16>,
 ) -> Result<(), ClientRequestError> {
+    tracing::debug!("Handling socket ping request");
     const RESPONSE_SIZE: usize = 16 + 2;
+    // TODO: Use an array instead of a BytesMut to avoid heap allocation.
     let mut bb = bytes::BytesMut::with_capacity(RESPONSE_SIZE);
 
     // Format the ping response as a mapped IPv6 address and port.
@@ -417,14 +430,17 @@ async fn port_override(
     peer_socket: SocketAddr,
     preferred_port: &RwLock<u16>,
 ) -> Result<(), ClientRequestError> {
+    tracing::debug!("Handling port override request from {peer_socket}");
     let mut port = quic_recv
         .read_u16()
         .await
         .map_err(ClientRequestError::IoError)?;
 
-    tracing::info!("Overriding port with {port}");
     if port == 0 {
+        tracing::debug!("Resetting peer's preferred port");
         port = peer_socket.port();
+    } else {
+        tracing::debug!("Overriding port with {port}");
     }
 
     // Update the mutable lock with the new port.
@@ -442,6 +458,7 @@ async fn handle_publish(
     publishers: PublishersRef,
     task_master: TaskTracker,
 ) -> Result<(), ClientRequestError> {
+    tracing::debug!("Handling publish request from {peer_address}");
     /// Helper to remove a publisher from the list of peers sharing a file hash.
     #[tracing::instrument(skip(publishers))]
     async fn try_remove_publisher(
@@ -451,14 +468,20 @@ async fn handle_publish(
     ) {
         // Remove the client from the list of peers publishing this hash.
         let mut publishers = publishers.write().await;
-        if let Some(file_publishers) = publishers.get_mut(&hash) {
+        if let std::collections::hash_map::Entry::Occupied(mut entry) = publishers.entry(hash) {
+            let file_publishers = entry.get_mut();
+
             // Remove this client from the file's list of publishers.
             file_publishers.remove(&session_nonce);
+            tracing::debug!("Removed publisher for hash {hash}");
 
             // Remove the file hash from the map if no clients are publishing it.
             if file_publishers.is_empty() {
-                publishers.remove(&hash);
+                entry.remove();
+                tracing::debug!("Removed hash {hash} from publishers map");
             }
+        } else {
+            tracing::warn!("Failed to find publisher for hash {hash}");
         }
     }
     /// A loop to handle messages to be sent to a client publishing a file hash.
@@ -469,6 +492,7 @@ async fn handle_publish(
         hash: HashBytes,
     ) {
         tracing::info!("Starting publish task for client");
+        // TODO: Use an array instead of a BytesMut to avoid heap allocation, since the message size is fixed.
         let mut bb = bytes::BytesMut::with_capacity(MAX_SERVER_COMMUNICATION_SIZE);
 
         while let Some((peer_ip, port)) = rx.recv().await {
@@ -561,6 +585,7 @@ async fn handle_subscribe(
     client_preferred_port: u16,
     clients: &PublishersRef,
 ) -> Result<(), ClientRequestError> {
+    tracing::debug!("Handling subscribe request from {client_ip}:{client_preferred_port}");
     // Constants for the maximum number of peer-published items to send to the client.
     const PEER_PUBLISH_BYTE_SIZE: usize =
         size_of::<[u8; 16]>() + size_of::<u16>() + size_of::<u64>();
@@ -619,18 +644,23 @@ async fn handle_subscribe(
 
         // Feed the subscribing client's socket address to the task that handles communicating with the publisher.
         // Only include the peer if the message was successfully passed.
-        if let Ok(()) = pub_client
+        match pub_client
             .stream
             .send((client_ip, client_preferred_port))
             .await
         {
-            // Send the publisher's socket address to the subscribing client.
-            file_yeet_shared::write_ipv6_and_port(&mut bb, publishing_ip, publishing_port);
+            Ok(()) => {
+                // Send the publisher's socket address to the subscribing client.
+                file_yeet_shared::write_ipv6_and_port(&mut bb, publishing_ip, publishing_port);
 
-            // Send the file size to the subscribing client.
-            bb.put_u64(file_size);
+                // Send the file size to the subscribing client.
+                bb.put_u64(file_size);
 
-            n += 1;
+                n += 1;
+            }
+            Err(e) => {
+                tracing::error!("Failed to send message to publisher: {e}");
+            }
         }
     }
 
@@ -647,7 +677,7 @@ async fn handle_subscribe(
     if n == 0 {
         tracing::debug!("No peers to introduce");
     } else {
-        tracing::debug!("Introduced {n} peers");
+        tracing::info!("Introduced {n} peers");
     }
 
     Ok(())

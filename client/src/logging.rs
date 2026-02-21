@@ -1,7 +1,7 @@
 const FILE_YEET_LOG_SUFFIX: &str = "file_yeet.log";
 
 const MAX_LOG_FILE_COUNT: std::num::NonZeroUsize =
-    std::num::NonZeroUsize::new(2).expect("MAX_LOG_FILE_COUNT must be a non-zero value");
+    std::num::NonZeroUsize::new(2).expect("MAX_LOG_FILE_COUNT must be a non-zero size");
 
 /// Delete old log files in the application folder.
 fn delete_old_logs(app_folder: &std::path::Path) {

@@ -205,14 +205,13 @@ pub fn ipv6_mapped(ip: IpAddr) -> Ipv6Addr {
 }
 
 /// Write an IPv6 address and port to the stream as a fixed length.
-pub fn write_ipv6_and_port(bb: &mut bytes::BytesMut, ipv6: Ipv6Addr, port: u16) {
-    use bytes::BufMut as _;
+pub fn write_ipv6_and_port<B: bytes::BufMut>(bb: &mut B, ipv6: Ipv6Addr, port: u16) {
     bb.put(&ipv6.octets()[..]);
     bb.put_u16(port);
 }
 
 /// Write an IP address and port to the stream as a fixed length.
-pub fn write_ip_and_port(bb: &mut bytes::BytesMut, ip: IpAddr, port: u16) {
+pub fn write_ip_and_port<B: bytes::BufMut>(bb: &mut B, ip: IpAddr, port: u16) {
     write_ipv6_and_port(bb, ipv6_mapped(ip), port);
 }
 
