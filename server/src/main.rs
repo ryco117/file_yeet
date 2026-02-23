@@ -410,15 +410,15 @@ async fn socket_ping(
 ) -> Result<(), ClientRequestError> {
     tracing::debug!("Handling socket ping request");
     const RESPONSE_SIZE: usize = 16 + 2;
-    // TODO: Use an array instead of a BytesMut to avoid heap allocation.
-    let mut bb = bytes::BytesMut::with_capacity(RESPONSE_SIZE);
+    let mut buffer_data = [0; RESPONSE_SIZE];
+    let mut bb = &mut buffer_data[..];
 
     // Format the ping response as a mapped IPv6 address and port.
     file_yeet_shared::write_ip_and_port(&mut bb, peer_ip, *preferred_port.read().await);
 
     // Send the ping response to the client.
     quic_send
-        .write_all(&bb)
+        .write_all(&buffer_data)
         .await
         .map_err(|e| ClientRequestError::IoError(e.into()))
 }
@@ -488,26 +488,25 @@ async fn handle_publish(
     #[tracing::instrument(skip(quic_send, rx))]
     async fn handle_publish_inner(
         mut quic_send: quinn::SendStream,
+        publish_address: IpAddr,
         mut rx: mpsc::Receiver<(Ipv6Addr, u16)>,
         hash: HashBytes,
     ) {
-        tracing::info!("Starting publish task for client");
-        // TODO: Use an array instead of a BytesMut to avoid heap allocation, since the message size is fixed.
-        let mut bb = bytes::BytesMut::with_capacity(MAX_SERVER_COMMUNICATION_SIZE);
-
+        tracing::debug!("Starting publish task for client");
         while let Some((peer_ip, port)) = rx.recv().await {
+            let mut buffer_data = [0; 16 + 2];
+            let mut bb = &mut buffer_data[..];
+
             // Format the message as an IP address and port.
             file_yeet_shared::write_ipv6_and_port(&mut bb, peer_ip, port);
 
             // Try to send the message to the client.
-            if let Err(e) = quic_send.write_all(&bb).await {
+            if let Err(e) = quic_send.write_all(&buffer_data).await {
                 tracing::error!("Failed to send message to client: {e}");
                 return;
             }
-            // Clear the scratch space before the next iteration.
-            bb.clear();
 
-            tracing::info!("Introduced {peer_ip} to peer");
+            tracing::info!("Introduced {peer_ip} to publisher");
         }
     }
 
@@ -565,7 +564,7 @@ async fn handle_publish(
             _ = client_streams.recv.read_exact(&mut client_cancel_scratch) => {}
 
             // Handle the client's file-publishing task.
-            () = handle_publish_inner(client_streams.send, rx, hash) => {}
+            () = handle_publish_inner(client_streams.send, peer_address, rx, hash) => {}
         }
 
         // Remove any reference there may be to this publish task.
