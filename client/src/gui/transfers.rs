@@ -364,6 +364,7 @@ pub struct DownloadTransfer {
     pub base: TransferBase,
     pub progress: DownloadState,
     pub publish_on_success: bool,
+    pub context_menu_visible: bool,
 }
 impl NonceItem for DownloadTransfer {
     fn nonce(&self) -> Nonce {
@@ -453,33 +454,82 @@ impl Transfer for DownloadTransfer {
             DownloadState::Transferring(DownloadTransferringState {
                 progress_animation: p,
                 ..
-            }) => widget::row!(
-                "Transferring...",
-                widget::progress_bar(0.0..=1., *p).girth(24),
-                widget::column!(
-                    widget::row!(
-                        tooltip_button(
-                            "Pause",
-                            Message::PauseDownload(self.base.nonce),
-                            "Pause the download, it can be safely resumed",
+            }) => {
+                // Create either a context menu or a button to open one, depending on the state.
+                // TODO: Use a proper context menu when `iced` adds support for them in the future.
+                let context_menu: iced::Element<Message> = if self.context_menu_visible {
+                    /// A helper function to create a button style with squared corners for the context menu.
+                    fn button_style(
+                        theme: &iced::Theme,
+                        status: widget::button::Status,
+                    ) -> widget::button::Style {
+                        let mut style = widget::button::primary(theme, status);
+
+                        // Set the border radii to `0` to square the corners.
+                        style.border.radius = iced::border::Radius::default();
+                        style
+                    }
+
+                    widget::container(widget::column!(
+                        timed_tooltip(
+                            widget::button(widget::text("⋯").size(12))
+                                .on_press(Message::DownloadContextMenuVisibility(
+                                    self.base.nonce,
+                                    false
+                                ))
+                                .style(button_style)
+                                .width(iced::Length::Fill),
+                            "Close this context menu",
+                            mouse_move_elapsed,
                         ),
-                        tooltip_button(
-                            "Cancel",
-                            Message::CancelTransfer(self.base.nonce, FileYeetCommandType::Sub),
+                        widget::rule::horizontal(2),
+                        timed_tooltip(
+                            widget::button(widget::text("Cancel Transfer").size(12))
+                                .on_press(Message::CancelTransfer(
+                                    self.base.nonce,
+                                    FileYeetCommandType::Sub
+                                ))
+                                .style(button_style)
+                                .width(iced::Length::Fill),
                             "Cancel the download, abandoning progress",
+                            mouse_move_elapsed,
                         ),
+                        widget::rule::horizontal(2),
+                        timed_tooltip(
+                            widget::checkbox(self.publish_on_success)
+                                .label("Reyeet on success")
+                                .on_toggle(|b| Message::PublishOnSuccessToggle(self.base.nonce, b))
+                                .size(12),
+                            "Automatically publish the file after a successful download",
+                            mouse_move_elapsed,
+                        ),
+                        widget::rule::horizontal(0),
+                    ))
+                    .style(iced::widget::container::bordered_box)
+                    .width(iced::Length::Shrink)
+                    .into()
+                } else {
+                    tooltip_button(
+                        "⋮",
+                        Message::DownloadContextMenuVisibility(self.base.nonce, true),
+                        "View more options with a context menu",
                     )
-                    .spacing(8),
-                    widget::checkbox(self.publish_on_success)
-                        .label("Reyeet on success")
-                        .on_toggle(|b| Message::PublishOnSuccessToggle(self.base.nonce, b))
-                        .size(10),
+                };
+
+                widget::row!(
+                    "Transferring...",
+                    widget::progress_bar(0.0..=1., *p).girth(24),
+                    tooltip_button(
+                        "Pause",
+                        Message::PauseDownload(self.base.nonce),
+                        "Pause the download, it can be safely resumed",
+                    ),
+                    context_menu,
                 )
-                .align_x(iced::Alignment::End),
-            )
-            .spacing(6)
-            .align_y(iced::Alignment::Center)
-            .into(),
+                .spacing(6)
+                .align_y(iced::Alignment::Center)
+                .into()
+            }
 
             DownloadState::Paused(_) => widget::row!(
                 "Download is paused",

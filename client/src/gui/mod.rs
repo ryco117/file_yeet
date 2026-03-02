@@ -406,6 +406,9 @@ pub enum Message {
     /// Pause a download that is in-progress.
     PauseDownload(Nonce),
 
+    /// Set whether a download's context menu is open.
+    DownloadContextMenuVisibility(Nonce, bool),
+
     /// Update a download's `publish_on_success` toggle.
     PublishOnSuccessToggle(Nonce, bool),
 
@@ -651,6 +654,9 @@ impl AppState {
                 self.update_cancel_transfer(nonce, transfer_type)
             }
             Message::PauseDownload(nonce) => self.update_pause_download(nonce),
+            Message::DownloadContextMenuVisibility(nonce, is_open) => {
+                self.update_download_context_menu_visibility(nonce, is_open)
+            }
             Message::PublishOnSuccessToggle(nonce, publish_on_success) => {
                 self.update_publish_on_success_toggle(nonce, publish_on_success)
             }
@@ -2115,6 +2121,7 @@ impl AppState {
             },
             progress: DownloadState::Paused(saved_intervals),
             publish_on_success: false,
+            context_menu_visible: false,
         });
 
         if cfg!(debug_assertions) && !is_nonce_sorted(downloads) {
@@ -2180,6 +2187,7 @@ impl AppState {
                             },
                             progress: DownloadState::Connecting,
                             publish_on_success: false,
+                            context_menu_visible: false,
                         };
 
                         // New connection attempt for this peer with result command identified by the nonce.
@@ -2677,6 +2685,8 @@ impl AppState {
         };
 
         // Cancel the download's tasks.
+        // TODO: Current pauses look like a failure from the peer's side.
+        //       Consider sending a message to the peer to indicate that this is a pause and not a failure so that the peer can handle it more gracefully.
         t.base.cancellation_token.cancel();
         tracing::debug!("Paused download {}", t.base.hash_hex);
 
@@ -2709,12 +2719,38 @@ impl AppState {
                     Some,
                 ),
 
-            // Already set the `Paused` intervals to `None`, return.
+            // Already set the `Paused` intervals to `None`, so this case is covered.
             _ => return iced::Task::none(),
         };
 
         // Update with the correct intervals.
         t.progress = DownloadState::Paused(intervals);
+        iced::Task::none()
+    }
+
+    /// Set the context menu visibility for the given download.
+    #[tracing::instrument(skip(self))]
+    fn update_download_context_menu_visibility(
+        &mut self,
+        nonce: Nonce,
+        is_visible: bool,
+    ) -> iced::Task<Message> {
+        let ConnectionState::Connected(ConnectedState { downloads, .. }) =
+            &mut self.connection_state
+        else {
+            tracing::warn!("No connected state to update download context menu visibility");
+            return iced::Task::none();
+        };
+
+        if let Some((_, download)) = binary_find_nonce_mut(downloads, nonce) {
+            tracing::debug!("Setting context menu visibility");
+            download.context_menu_visible = is_visible;
+        } else {
+            log_status_change::<LogWarnStatus>(
+                &mut self.status_manager,
+                "No download found to update context menu visibility".to_owned(),
+            );
+        }
         iced::Task::none()
     }
 
@@ -2733,7 +2769,7 @@ impl AppState {
         };
 
         if let Some((_, download)) = binary_find_nonce_mut(downloads, nonce) {
-            tracing::debug!("Setting `publish_on_success` for download to {publish_on_success}");
+            tracing::debug!("Setting `publish_on_success`");
             download.publish_on_success = publish_on_success;
         } else {
             log_status_change::<LogWarnStatus>(

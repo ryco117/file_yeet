@@ -39,7 +39,7 @@ docker build -t file_yeet_server:local .
 
 
 ### Client
-![Client GUI screenshot](images/client_screenshot.png)
+![Client GUI screenshot](images/file_yeet_client-accept-size-before-download.png)
 ```text
 $ cargo r --bin file_yeet_client -- -h
 The command line interface for `file_yeet_client`

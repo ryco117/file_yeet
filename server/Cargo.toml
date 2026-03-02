@@ -11,7 +11,7 @@ displaydoc = "0.2"
 file_yeet_shared = { path = "../shared" }
 futures-util = "0.3"
 quinn = "0.11"
-rand = "0.9"
+rand = "0.10"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 thiserror = "2.0"
 tokio = { version = "1.49", features = ["io-util", "macros", "net", "rt-multi-thread", "signal"] }

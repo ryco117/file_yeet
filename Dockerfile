@@ -1,23 +1,40 @@
-# Use a basic Rust image as a base
-FROM rust:1.89.0-alpine
+# Build stage - use the official Rust image with Alpine
+FROM rust:alpine AS builder
 
-# Copy the source code into the container
+# Install build dependencies
+RUN apk add --no-cache musl-dev
+
+# Set up workspace
 WORKDIR /usr/src/file_yeet
-RUN mkdir -p ./server/
-COPY server/Cargo.toml ./server/
-COPY server/Cargo.lock ./server/
-COPY server/src ./server/src/
-RUN mkdir -p ./shared/
-COPY shared/Cargo.toml ./shared/
-COPY shared/src ./shared/src/
+
+# Copy shared library first (dependency)
+COPY shared/ ./shared/
+
+# Copy server code
+COPY server/ ./server/
+
+# Build the server binary in release mode for smaller size
 WORKDIR /usr/src/file_yeet/server
+RUN cargo build --release --bin file_yeet_server
 
-# Install dependencies
-RUN apk add musl-dev
+# Runtime stage - minimal Alpine Linux
+FROM alpine:latest
 
-# Build and install the server
-RUN cargo install --path . --bin file_yeet_server
-RUN cargo clean
+# Install only the runtime dependencies (if any)
+RUN apk add --no-cache ca-certificates
+
+# Create a non-root user for security
+RUN addgroup -g 1000 -S file_yeet && \
+    adduser -u 1000 -S file_yeet -G file_yeet
+
+# Copy the compiled binary from the builder stage
+COPY --from=builder /usr/src/file_yeet/server/target/release/file_yeet_server /usr/local/bin/file_yeet_server
+
+# Make sure the binary is executable
+RUN chmod +x /usr/local/bin/file_yeet_server
+
+# Switch to non-root user
+USER file_yeet
 
 # Expose the port that the server will be running on
 EXPOSE 7828

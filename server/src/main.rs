@@ -106,6 +106,8 @@ async fn main() {
     // Create a self-signed certificate for the peer communications.
     let (server_cert, server_key) = file_yeet_shared::generate_self_signed_cert()
         .expect("Failed to generate self-signed certificate");
+    tracing::debug!("Generated self-signed certificate for server");
+
     let mut server_config = quinn::ServerConfig::with_single_cert(vec![server_cert], server_key)
         .expect("Quinn failed to accept the server certificates");
 
@@ -118,6 +120,7 @@ async fn main() {
     // Create a new QUIC endpoint.
     let local_end = quinn::Endpoint::server(server_config, bind_address)
         .expect("Failed to bind to local QUIC endpoint");
+    tracing::debug!("QUIC endpoint created and bound: {:?}", local_end.local_addr());
 
     // Create a map between file hashes and the addresses of peers that have the file.
     let publishers: PublishersRef = PublishersRef::default();
@@ -473,15 +476,15 @@ async fn handle_publish(
 
             // Remove this client from the file's list of publishers.
             file_publishers.remove(&session_nonce);
-            tracing::debug!("Removed publisher for hash {hash}");
+            tracing::debug!("Removed publisher for hash");
 
             // Remove the file hash from the map if no clients are publishing it.
             if file_publishers.is_empty() {
                 entry.remove();
-                tracing::debug!("Removed hash {hash} from publishers map");
+                tracing::debug!("Removed hash from publishers map");
             }
         } else {
-            tracing::warn!("Failed to find publisher for hash {hash}");
+            tracing::warn!("Failed to find publisher for hash");
         }
     }
     /// A loop to handle messages to be sent to a client publishing a file hash.
