@@ -3,6 +3,7 @@ use std::{
     mem::size_of,
     net::{IpAddr, Ipv6Addr, SocketAddr},
     num::{NonZeroU16, NonZeroU32},
+    path::PathBuf,
     sync::Arc,
 };
 
@@ -74,6 +75,14 @@ struct Cli {
     /// Enable verbose logging.
     #[arg(short, long)]
     verbose: bool,
+
+    /// Path to a PEM-encoded TLS certificate file. Requires --tls-key.
+    #[arg(long, requires = "tls_key")]
+    tls_cert: Option<PathBuf>,
+
+    /// Path to a PEM-encoded TLS private key file. Requires --tls-cert.
+    #[arg(long, requires = "tls_cert")]
+    tls_key: Option<PathBuf>,
 }
 
 /// A mapping between file hashes and the addresses of connected peers that are publishing the file.
@@ -103,10 +112,15 @@ async fn main() {
     // Print out the address we're going to bind to.
     tracing::info!("Using bind address: {bind_address:?}");
 
-    // Create a self-signed certificate for the peer communications.
-    let (server_cert, server_key) = file_yeet_shared::generate_self_signed_cert()
-        .expect("Failed to generate self-signed certificate");
-    tracing::debug!("Generated self-signed certificate for server");
+    // Load or generate a certificate and private key for QUIC.
+    let (server_cert, server_key) =
+        if let (Some(cert_path), Some(key_path)) = (args.tls_cert, args.tls_key) {
+            load_tls_files(&cert_path, &key_path).expect("Failed to load TLS certificate and key")
+        } else {
+            file_yeet_shared::generate_self_signed_cert()
+                .expect("Failed to generate self-signed certificate")
+        };
+    tracing::debug!("TLS certificate and key ready");
 
     let mut server_config = quinn::ServerConfig::with_single_cert(vec![server_cert], server_key)
         .expect("Quinn failed to accept the server certificates");
@@ -120,7 +134,10 @@ async fn main() {
     // Create a new QUIC endpoint.
     let local_end = quinn::Endpoint::server(server_config, bind_address)
         .expect("Failed to bind to local QUIC endpoint");
-    tracing::debug!("QUIC endpoint created and bound: {:?}", local_end.local_addr());
+    tracing::debug!(
+        "QUIC endpoint created and bound: {:?}",
+        local_end.local_addr()
+    );
 
     // Create a map between file hashes and the addresses of peers that have the file.
     let publishers: PublishersRef = PublishersRef::default();
@@ -689,4 +706,21 @@ async fn handle_subscribe(
 fn slice_shuffle<T>(v: &mut [T]) {
     let mut rng = rand::rng();
     v.shuffle(&mut rng);
+}
+
+/// Load a TLS certificate and private key from PEM files.
+fn load_tls_files(
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
+) -> Result<
+    (
+        rustls::pki_types::CertificateDer<'static>,
+        rustls::pki_types::PrivateKeyDer<'static>,
+    ),
+    rustls::pki_types::pem::Error,
+> {
+    use rustls::pki_types::pem::PemObject as _;
+    let cert = rustls::pki_types::CertificateDer::from_pem_file(cert_path)?;
+    let key = rustls::pki_types::PrivateKeyDer::from_pem_file(key_path)?;
+    Ok((cert, key))
 }
