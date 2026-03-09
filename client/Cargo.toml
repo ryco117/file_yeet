@@ -5,7 +5,6 @@ edition = "2021"
 license = "MIT"
 
 [dependencies]
-anyhow = "1.0"
 bytes = "1.11"
 chrono = "0.4"
 circular-buffer = "1.2"

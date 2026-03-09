@@ -255,17 +255,52 @@ struct Manager<'a> {
     pub cancellation_token: CancellationToken,
 }
 
+/// Errors that can occur while handling the publish command.
+#[derive(Debug, thiserror::Error)]
+enum PublishCommandError {
+    #[error("Failed to hash file: {0}")]
+    HashFile(core::FileAccessError),
+
+    #[error("{0}")]
+    PublishLoop(#[from] core::PublishError),
+}
+
+/// Errors that can occur while handling the subscribe command.
+#[derive(Debug, thiserror::Error)]
+enum SubscribeCommandError {
+    #[error("File hash not given in valid format")]
+    InvalidHashFormat,
+
+    #[error("Failed to parse the hash and optional extension")]
+    ParseHashFailed,
+
+    #[error("Failed to parse hex hash: {0}")]
+    ParseHexHash(faster_hex::Error),
+
+    #[error("Failed to subscribe to the file: {0}")]
+    Subscribe(#[from] core::SubscribeError),
+
+    #[error("No peers are available for the file")]
+    NoPeers,
+
+    #[error("Failed to connect to any available peers")]
+    NoViablePeers,
+
+    #[error("Failed to download from peer: {0}")]
+    Download(#[from] core::DownloadError),
+}
+
 /// Handle the CLI command to publish a file.
 #[tracing::instrument(skip_all)]
 async fn publish_command(
     prepared_connection: &PreparedConnection,
     file_path: String,
     manager: Manager<'_>,
-) -> anyhow::Result<()> {
+) -> Result<(), PublishCommandError> {
     let file_path = std::path::Path::new(&file_path);
     let (file_size, hash) = match core::file_size_and_hash(file_path, None).await {
         Ok(t) => t,
-        Err(e) => anyhow::bail!("Failed to hash file: {e}"),
+        Err(e) => return Err(PublishCommandError::HashFile(e)),
     };
     let display_path = file_path.display();
     let file_bytes = humanize_bytes(file_size);
@@ -290,7 +325,7 @@ async fn publish_command(
             tracing::info!("Ctrl-C detected, cancelling the publish");
             cancellation_token.cancel();
         }
-        r = publish_loop(endpoint, server_connection, hash, file_size, file_path, manager) => return r
+        r = publish_loop(endpoint, server_connection, hash, file_size, file_path, manager) => return r.map_err(Into::into)
     }
 
     Ok(())
@@ -304,21 +339,21 @@ async fn subscribe_command(
     hash_ext: String,
     output_path: Option<String>,
     manager: Manager<'_>,
-) -> anyhow::Result<()> {
+) -> Result<(), SubscribeCommandError> {
     // Parse the hash and optional extension with regex.
     let (hash_hex, ext) = match HASH_EXT_REGEX.captures(&hash_ext) {
         Some(c) => (
             c.get(1)
-                .ok_or_else(|| anyhow::anyhow!("File hash not given in valid format"))?
+                .ok_or(SubscribeCommandError::InvalidHashFormat)?
                 .as_str(),
             c.get(2).map(|m| m.as_str()),
         ),
-        None => anyhow::bail!("Failed to parse the hash and optional extension"),
+        None => return Err(SubscribeCommandError::ParseHashFailed),
     };
 
     let mut hash = HashBytes::default();
     if let Err(e) = faster_hex::hex_decode(hash_hex.as_bytes(), &mut hash.bytes) {
-        anyhow::bail!("Failed to parse hex hash: {e}");
+        return Err(SubscribeCommandError::ParseHexHash(e));
     }
 
     // Determine the output file path to use.
@@ -348,14 +383,14 @@ async fn subscribe_command(
 
     // Request all available peers from the server.
     let mut peers = match core::subscribe(server_connection, &mut bb, hash, None).await {
-        Err(e) => anyhow::bail!("Failed to subscribe to the file: {e}"),
+        Err(e) => return Err(SubscribeCommandError::Subscribe(e)),
         Ok(c) => c,
     };
     bb.clear();
 
     // If no peers are available, quickly return.
     if peers.is_empty() {
-        anyhow::bail!("No peers are available for the file");
+        return Err(SubscribeCommandError::NoPeers);
     }
 
     // Try to connect to multiple peers concurrently with a list of connection futures.
@@ -401,7 +436,7 @@ async fn subscribe_command(
 
     // If no connections were viable or accepted, then bail.
     let Some((peer_connection, mut peer_streams, file_size)) = peer_connection else {
-        anyhow::bail!("Failed to connect to any available peers");
+        return Err(SubscribeCommandError::NoViablePeers);
     };
 
     // Create a background task to update the download progress visually.
@@ -444,17 +479,14 @@ async fn subscribe_command(
 
     // Try to download the requested file using the accepted peer connection.
     // Pin the future to avoid a stack overflow. <https://rust-lang.github.io/rust-clippy/master/index.html#large_futures>
-    if let Err(e) = core::download_from_peer(
+    core::download_from_peer(
         hash,
         &mut peer_streams,
         file_size,
         &output,
         Some(&progress_clone),
     )
-    .await
-    {
-        anyhow::bail!("Failed to download from peer: {e}");
-    }
+    .await?;
 
     peer_connection.close(GOODBYE_CODE, "Thanks for sharing".as_bytes());
 
@@ -470,7 +502,7 @@ async fn publish_loop(
     file_size: u64,
     file_path: &Path,
     manager: Manager<'_>,
-) -> anyhow::Result<()> {
+) -> Result<(), core::PublishError> {
     // Create a bi-directional stream to the server.
     let mut server_streams: BiStream =
         crate::core::publish(server_connection, hash, file_size).await?;

@@ -1127,7 +1127,6 @@ checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
 name = "file_yeet_client"
 version = "0.2.1"
 dependencies = [
- "anyhow",
  "bytes",
  "chrono",
  "circular-buffer",
