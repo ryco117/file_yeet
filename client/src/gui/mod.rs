@@ -1538,7 +1538,7 @@ impl AppState {
                 log_status_change::<LogWarnStatus>(
                     status_manager,
                     format!(
-                        "Already publishing hash {hash} for {}",
+                        "Already publishing hash {hash:#} for {}",
                         pi.path.to_string_lossy()
                     ),
                 );
@@ -3251,8 +3251,11 @@ impl AppState {
                 if let Some(interval) = intervals.interval_at_mut(old_range.start) {
                     interval.completed = true;
                 } else {
-                    // TODO: Determine appropriate way to handle this error.
-                    tracing::error!("Could not find interval to mark as completed for range");
+                    // This should never happen, but because the interval data is still valid, pausing will still work and recover the progress.
+                    log_status_change::<LogErrorStatus>(
+                        &mut self.status_manager,
+                        format!("Could not find interval to mark as completed for range. Consider pausing and resuming download {:#} to recover progress", t.base.hash),
+                    );
                 }
 
                 if let Some(next_chunk) = intervals.next_download_chunk() {

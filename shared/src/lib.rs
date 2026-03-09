@@ -48,7 +48,20 @@ impl std::fmt::Debug for HashBytes {
         // Encode the hash bytes into a hexadecimal string.
         let hex = faster_hex::hex_encode(&self.bytes, &mut hex_str_bytes)
             .expect("Hex encoding of hash failed");
-        write!(f, "{hex}")
+
+        if f.alternate() {
+            // Write the first 3 bytes of the hash as hex.
+            const TRUNCATED_CHAR_COUNT: usize = 6; // 3 bytes * 2 chars/byte.
+            write!(f, "{}", &hex[..TRUNCATED_CHAR_COUNT])?;
+
+            // Write an ellipsis to indicate truncation.
+            write!(f, "…")?;
+
+            // Write the final 3 bytes of the hash as hex.
+            write!(f, "{}", &hex[hex.len() - TRUNCATED_CHAR_COUNT..])
+        } else {
+            write!(f, "{hex}")
+        }
     }
 }
 /// Implement a reasonable `Display` for the `HashBytes` type.
