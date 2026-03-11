@@ -1692,7 +1692,7 @@ impl AppState {
                     }),
                     Some((_, publish)),
                 ) => {
-                    tracing::info!("Publish request succeeded for {hash}");
+                    tracing::info!("Publish request succeeded for {hash:#}");
                     publish.state = PublishState::Publishing(Publish {
                         server_streams,
                         hash,
@@ -2094,7 +2094,7 @@ impl AppState {
                     if let Err(e) = file_intervals.add_interval(interval) {
                         log_status_change::<LogErrorStatus>(
                             &mut self.status_manager,
-                            format!("Failed to recover partial download {hash}: {e}"),
+                            format!("Failed to recover partial download {hash:#}: {e}"),
                         );
                         return iced::Task::none();
                     }
@@ -3252,6 +3252,8 @@ impl AppState {
                     interval.completed = true;
                 } else {
                     // This should never happen, but because the interval data is still valid, pausing will still work and recover the progress.
+                    // TODO: Force this error to occur locally and validate that pausing/resuming
+                    //       recovery works.
                     log_status_change::<LogErrorStatus>(
                         &mut self.status_manager,
                         format!("Could not find interval to mark as completed for range. Consider pausing and resuming download {:#} to recover progress", t.base.hash),

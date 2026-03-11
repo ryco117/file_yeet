@@ -590,7 +590,7 @@ async fn handle_publish(
         // Remove any reference there may be to this publish task.
         try_remove_publisher(session_nonce, hash, publishers).await;
 
-        tracing::info!("Finishing publish task for client {hash}",);
+        tracing::info!("Finishing publish task for client {hash:#}",);
     });
 
     Ok(())
