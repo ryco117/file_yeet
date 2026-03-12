@@ -305,8 +305,8 @@ pub enum Message {
     /// Update the gateway text setting.
     GatewayTextChanged(String),
 
-    /// Initiate a connection to the server.
-    ConnectClicked,
+    /// Attempt a connection to the user-specified server.
+    AttemptServerConnection,
 
     /// Update animations based on elapsed time.
     AnimationTick,
@@ -521,7 +521,7 @@ impl AppState {
             (initial_state, window_task)
         } else {
             // Attempt to connect to the given server on start.
-            let connect_task = initial_state.update_connect_clicked();
+            let connect_task = initial_state.update_attempt_server_connection();
             (initial_state, window_task.chain(connect_task))
         }
     }
@@ -552,7 +552,7 @@ impl AppState {
             }
             Message::PortForwardTextChanged(text) => self.update_port_forward_text(text),
             Message::GatewayTextChanged(text) => self.update_gateway_text(text),
-            Message::ConnectClicked => self.update_connect_clicked(),
+            Message::AttemptServerConnection => self.update_attempt_server_connection(),
             Message::AnimationTick => self.update_animation_tick(),
             Message::ToggleStatusHistory => self.update_show_status_logs(),
             Message::ConnectResulted(r) => self.update_connect_resulted(r),
@@ -862,7 +862,7 @@ impl AppState {
         );
 
         let connect_button = widget::button("Connect")
-            .on_press_maybe((!self.modal).then_some(Message::ConnectClicked));
+            .on_press_maybe((!self.modal).then_some(Message::AttemptServerConnection));
         let mut internal_port_text = widget::text_input(
             "E.g., 12345. Leave empty to use any available port",
             &self.options.internal_port_text,
@@ -873,7 +873,7 @@ impl AppState {
         if !self.modal {
             server_address = server_address
                 .on_input(Message::ServerAddressChanged)
-                .on_submit(Message::ConnectClicked);
+                .on_submit(Message::AttemptServerConnection);
 
             internal_port_text = internal_port_text.on_input(Message::InternalPortTextChanged);
             if let PortMappingSetting::PortForwarding(_) = &self.options.port_mapping {
@@ -1194,19 +1194,19 @@ impl AppState {
         iced::Task::none()
     }
 
-    /// Update the state after the connect button was clicked.
+    /// Attempt a connection to the server using the address provided by the user.
     #[tracing::instrument(skip_all)]
-    fn update_connect_clicked(&mut self) -> iced::Task<Message> {
-        tracing::debug!("Connect button clicked");
+    fn update_attempt_server_connection(&mut self) -> iced::Task<Message> {
+        tracing::debug!("Attempting connection to server with address '{}'", self.options.server_address);
 
         // Clear the status message before starting the connection attempt.
         self.clear_status_message();
 
         // Determine if a valid server address was entered.
         let regex_match = if self.options.server_address.trim().is_empty() {
-            // If empty, use sane defaults.
-            "localhost".clone_into(&mut self.options.server_address);
-            Some((self.options.server_address.clone(), DEFAULT_PORT))
+            // If empty, do not assume the intended address.
+            // TODO: Use Result instead of Option to distinguish between empty and invalid input and show different messages.
+            None
         } else {
             // Otherwise, parse the server address and optional port.
             SERVER_ADDRESS_REGEX
@@ -2543,7 +2543,11 @@ impl AppState {
             &mut self.connection_state
         {
             if let Some((_, publish)) = binary_find_nonce_mut(publishes, nonce) {
-                tracing::info!("Cancelling publish for {}", publish.path.to_string_lossy());
+                if let Some(hash) = publish.state.hash_and_file_size().map(|(h, _)| h) {
+                    tracing::info!("Cancelling publish for {} {hash:#}", publish.path.to_string_lossy());
+                } else {
+                    tracing::info!("Cancelling publish for {}", publish.path.to_string_lossy());
+                }
                 publish.cancellation_token.cancel();
                 publish.state = PublishState::Cancelled(publish.state.hash_and_file_size());
             } else {
