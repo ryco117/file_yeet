@@ -121,7 +121,7 @@ pub async fn prepare_server_connection(
     suggested_gateway: Option<&str>,
     internal_port: Option<NonZeroU16>,
     external_port_config: PortMappingConfig,
-    bb: &mut bytes::BytesMut,
+    skip_server_cert_validation: bool,
 ) -> Result<PreparedConnection, PrepareConnectionError> {
     // Create a self-signed certificate for the peer communications.
     let (server_cert, server_key) = file_yeet_shared::generate_self_signed_cert()
@@ -152,7 +152,8 @@ pub async fn prepare_server_connection(
     endpoint.set_default_client_config(configure_peer_verification());
 
     // Connect to the specified `file_yeet` server.
-    let connection = connect_to_server(&endpoint, server_socket).await?;
+    let connection =
+        connect_to_server(&endpoint, server_socket, skip_server_cert_validation).await?;
 
     // Share debug information about the QUIC endpoints.
     let mut local_address = endpoint
@@ -237,7 +238,7 @@ pub async fn prepare_server_connection(
     if let Some(port) = port_override {
         // Only send a port override request if the server sees us through a different port.
         if sanity_check.0.port() != port.get() {
-            port_override_request(&connection, port, bb).await?;
+            port_override_request(&connection, port).await?;
             sanity_check.0.set_port(port.get());
         }
     }
@@ -368,6 +369,10 @@ pub async fn renew_port_mapping(
 /// Error that may occur when attempting to connect to the server.
 #[derive(Debug, thiserror::Error)]
 pub enum ConnectToServerError {
+    /// Failed to create a default QUIC client configuration for server verification.
+    #[error("Failed to configure default server certificate verification: {0}")]
+    TlsConfiguration(#[from] rustls::Error),
+
     /// Failed to begin a QUIC connection to the server.
     #[error("Failed to begin a QUIC connection to the server: {0}")]
     Connect(#[from] quinn::ConnectError),
@@ -382,15 +387,25 @@ pub enum ConnectToServerError {
 }
 
 /// Connect to the server using QUIC.
+/// Optionally, skip server certificate validation by using the default peer configuration.
 #[tracing::instrument(skip(endpoint))]
 async fn connect_to_server(
     endpoint: &quinn::Endpoint,
     server_socket: SocketAddrHelper,
+    skip_server_cert_validation: bool,
 ) -> Result<quinn::Connection, ConnectToServerError> {
     // Attempt to connect to the server using QUIC.
     let connection = tokio::time::timeout(
         SERVER_CONNECTION_TIMEOUT,
-        endpoint.connect(server_socket.address, server_socket.hostname.as_str())?,
+        if skip_server_cert_validation {
+            endpoint.connect(server_socket.address, server_socket.hostname.as_str())
+        } else {
+            endpoint.connect_with(
+                configure_server_verification()?,
+                server_socket.address,
+                server_socket.hostname.as_str(),
+            )
+        }?,
     )
     .await??;
     tracing::info!("QUIC connection made to the server");
@@ -452,58 +467,25 @@ pub enum PortOverrideError {
 }
 
 /// Perform a port override request to the server.
-#[tracing::instrument(skip(server_connection, bb))]
+#[tracing::instrument(skip(server_connection))]
 pub async fn port_override_request(
     server_connection: &quinn::Connection,
     port: NonZeroU16,
-    bb: &mut bytes::BytesMut,
 ) -> Result<(), PortOverrideError> {
     // Create a bi-directional stream to the server.
     let mut server_streams: BiStream = server_connection.open_bi().await?.into();
 
     // Format a port override request.
-    bb.clear();
+    let mut byte_buffer = [0u8; 2 + 2];
+    let mut bb = &mut byte_buffer[..];
     bb.put_u16(file_yeet_shared::ClientApiRequest::PortOverride as u16);
     bb.put_u16(port.get());
 
     // Send the port override request to the server and clear the buffer.
-    server_streams.send.write_all(bb).await?;
+    server_streams.send.write_all(&byte_buffer).await?;
 
     Ok(())
 }
-
-// /// Errors that may occur when sending an introduction request.
-// #[derive(Debug, thiserror::Error)]
-// pub enum IntroductionError {
-//     /// Failed to establish a new QUIC stream for the introduction request.
-//     #[error("{0}")]
-//     Connection(#[from] quinn::ConnectionError),
-
-//     /// Failed to send the introduction request.
-//     #[error("{0}")]
-//     SendRequest(#[from] quinn::WriteError),
-// }
-
-// /// Perform an introduction request to the server for a specific peer and hash.
-// #[tracing::instrument(skip(server_connection, bb, external_address))]
-// pub async fn introduction(
-//     server_connection: &quinn::Connection,
-//     bb: &mut bytes::BytesMut,
-//     hash: HashBytes,
-//     external_address: SocketAddr,
-// ) -> Result<(), IntroductionError> {
-//     // Create a bi-directional stream to the server.
-//     let mut server_streams: BiStream = server_connection.open_bi().await?.into();
-
-//     // Send the server an introduction request.
-//     bb.clear();
-//     bb.put_u16(file_yeet_shared::ClientApiRequest::Introduction as u16);
-//     bb.put(&hash.bytes[..]);
-//     file_yeet_shared::write_ip_and_port(bb, external_address.ip(), external_address.port());
-//     server_streams.send.write_all(bb).await?;
-
-//     Ok(())
-// }
 
 /// Errors that may occur when sending a publish request to the server.
 #[derive(Debug, thiserror::Error)]
@@ -600,10 +582,9 @@ pub enum SubscribeError {
 
 /// Perform a subscribe request to the server.
 /// Returns a list of peers that are sharing the file and the file size they promise to send.
-#[tracing::instrument(skip(server_connection, bb, our_external_address))]
+#[tracing::instrument(skip(server_connection, our_external_address))]
 pub async fn subscribe(
     server_connection: &quinn::Connection,
-    bb: &mut bytes::BytesMut,
     hash: HashBytes,
     our_external_address: Option<SocketAddr>,
 ) -> Result<Vec<(SocketAddr, u64)>, SubscribeError> {
@@ -611,10 +592,11 @@ pub async fn subscribe(
     let mut server_streams: BiStream = server_connection.open_bi().await?.into();
 
     // Send the server a subscribe request.
-    bb.clear();
+    let mut byte_buffer = [0u8; 2 + file_yeet_shared::HASH_BYTE_COUNT];
+    let mut bb = &mut byte_buffer[..];
     bb.put_u16(file_yeet_shared::ClientApiRequest::Subscribe as u16);
     bb.put(&hash.bytes[..]);
-    server_streams.send.write_all(bb).await?;
+    server_streams.send.write_all(&byte_buffer).await?;
 
     tracing::info!("Requesting file with hash from the server...");
 
@@ -1575,21 +1557,8 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerCertVerification {
     }
 }
 
-/// Build a QUIC client config that will skip server verification.
-/// # Panics
-/// If the conversion from `Duration` to `IdleTimeout` fails.
-fn configure_peer_verification() -> quinn::ClientConfig {
-    // TODO: Use a secure client configuration when connecting to the server.
-    let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(
-        rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(SkipServerCertVerification::new())
-            .with_no_client_auth(),
-    )
-    .expect("Failed to create a QUIC client configuration");
-
-    let mut client_config = quinn::ClientConfig::new(Arc::new(crypto));
-
+/// Helper for building the agreed upon QUIC transport configuration for connections.
+fn default_transport_config() -> quinn::TransportConfig {
     // Set custom keep alive policies.
     let mut transport_config = quinn::TransportConfig::default();
     transport_config.max_idle_timeout(Some(quinn::IdleTimeout::from(quinn::VarInt::from_u32(
@@ -1600,7 +1569,33 @@ fn configure_peer_verification() -> quinn::ClientConfig {
     transport_config.keep_alive_interval(Some(Duration::from_millis(
         file_yeet_shared::QUIC_TIMEOUT_MILLIS as u64 / 6,
     )));
-    client_config.transport_config(Arc::new(transport_config));
 
+    // TODO: Create the Arc once and clone when required.
+    transport_config
+}
+
+/// Build a QUIC client config that will skip server verification.
+/// # Panics
+/// If the QUIC client configuration cannot be created from the Rustls client configuration.
+fn configure_peer_verification() -> quinn::ClientConfig {
+    let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(
+        rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(SkipServerCertVerification::new())
+            .with_no_client_auth(),
+    )
+    .expect("Failed to create a QUIC client configuration");
+
+    let mut client_config = quinn::ClientConfig::new(Arc::new(crypto));
+    client_config.transport_config(Arc::new(default_transport_config()));
     client_config
+}
+
+/// Build a QUIC client config that will validate server addresses.
+/// # Errors
+/// If the QUIC client configuration cannot be created from the Rustls client configuration with platform verifier.
+fn configure_server_verification() -> Result<quinn::ClientConfig, rustls::Error> {
+    let mut client_config = quinn::ClientConfig::try_with_platform_verifier()?;
+    client_config.transport_config(Arc::new(default_transport_config()));
+    Ok(client_config)
 }

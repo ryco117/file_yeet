@@ -83,6 +83,10 @@ struct Cli {
     /// Path to a PEM-encoded TLS private key file. Requires --tls-cert.
     #[arg(long, requires = "tls_cert")]
     tls_key: Option<PathBuf>,
+
+    /// Allow using a self-signed certificate. Insecure and disabled by default. Conflicts with providing a TLS certificate file.
+    #[arg(long, conflicts_with = "tls_cert", required_unless_present = "tls_cert")]
+    self_sign_certificate: bool,
 }
 
 /// A mapping between file hashes and the addresses of connected peers that are publishing the file.
@@ -101,6 +105,16 @@ async fn main() {
     }
     .init();
     tracing::info!("Server Version: {}", env!("CARGO_PKG_VERSION"));
+
+    // Ensure the user understands the risks of not providing TLS certificate and key files.
+    if args.tls_cert.is_none() {
+        if args.self_sign_certificate {
+            tracing::warn!("No TLS certificate provided, using a self-signed certificate. This means a man-in-the-middle attack is possible and would allow an attack to read the file hashes a target is publishing or subscribing to.");
+        } else {
+            tracing::warn!("No TLS certificate provided, and self-signed certificates are not enabled. This means the server will not be able to accept any connections. To fix this, provide a TLS certificate and key with --tls-cert and --tls-key, or enable self-signed certificates with --self-sign-certificate.");
+            return;
+        }
+    }
 
     // Determine which address to bind to.
     let SocketAddrHelper {

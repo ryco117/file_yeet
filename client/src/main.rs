@@ -1,8 +1,6 @@
 use std::{io::Write as _, num::NonZeroU16, path::Path, sync::Arc};
 
-use file_yeet_shared::{
-    BiStream, HashBytes, GOODBYE_CODE, GOODBYE_MESSAGE, MAX_SERVER_COMMUNICATION_SIZE,
-};
+use file_yeet_shared::{BiStream, HashBytes, GOODBYE_CODE, GOODBYE_MESSAGE};
 use futures_util::{stream::FuturesUnordered, StreamExt};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
@@ -18,6 +16,7 @@ mod win_cmd;
 /// The command line interface for `file_yeet_client`.
 #[derive(clap::Parser)]
 #[command(author, version, about, long_about = None)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct Cli {
     /// The address of the rendezvous server. Either an IP address or a hostname.
     #[arg(short, long)]
@@ -54,6 +53,10 @@ pub struct Cli {
     /// Log to stdout instead of trying to log to a file.
     #[arg(short, long)]
     log_to_stdout: bool,
+
+    /// Skip server certificate validation. Generally not recommended, but may be useful for testing or homebrew servers.
+    #[arg(long)]
+    skip_server_cert_validation: bool,
 
     #[command(subcommand)]
     cmd: Option<FileYeetCommand>,
@@ -127,9 +130,6 @@ fn main() {
         return;
     };
 
-    // Create a buffer for sending and receiving data within the payload size for `file_yeet`.
-    let mut bb = bytes::BytesMut::with_capacity(MAX_SERVER_COMMUNICATION_SIZE);
-
     // Begin an asynchronous runtime outside of the GUI event loop to handle the command line request.
     let async_runtime = match tokio::runtime::Runtime::new() {
         Ok(r) => r,
@@ -154,7 +154,7 @@ fn main() {
             } else {
                 core::PortMappingConfig::None
             },
-            &mut bb,
+            args.skip_server_cert_validation,
         )
         .await
         .expect("Failed to perform basic connection setup");
@@ -215,7 +215,7 @@ fn main() {
             // Try to get the file hash from the rendezvous server and peers.
             FileYeetCommand::Sub { hash_ext, output } => {
                 if let Err(e) =
-                    subscribe_command(&prepared_connection, bb, hash_ext, output, manager).await
+                    subscribe_command(&prepared_connection, hash_ext, output, manager).await
                 {
                     tracing::error!("Failed to download the file: {e}");
                 }
@@ -335,7 +335,6 @@ async fn publish_command(
 #[tracing::instrument(skip_all)]
 async fn subscribe_command(
     prepared_connection: &PreparedConnection,
-    mut bb: bytes::BytesMut,
     hash_ext: String,
     output_path: Option<String>,
     manager: Manager<'_>,
@@ -382,11 +381,10 @@ async fn subscribe_command(
     } = prepared_connection;
 
     // Request all available peers from the server.
-    let mut peers = match core::subscribe(server_connection, &mut bb, hash, None).await {
+    let mut peers = match core::subscribe(server_connection, hash, None).await {
         Err(e) => return Err(SubscribeCommandError::Subscribe(e)),
         Ok(c) => c,
     };
-    bb.clear();
 
     // If no peers are available, quickly return.
     if peers.is_empty() {

@@ -70,6 +70,7 @@ pub struct AppSettings {
     pub port_forwarding_text: String,
     pub internal_port_text: String,
     pub port_mapping: PortMappingSetting,
+    pub skip_server_cert_verification: Option<bool>,
     pub last_publishes: Vec<SavedPublish>,
     pub last_downloads: Vec<SavedDownload>,
 }

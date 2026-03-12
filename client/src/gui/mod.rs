@@ -29,8 +29,8 @@ use crate::{
         },
         peer_connection_into_stream, udp_holepunch, ConnectionsManager, FileYeetCommandType,
         Hasher, PortMappingConfig, PrepareConnectionError, PreparedConnection,
-        ReadSubscribingPeerError, SubscribeError, HASH_EXT_REGEX, MAX_PEER_COMMUNICATION_SIZE,
-        PEER_CONNECT_TIMEOUT, SERVER_CONNECTION_TIMEOUT,
+        ReadSubscribingPeerError, SubscribeError, HASH_EXT_REGEX, PEER_CONNECT_TIMEOUT,
+        SERVER_CONNECTION_TIMEOUT,
     },
     gui::{
         publish::{draw_publishes, Publish, PublishItem, PublishRequestResult, PublishState},
@@ -305,6 +305,9 @@ pub enum Message {
     /// Update the gateway text setting.
     GatewayTextChanged(String),
 
+    /// Update the skip server certificate verification setting.
+    SkipServerCertVerificationChanged(bool),
+
     /// Attempt a connection to the user-specified server.
     AttemptServerConnection,
 
@@ -470,13 +473,14 @@ impl AppState {
         });
 
         {
-            // The CLI arguments take final precedence on start.
+            // The CLI arguments take highest precedence on launch.
             let crate::Cli {
                 server_address,
                 external_port_override,
                 internal_port,
                 gateway,
                 nat_map,
+                skip_server_cert_validation,
                 ..
             } = args;
 
@@ -502,6 +506,9 @@ impl AppState {
                 // Default to enabling NAT-PMP/PCP if no port forwarding is set.
                 // Average users may not know that this is usually the best option for them.
                 settings.port_mapping = PortMappingSetting::TryPcpNatPmp;
+            }
+            if *skip_server_cert_validation {
+                settings.skip_server_cert_verification = Some(true);
             }
         }
 
@@ -552,6 +559,12 @@ impl AppState {
             }
             Message::PortForwardTextChanged(text) => self.update_port_forward_text(text),
             Message::GatewayTextChanged(text) => self.update_gateway_text(text),
+            Message::SkipServerCertVerificationChanged(skip) => {
+                tracing::debug!("Skip server certificate verification changed to {skip}");
+                self.options.skip_server_cert_verification = Some(skip);
+                self.save_on_exit = true;
+                iced::Task::none()
+            }
             Message::AttemptServerConnection => self.update_attempt_server_connection(),
             Message::AnimationTick => self.update_animation_tick(),
             Message::ToggleStatusHistory => self.update_show_status_logs(),
@@ -841,6 +854,7 @@ impl AppState {
                 &mouse_move_elapsed,
             )
         ]
+        .spacing(6)
         .align_y(iced::Alignment::Center);
         widget::column!(page, horizontal_line(), status_bar)
             .spacing(4)
@@ -935,6 +949,14 @@ impl AppState {
                 widget::space().height(iced::Length::FillPortion(2)),
                 choose_port_mapping,
                 gateway,
+                widget::checkbox(self.options.skip_server_cert_verification.unwrap_or(false))
+                    .label("Skip server certificate verification")
+                    .on_toggle(Message::SkipServerCertVerificationChanged),
+                if self.options.skip_server_cert_verification.unwrap_or(false) {
+                    Element::from(widget::text("Warning: Skipping server certificate verification isn't recommended as it opens the connection up to eaves-dropping").color(WARN_YELLOW_COLOR))
+                } else {
+                    widget::space().into()
+                },
             )
             .align_x(iced::Alignment::Center)
             .spacing(6),
@@ -1042,6 +1064,12 @@ impl AppState {
         .align_y(iced::alignment::Alignment::Center)
         .spacing(6);
 
+        let optional_cert_warning = if self.options.skip_server_cert_verification.unwrap_or(false) {
+            Element::from(widget::text("Warning: Skipping server certificate verification isn't recommended as it opens the connection up to eaves-dropping").color(WARN_YELLOW_COLOR))
+        } else {
+            widget::space().into()
+        };
+
         // Hash input and download button.
         let download_input = widget::row!(hash_text_input, download_button).spacing(6);
 
@@ -1100,6 +1128,7 @@ impl AppState {
         widget::container(
             widget::column!(
                 header,
+                optional_cert_warning,
                 horizontal_line(),
                 widget::row!(
                     publish_button,
@@ -1197,7 +1226,10 @@ impl AppState {
     /// Attempt a connection to the server using the address provided by the user.
     #[tracing::instrument(skip_all)]
     fn update_attempt_server_connection(&mut self) -> iced::Task<Message> {
-        tracing::debug!("Attempting connection to server with address '{}'", self.options.server_address);
+        tracing::debug!(
+            "Attempting connection to server with address '{}'",
+            self.options.server_address
+        );
 
         // Clear the status message before starting the connection attempt.
         self.clear_status_message();
@@ -1279,18 +1311,19 @@ impl AppState {
             }
         };
         let gateway = self.options.gateway_address.clone();
+        let skip_server_cert_verification =
+            self.options.skip_server_cert_verification.unwrap_or(false);
 
         // Try to connect to the server in a new task.
         iced::Task::perform(
             async move {
-                let mut bb = bytes::BytesMut::with_capacity(MAX_PEER_COMMUNICATION_SIZE);
                 crate::core::prepare_server_connection(
                     Some(&server_address),
                     port,
                     gateway.as_deref(),
                     internal_port,
                     port_mapping,
-                    &mut bb,
+                    skip_server_cert_verification,
                 )
                 .await
                 .map_err(Arc::new)
@@ -2055,8 +2088,7 @@ impl AppState {
         let external_address = external_address.0;
         iced::Task::perform(
             async move {
-                let mut bb = bytes::BytesMut::with_capacity(MAX_PEER_COMMUNICATION_SIZE);
-                crate::core::subscribe(&server, &mut bb, hash, Some(external_address))
+                crate::core::subscribe(&server, hash, Some(external_address))
                     .await
                     .map(|publishing_peers| {
                         IncomingSubscribePeers::new(publishing_peers, path, hash)
@@ -2544,7 +2576,10 @@ impl AppState {
         {
             if let Some((_, publish)) = binary_find_nonce_mut(publishes, nonce) {
                 if let Some(hash) = publish.state.hash_and_file_size().map(|(h, _)| h) {
-                    tracing::info!("Cancelling publish for {} {hash:#}", publish.path.to_string_lossy());
+                    tracing::info!(
+                        "Cancelling publish for {} {hash:#}",
+                        publish.path.to_string_lossy()
+                    );
                 } else {
                     tracing::info!("Cancelling publish for {}", publish.path.to_string_lossy());
                 }
@@ -2865,11 +2900,8 @@ impl AppState {
             // We don't need to create the file; in fact we get to reuse the existing progress.
             let future = async move {
                 // Get the list of peers to resume the download from.
-                let mut bb = bytes::BytesMut::with_capacity(MAX_PEER_COMMUNICATION_SIZE);
                 let peers =
-                    match crate::core::subscribe(&server, &mut bb, hash, Some(external_address))
-                        .await
-                    {
+                    match crate::core::subscribe(&server, hash, Some(external_address)).await {
                         Ok(peers) => peers,
                         Err(e) => {
                             // TODO: Handle subscribe failed correctly. Some failures may indicate
@@ -2914,8 +2946,7 @@ impl AppState {
             .map_err(|e| Some(Arc::new(format!("{e}"))))?;
 
             // Get the list of peers to resume the download from.
-            let mut bb = bytes::BytesMut::with_capacity(MAX_PEER_COMMUNICATION_SIZE);
-            let peers = crate::core::subscribe(&server, &mut bb, hash, Some(external_address))
+            let peers = crate::core::subscribe(&server, hash, Some(external_address))
                 .await
                 .map_err(|e| Some(Arc::new(format!("{e}"))))?;
 
@@ -2947,7 +2978,7 @@ impl AppState {
     }
 
     /// Update the state after a resume partial hash has resulted.
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(skip(self, result))]
     fn update_resume_partial_hash(
         &mut self,
         nonce: Nonce,
@@ -4127,7 +4158,7 @@ fn create_sized_file(file_size: u64, output_path: &std::path::Path) -> Result<()
 
 /// Helper to perform a partial download from a single peer.
 /// The `output_path` must already exist and be writable.
-#[tracing::instrument(skip(peer_stream, cancellation_token, byte_progress, output_path))]
+#[tracing::instrument(skip(peer_stream, cancellation_token, byte_progress, output_path, hasher))]
 async fn partial_download(
     peer_stream: PeerRequestStream,
     cancellation_token: CancellationToken,

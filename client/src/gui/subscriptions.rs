@@ -19,7 +19,18 @@ use crate::{
 fn unhandled_events() -> Subscription<Message> {
     iced::event::listen_with(|event, status, window| match status {
         iced::event::Status::Ignored => Some(Message::UnhandledEvent(window, event)),
-        iced::event::Status::Captured => None,
+        iced::event::Status::Captured => {
+            // Special-case capturing mouse movement since the timing is always meant to be recorded.
+            if matches!(
+                event,
+                iced::Event::Mouse(iced::mouse::Event::CursorMoved { .. })
+            ) {
+                // TODO: Make a `Message` specifically for mouse-movement so that the enum does not need to be matched twice.
+                Some(Message::UnhandledEvent(window, event))
+            } else {
+                None
+            }
+        }
     })
 }
 
