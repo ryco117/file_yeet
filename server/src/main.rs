@@ -85,7 +85,7 @@ struct Cli {
     tls_key: Option<PathBuf>,
 
     /// Allow using a self-signed certificate. Insecure and disabled by default. Conflicts with providing a TLS certificate file.
-    #[arg(long, conflicts_with = "tls_cert", required_unless_present = "tls_cert")]
+    #[arg(long, conflicts_with = "tls_cert")]
     self_sign_certificate: bool,
 }
 
