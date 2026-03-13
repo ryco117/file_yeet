@@ -1252,12 +1252,12 @@ impl AppState {
         // Determine if a valid server address was entered.
         let regex_match = if self.options.server_address.trim().is_empty() {
             // If empty, do not assume the intended address.
-            // TODO: Use Result instead of Option to distinguish between empty and invalid input and show different messages.
-            None
+            Err("No server address provided".to_owned())
         } else {
             // Otherwise, parse the server address and optional port.
             SERVER_ADDRESS_REGEX
                 .captures(&self.options.server_address)
+                .ok_or_else(|| "Invalid server address".to_owned())
                 .and_then(|captures| {
                     let host = if let Some(host) = captures.name("host").map(|h| h.as_str()) {
                          if host.starts_with('[') && host.ends_with(']') {
@@ -1270,26 +1270,30 @@ impl AppState {
                     } else {
                         captures
                             .name("unbraced_ipv6_host")
-                            .expect("Unexpected error: One of `host` and `unbraced_ipv6_host` must be captured in a successful map")
+                            .or_else(|| {
+                                tracing::error!("Unexpected error: One of capture groups `host` and `unbraced_ipv6_host` must be captured in a successful map");
+                                None
+                            })
+                            .unwrap()
                             .as_str()
                     };
 
                     // If there is no port, use the default port. Otherwise, validate the input.
-                    let port = captures.name("port").map_or(Some(DEFAULT_PORT), |p| {
-                        p.as_str().parse::<NonZeroU16>().ok()
-                    })?;
+                    let port = captures.name("port").map_or(Ok(DEFAULT_PORT), |p| {
+                        p.as_str().parse::<NonZeroU16>()
+                    }).map_err(|e| format!("Invalid port number: {e}"))?;
 
-                    Some((host.to_owned(), port))
+                    Ok((host.to_owned(), port))
                 })
         };
 
         // If the server address is invalid, display an error message and return.
-        let Some((server_address, port)) = regex_match else {
-            log_status_change::<LogWarnStatus>(
-                &mut self.status_manager,
-                "Invalid server address".to_owned(),
-            );
-            return iced::Task::none();
+        let (server_address, port) = match regex_match {
+            Ok(p) => p,
+            Err(error_string) => {
+                log_status_change::<LogWarnStatus>(&mut self.status_manager, error_string);
+                return iced::Task::none();
+            }
         };
 
         // Validate the internal port.
