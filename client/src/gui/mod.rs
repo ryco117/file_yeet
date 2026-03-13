@@ -3697,6 +3697,7 @@ impl AppState {
                     tracing::error!("Could not save settings: {e}");
                 } else {
                     tracing::info!("Settings saved");
+                    self.save_on_exit = false;
                 }
             } else {
                 tracing::debug!("No changes to settings, not saving");
