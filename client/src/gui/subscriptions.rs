@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc, time::Instant};
 
 use crab_nat::PortMapping;
 use file_yeet_shared::{BiStream, HashBytes, ReadIpPortError, GOODBYE_CODE, GOODBYE_MESSAGE};
@@ -10,7 +10,7 @@ use crate::{
     core::{ConnectionsManager, ReadSubscribingPeerError},
     gui::{
         publish::{Publish, PublishItem, PublishRequestResult, PublishState},
-        Message, Nonce, PeerRequestStream,
+        Message, Nonce, PeerRequestStream, TOOLTIP_WAIT_DURATION,
     },
 };
 
@@ -19,18 +19,7 @@ use crate::{
 fn unhandled_events() -> Subscription<Message> {
     iced::event::listen_with(|event, status, window| match status {
         iced::event::Status::Ignored => Some(Message::UnhandledEvent(window, event)),
-        iced::event::Status::Captured => {
-            // Special-case capturing mouse movement since the timing is always meant to be recorded.
-            if matches!(
-                event,
-                iced::Event::Mouse(iced::mouse::Event::CursorMoved { .. })
-            ) {
-                // TODO: Make a `Message` specifically for mouse-movement so that the enum does not need to be matched twice.
-                Some(Message::UnhandledEvent(window, event))
-            } else {
-                None
-            }
-        }
+        iced::event::Status::Captured => None,
     })
 }
 
@@ -44,6 +33,34 @@ fn animation() -> Subscription<Message> {
 #[inline]
 pub fn stalling() -> Subscription<Message> {
     Subscription::batch([unhandled_events(), animation()])
+}
+
+/// Helper to allow for the animation of a tooltip to occur after the timeout.
+/// This is useful in views which do not need a general animation loop, but want tooltips to trigger.
+async fn tooltip_animation(last_mouse_move: &Instant) {
+    tokio::time::sleep_until(
+        last_mouse_move
+            .checked_add(TOOLTIP_WAIT_DURATION)
+            .unwrap_or_else(Instant::now)
+            .into(),
+    )
+    .await;
+}
+
+/// Helper to create a subscription to allow for tooltip animations.
+/// This is useful in views which do not need a general animation loop, but want tooltips to trigger.
+fn tooltip_subscription(last_mouse_move: Instant) -> Subscription<Message> {
+    Subscription::run_with(last_mouse_move, |last_mouse_move| {
+        let last_mouse_move = *last_mouse_move;
+        iced::stream::channel(1, async move |mut output| {
+            tooltip_animation(&last_mouse_move).await;
+            if let Err(e) = output.try_send(Message::AnimationTick) {
+                tracing::error!(
+                    "Failed to perform internal message passing for tooltip animation: {e}"
+                );
+            }
+        })
+    })
 }
 
 /// Data for `incoming_connections_loop`.
@@ -408,7 +425,8 @@ where
 }
 
 /// Listen for application close events when disconnected.
-#[inline]
-pub fn disconnected() -> Subscription<Message> {
-    unhandled_events()
+pub fn disconnected(last_mouse_move: Option<&Instant>) -> Subscription<Message> {
+    let tooltip_animation =
+        last_mouse_move.map(|last_mouse_move| tooltip_subscription(*last_mouse_move));
+    Subscription::batch(std::iter::once(unhandled_events()).chain(tooltip_animation))
 }

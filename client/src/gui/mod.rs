@@ -48,6 +48,7 @@ use crate::{
 };
 
 mod publish;
+mod strings;
 mod subscriptions;
 mod transfers;
 
@@ -771,7 +772,9 @@ impl AppState {
             ),
 
             // Listen for application close events when disconnected.
-            ConnectionState::Disconnected => subscriptions::disconnected(),
+            ConnectionState::Disconnected => {
+                subscriptions::disconnected(self.last_mouse_move.as_ref())
+            }
         }
     }
 
@@ -803,7 +806,7 @@ impl AppState {
         } else {
             match &self.connection_state {
                 // Display a prompt for the server address when disconnected.
-                ConnectionState::Disconnected => self.view_disconnected_page(),
+                ConnectionState::Disconnected => self.view_disconnected_page(&mouse_move_elapsed),
 
                 // Display a spinner while connecting/stalling.
                 &ConnectionState::Stalling { start, tick } => {
@@ -869,7 +872,7 @@ impl AppState {
     }
 
     /// Draw the disconnected page with a server address input and connect button.
-    fn view_disconnected_page(&self) -> iced::Element<'_, Message> {
+    fn view_disconnected_page(&self, mouse_move_elapsed: &Duration) -> iced::Element<'_, Message> {
         let mut server_address = widget::text_input(
             "Server address. E.g., localhost:7828",
             &self.options.server_address,
@@ -941,6 +944,14 @@ impl AppState {
         .spacing(6)
         .align_y(iced::Alignment::Center);
 
+        let skip_server_validation_checkbox = timed_tooltip(
+            widget::checkbox(self.options.skip_server_cert_verification.unwrap_or(false))
+                .label("Skip server certificate verification")
+                .on_toggle(Message::SkipServerCertVerificationChanged),
+            strings::WARNING_SKIPPING_SERVER_VERIFICATION,
+            mouse_move_elapsed,
+        );
+
         widget::container(
             widget::column!(
                 widget::space().height(iced::Length::Fill),
@@ -949,11 +960,12 @@ impl AppState {
                 widget::space().height(iced::Length::FillPortion(2)),
                 choose_port_mapping,
                 gateway,
-                widget::checkbox(self.options.skip_server_cert_verification.unwrap_or(false))
-                    .label("Skip server certificate verification")
-                    .on_toggle(Message::SkipServerCertVerificationChanged),
+                skip_server_validation_checkbox,
                 if self.options.skip_server_cert_verification.unwrap_or(false) {
-                    Element::from(widget::text("Warning: Skipping server certificate verification isn't recommended as it opens the connection up to eaves-dropping").color(WARN_YELLOW_COLOR))
+                    Element::from(
+                        widget::text(strings::WARNING_SKIPPING_SERVER_VERIFICATION)
+                            .color(WARN_YELLOW_COLOR),
+                    )
                 } else {
                     widget::space().into()
                 },
@@ -1065,7 +1077,10 @@ impl AppState {
         .spacing(6);
 
         let optional_cert_warning = if self.options.skip_server_cert_verification.unwrap_or(false) {
-            Element::from(widget::text("Warning: Skipping server certificate verification isn't recommended as it opens the connection up to eaves-dropping").color(WARN_YELLOW_COLOR))
+            Element::from(
+                widget::text(strings::WARNING_SKIPPING_SERVER_VERIFICATION)
+                    .color(WARN_YELLOW_COLOR),
+            )
         } else {
             widget::space().into()
         };
@@ -1165,7 +1180,7 @@ impl AppState {
                 if let Err(e) = &o {
                     log_status_change::<LogWarnStatus>(
                         &mut self.status_manager,
-                        format!("{INVALID_PORT_FORWARD}: {e}"),
+                        format!("{}: {e}", strings::INVALID_PORT_FORWARD),
                     );
                 } else {
                     self.clear_status_message();
@@ -1201,7 +1216,7 @@ impl AppState {
                     *port = None;
                     log_status_change::<LogWarnStatus>(
                         &mut self.status_manager,
-                        format!("{INVALID_PORT_FORWARD}: {e}"),
+                        format!("{}: {e}", strings::INVALID_PORT_FORWARD),
                     );
                 }
             }
@@ -1599,7 +1614,7 @@ impl AppState {
                     // Duplicate file path.
                     log_status_change::<LogWarnStatus>(
                         &mut self.status_manager,
-                        PUBLISH_PATH_EXISTS.to_owned(),
+                        strings::PUBLISH_PATH_EXISTS.to_owned(),
                     );
                     true
                 } else {
@@ -2066,7 +2081,7 @@ impl AppState {
         if publishes.iter().any(|p| &path == p.path.as_ref()) {
             log_status_change::<LogWarnStatus>(
                 &mut self.status_manager,
-                PUBLISH_PATH_EXISTS.to_owned(),
+                strings::PUBLISH_PATH_EXISTS.to_owned(),
             );
             return iced::Task::none();
         }
@@ -4365,6 +4380,3 @@ async fn multi_peer_download_verify(
         ),
     }
 }
-
-const INVALID_PORT_FORWARD: &str = "Invalid port forward. Defaults to no port mappings";
-const PUBLISH_PATH_EXISTS: &str = "Publish using this path already exists";
