@@ -47,6 +47,7 @@ use crate::{
     },
 };
 
+mod debug_state;
 mod publish;
 mod strings;
 mod subscriptions;
@@ -246,17 +247,29 @@ enum ConnectionState {
     #[default]
     Disconnected,
 
-    /// Connecting to the server or safely closing the application.
-    Stalling { start: Instant, tick: Instant },
+    /// Connecting to the server.
+    ConnectStalling { start: Instant, tick: Instant },
 
     /// A connection to the server is active.
     Connected(ConnectedState),
+
+    /// Safely leaving disconnecting from the server and peers, saving any partial progress and settings changes to disk, etc.
+    SafelyLeaveStalling { start: Instant, tick: Instant },
 }
 impl ConnectionState {
-    /// Make a new `ConnectionState` in the stalling state.
-    pub fn new_stalling() -> Self {
+    /// Make a new `ConnectionState` in the `ConnectStalling` state.
+    pub fn new_connect_stalling() -> Self {
         let now = Instant::now();
-        Self::Stalling {
+        Self::ConnectStalling {
+            start: now,
+            tick: now,
+        }
+    }
+
+    /// Make a new `ConnectionState` in the `SafelyLeaveStalling` state.
+    pub fn new_safely_leave_stalling() -> Self {
+        let now = Instant::now();
+        Self::SafelyLeaveStalling {
             start: now,
             tick: now,
         }
@@ -271,18 +284,41 @@ struct StatusManager {
     pub history_visible: bool,
 }
 
+/// Enum state of the modal dialog, if any, currently open.
+/// Takes precedence over other interactions.
+#[derive(Clone, Debug, Default)]
+pub enum ModalState {
+    #[default]
+    None,
+    ExternalDialog,
+    Confirmation {
+        title: String,
+        message: String,
+        confirm_action: Box<Message>,
+    },
+}
+impl ModalState {
+    /// Returns true if and only if no modal dialog is currently open, allowing normal interactions.
+    #[inline]
+    pub fn is_non_modal(&self) -> bool {
+        matches!(self, ModalState::None)
+    }
+}
+
 /// The state of the application for interacting with the GUI.
 #[derive(Default)]
 pub struct AppState {
     connection_state: ConnectionState,
     options: AppSettings,
     status_manager: StatusManager,
-    modal: bool,
-    safely_closing: bool,
+    modal_state: ModalState,
     save_on_exit: bool,
     port_mapping: Option<crab_nat::PortMapping>,
     main_window: Option<window::Id>,
     last_mouse_move: Option<Instant>,
+
+    /// Debug state used only for development purposes.
+    _debug_state: debug_state::DebugState,
 }
 
 /// The messages that can be sent to the update loop of the application.
@@ -329,6 +365,10 @@ pub enum Message {
 
     /// Leave the server and disconnect.
     SafelyLeaveServer,
+
+    /// Show a confirmation dialog before leaving the server.
+    //  TODO: Replace with a generic confirmation message.
+    ModalLeaveServerConfirmation,
 
     /// Complete the server disconnection process without further asynchronous actions.
     LeftServer,
@@ -403,6 +443,13 @@ pub enum Message {
 
     /// Remove a publish item.
     RemovePublish(Nonce),
+
+    /// Show a confirmation dialog before cancelling a transfer.
+    //  TODO: Replace with a generic confirmation message.
+    ModalCancelTransferConfirmation(Nonce, FileYeetCommandType),
+
+    /// Dismiss the currently open confirmation modal without taking any action.
+    DismissModal,
 
     /// Cancel a transfer that is in-progress.
     CancelTransfer(Nonce, FileYeetCommandType),
@@ -576,10 +623,18 @@ impl AppState {
                 iced::clipboard::write(self.options.server_address.clone())
             }
             Message::SafelyLeaveServer => self.safely_close(CloseType::Connections),
+            Message::ModalLeaveServerConfirmation => {
+                self.modal_state = ModalState::Confirmation {
+                    title: "Leave Server?".to_owned(),
+                    message: "Are you sure you want to leave the server? All active transfers will be cancelled. Partial download progress will be saved, if any.".to_owned(),
+                    confirm_action: Box::new(Message::SafelyLeaveServer),
+                };
+                iced::Task::none()
+            }
             Message::LeftServer => {
                 tracing::debug!("Left server, now disconnected");
-                self.safely_closing = false;
                 self.connection_state = ConnectionState::Disconnected;
+                self.modal_state = ModalState::None; // No file dialogs or confirmations should be open when disconnected.
                 iced::Task::none()
             }
             Message::PeerRequestedTransfer((hash, peer_request)) => {
@@ -612,7 +667,7 @@ impl AppState {
                 self.clear_status_message();
 
                 // Let state know that a modal dialog is open.
-                self.modal = true;
+                self.modal_state = ModalState::ExternalDialog;
 
                 iced::Task::perform(
                     rfd::AsyncFileDialog::new()
@@ -630,7 +685,7 @@ impl AppState {
             Message::PublishChosenItem(publish) => self.update_publish_chosen_item(publish),
             Message::PublishPathCancelled => {
                 tracing::debug!("Publish choice cancelled");
-                self.modal = false;
+                self.modal_state = ModalState::None;
                 iced::Task::none()
             }
             Message::PublishFileHashed {
@@ -664,6 +719,29 @@ impl AppState {
             Message::CancelPublish(nonce) => self.update_cancel_publish(nonce),
             Message::RetryPublish(nonce) => self.update_retry_publish(nonce),
             Message::RemovePublish(nonce) => self.update_remove_publish(nonce),
+            Message::ModalCancelTransferConfirmation(nonce, transfer_type) => {
+                let (title, message) = match transfer_type {
+                    FileYeetCommandType::Sub => (
+                        "Cancel Download?".to_owned(),
+                        "Are you sure you want to cancel this download? All progress will be lost."
+                            .to_owned(),
+                    ),
+                    FileYeetCommandType::Pub => (
+                        "Cancel Upload?".to_owned(),
+                        "Are you sure you want to cancel this upload? The peer may attempt to recover the transfer later if the file is being published.".to_owned(),
+                    ),
+                };
+                self.modal_state = ModalState::Confirmation {
+                    title,
+                    message,
+                    confirm_action: Box::new(Message::CancelTransfer(nonce, transfer_type)),
+                };
+                iced::Task::none()
+            }
+            Message::DismissModal => {
+                self.modal_state = ModalState::None;
+                iced::Task::none()
+            }
             Message::CancelTransfer(nonce, transfer_type) => {
                 self.update_cancel_transfer(nonce, transfer_type)
             }
@@ -701,41 +779,7 @@ impl AppState {
             Message::RemoveFromTransfers(nonce, transfer_type) => {
                 self.update_remove_from_transfers(nonce, transfer_type)
             }
-            Message::UnhandledEvent(window, event) => match event {
-                // Check for a close window request to allow safe closing.
-                iced::Event::Window(window::Event::CloseRequested) => {
-                    tracing::debug!("`CloseRequested` event received from window {window}");
-
-                    if self.main_window.map_or_else(
-                        || {
-                            log_status_change::<LogErrorStatus>(
-                                &mut self.status_manager,
-                                "Main window not available at close event".to_owned(),
-                            );
-                            false
-                        },
-                        |w| w != window,
-                    ) || self.safely_closing
-                    {
-                        // Allow force closing if the safe exit is taking too long for the user.
-                        // Also allows non-main windows to close immediately.
-                        iced::window::close(window)
-                    } else {
-                        // Start the safe exit process.
-                        self.safely_close(CloseType::Application)
-                    }
-                }
-
-                // Check for mouse movement to update whether tooltips display.
-                iced::Event::Mouse(iced::mouse::Event::CursorMoved { .. }) => {
-                    // Update the time of last cursor movement.
-                    self.last_mouse_move = Some(Instant::now());
-                    iced::Task::none()
-                }
-
-                // Silently ignore all other events.
-                _ => iced::Task::none(),
-            },
+            Message::UnhandledEvent(window, event) => self.update_unhandled_event(window, &event),
             Message::ForceExit => {
                 tracing::debug!("Force exit requested");
                 self.main_window.map_or_else(
@@ -756,8 +800,9 @@ impl AppState {
     #[tracing::instrument(skip(self))]
     pub fn subscription(&self) -> iced::Subscription<Message> {
         match &self.connection_state {
-            // Listen for close events and animation ticks when connecting/stalling.
-            ConnectionState::Stalling { .. } => subscriptions::stalling(),
+            // Listen for close events and animation ticks when stalling.
+            ConnectionState::ConnectStalling { .. }
+            | ConnectionState::SafelyLeaveStalling { .. } => subscriptions::stalling(),
 
             ConnectionState::Connected(ConnectedState {
                 endpoint,
@@ -787,6 +832,45 @@ impl AppState {
             .map(Instant::elapsed)
             .unwrap_or_default();
 
+        // If a confirmation dialog is active, display it instead of the main content.
+        if let ModalState::Confirmation {
+            title,
+            message,
+            confirm_action,
+        } = &self.modal_state
+        {
+            return widget::container(
+                widget::container(
+                    widget::column![
+                        widget::text(title.as_str()).size(18),
+                        horizontal_line(),
+                        widget::text(message.as_str()),
+                        widget::row![
+                            widget::button("Accept")
+                                .on_press(*confirm_action.clone())
+                                .style(widget::button::danger),
+                            timed_tooltip(
+                                widget::button("Back").on_press(Message::DismissModal),
+                                "Dismiss this confirmation dialog",
+                                &mouse_move_elapsed
+                            ),
+                        ]
+                        .spacing(24),
+                    ]
+                    .align_x(iced::Alignment::Center)
+                    .height(iced::Length::Shrink)
+                    .spacing(12)
+                    .padding(16),
+                )
+                .style(widget::container::bordered_box)
+                .center(iced::Length::Shrink)
+                .max_width(640)
+                .max_height(440),
+            )
+            .center(iced::Length::Fill)
+            .into();
+        }
+
         // Create a different top-level page based on the connection state.
         let page: Element<Message> = if self.status_manager.history_visible {
             let content = widget::column(
@@ -808,25 +892,22 @@ impl AppState {
                 // Display a prompt for the server address when disconnected.
                 ConnectionState::Disconnected => self.view_disconnected_page(&mouse_move_elapsed),
 
-                // Display a spinner while connecting/stalling.
-                &ConnectionState::Stalling { start, tick } => {
-                    if self.safely_closing {
-                        widget::column!(
-                            Self::view_connecting_page(start, tick, MAX_SHUTDOWN_WAIT),
-                            widget::text("Closing, please wait...").size(24),
-                            widget::text(
-                                "Pressing close a second time will cancel safety operations."
-                            )
-                            .size(16),
-                            widget::space().height(iced::Length::Fill),
-                        )
-                        .spacing(4)
-                        .align_x(iced::Alignment::Center)
-                        .into()
-                    } else {
-                        Self::view_connecting_page(start, tick, SERVER_CONNECTION_TIMEOUT)
-                    }
+                // Display a progress animation while connecting.
+                &ConnectionState::ConnectStalling { start, tick } => {
+                    Self::view_stalling_page(start, tick, SERVER_CONNECTION_TIMEOUT)
                 }
+
+                // Display a progress animation while stalling to leave server.
+                &ConnectionState::SafelyLeaveStalling { start, tick } => widget::column!(
+                    Self::view_stalling_page(start, tick, MAX_SHUTDOWN_WAIT),
+                    widget::text("Closing, please wait...").size(24),
+                    widget::text("Pressing close a second time will cancel safety operations.")
+                        .size(16),
+                    widget::space().height(iced::Length::Fill),
+                )
+                .spacing(4)
+                .align_x(iced::Alignment::Center)
+                .into(),
 
                 // Display the main application controls when connected.
                 ConnectionState::Connected(connected_state) => {
@@ -859,6 +940,7 @@ impl AppState {
         ]
         .spacing(6)
         .align_y(iced::Alignment::Center);
+
         widget::column!(page, horizontal_line(), status_bar)
             .spacing(4)
             .padding(6)
@@ -878,8 +960,11 @@ impl AppState {
             &self.options.server_address,
         );
 
-        let connect_button = widget::button("Connect")
-            .on_press_maybe((!self.modal).then_some(Message::AttemptServerConnection));
+        let connect_button = widget::button("Connect").on_press_maybe(
+            self.modal_state
+                .is_non_modal()
+                .then_some(Message::AttemptServerConnection),
+        );
         let mut internal_port_text = widget::text_input(
             "E.g., 12345. Leave empty to use any available port",
             &self.options.internal_port_text,
@@ -887,7 +972,7 @@ impl AppState {
         let mut port_forward_text =
             widget::text_input("E.g., 8888", &self.options.port_forwarding_text);
 
-        if !self.modal {
+        if self.modal_state.is_non_modal() {
             server_address = server_address
                 .on_input(Message::ServerAddressChanged)
                 .on_submit(Message::AttemptServerConnection);
@@ -979,8 +1064,8 @@ impl AppState {
         .into()
     }
 
-    /// Draw the connecting page with a spinner.
-    fn view_connecting_page<'a>(
+    /// Draw a stalling page with a progress animation.
+    fn view_stalling_page<'a>(
         start: Instant,
         tick: Instant,
         max_duration: Duration,
@@ -1024,10 +1109,11 @@ impl AppState {
         let mut leave_server_button = widget::button(widget::text("Leave").size(14));
 
         // Disable the inputs while a modal is open.
-        if !self.modal {
+        if self.modal_state.is_non_modal() {
             publish_button = publish_button.on_press(Message::PublishClicked);
             hash_text_input = hash_text_input.on_input(Message::HashInputChanged);
-            leave_server_button = leave_server_button.on_press(Message::SafelyLeaveServer);
+            leave_server_button =
+                leave_server_button.on_press(Message::ModalLeaveServerConfirmation);
 
             // Enable the download button if the hash is valid.
             if HASH_EXT_REGEX.is_match(&connected_state.hash_input) {
@@ -1315,7 +1401,7 @@ impl AppState {
         tracing::debug!("Trying connection to server {server_address}:{port}");
 
         // Set the state to `Stalling` before starting the connection attempt.
-        self.connection_state = ConnectionState::new_stalling();
+        self.connection_state = ConnectionState::new_connect_stalling();
 
         // Try to get the user's intent from the GUI options.
         let port_mapping = match self.options.port_mapping {
@@ -1355,8 +1441,9 @@ impl AppState {
     #[tracing::instrument(skip_all)]
     fn update_animation_tick(&mut self) -> iced::Task<Message> {
         match &mut self.connection_state {
-            // Update the spinner when connecting/stalling.
-            ConnectionState::Stalling { tick, .. } => *tick = Instant::now(),
+            // Update the progress tick when stalling.
+            ConnectionState::ConnectStalling { tick, .. }
+            | ConnectionState::SafelyLeaveStalling { tick, .. } => *tick = Instant::now(),
 
             // Update the progress of transfers when connected.
             ConnectionState::Connected(ConnectedState {
@@ -1441,10 +1528,7 @@ impl AppState {
                 }
             }
             Err(e) => {
-                log_status_change::<LogErrorStatus>(
-                    &mut self.status_manager,
-                    format!("Error connecting: {e}"),
-                );
+                log_status_change::<LogErrorStatus>(&mut self.status_manager, format!("{e}"));
                 self.connection_state = ConnectionState::Disconnected;
             }
         }
@@ -1500,7 +1584,7 @@ impl AppState {
         publish: CreateOrExistingPublish,
     ) -> iced::Task<Message> {
         tracing::debug!("Publish dialog closed");
-        self.modal = false;
+        self.modal_state = ModalState::None;
 
         // Ensure the client is connected to a server.
         let ConnectionState::Connected(ConnectedState {
@@ -1732,65 +1816,68 @@ impl AppState {
         nonce: Nonce,
         result: PublishRequestResult,
     ) -> iced::Task<Message> {
-        if let ConnectionState::Connected(ConnectedState { publishes, .. }) =
+        let ConnectionState::Connected(ConnectedState { publishes, .. }) =
             &mut self.connection_state
-        {
-            match (result, binary_find_nonce_mut(publishes, nonce)) {
-                (
-                    PublishRequestResult::Success(IncomingPublishSession {
-                        server_streams,
-                        hash,
-                        file_size,
-                    }),
-                    Some((_, publish)),
-                ) => {
-                    tracing::info!("Publish request succeeded for {hash:#}");
-                    publish.state = PublishState::Publishing(Publish {
-                        server_streams,
-                        hash,
-                        hash_hex: hash.to_string(),
-                        file_size,
-                        human_readable_size: humanize_bytes(file_size),
-                    });
-                }
-                (PublishRequestResult::Failure(e), Some((_, publish))) => {
-                    tracing::error!("Publish request failed: {e}");
+        else {
+            tracing::warn!("Publish request resulted while not connected");
+            return iced::Task::none();
+        };
 
-                    // Check if this error indicates we lost connection to the server.
-                    let should_disconnect = match e.as_ref() {
-                        publish::PublishFileError::Publish(publish_error) => match publish_error {
-                            crate::core::PublishError::Connection(_) => true,
-                            crate::core::PublishError::SendRequest(write_error) => {
-                                should_disconnect_on_write_error(write_error)
-                            }
-                        },
-                        publish::PublishFileError::SocketRead(read_error) => {
-                            should_disconnect_on_read_ip_port_error(read_error)
+        match (result, binary_find_nonce_mut(publishes, nonce)) {
+            (
+                PublishRequestResult::Success(IncomingPublishSession {
+                    server_streams,
+                    hash,
+                    file_size,
+                }),
+                Some((_, publish)),
+            ) => {
+                tracing::info!("Publish request succeeded for {hash:#}");
+                publish.state = PublishState::Publishing(Publish {
+                    server_streams,
+                    hash,
+                    hash_hex: hash.to_string(),
+                    file_size,
+                    human_readable_size: humanize_bytes(file_size),
+                });
+            }
+            (PublishRequestResult::Failure(e), Some((_, publish))) => {
+                tracing::error!("Publish request failed: {e}");
+
+                // Check if this error indicates we lost connection to the server.
+                let should_disconnect = match e.as_ref() {
+                    publish::PublishFileError::Publish(publish_error) => match publish_error {
+                        crate::core::PublishError::Connection(_) => true,
+                        crate::core::PublishError::SendRequest(write_error) => {
+                            should_disconnect_on_write_error(write_error)
                         }
-                        // File access errors don't indicate lost connection.
-                        publish::PublishFileError::FileAccess(_) => false,
-                    } && !self.safely_closing;
-
-                    if should_disconnect {
-                        log_status_change::<LogErrorStatus>(
-                            &mut self.status_manager,
-                            format!("Lost connection to server: {e}"),
-                        );
+                    },
+                    publish::PublishFileError::SocketRead(read_error) => {
+                        should_disconnect_on_read_ip_port_error(read_error)
                     }
+                    // File access errors don't indicate lost connection.
+                    publish::PublishFileError::FileAccess(_) => false,
+                };
 
-                    publish.state = PublishState::Failure(e, publish.state.hash_and_file_size());
+                if should_disconnect {
+                    log_status_change::<LogErrorStatus>(
+                        &mut self.status_manager,
+                        format!("Lost connection to server: {e}"),
+                    );
+                }
 
-                    if should_disconnect {
-                        return iced::Task::done(Message::SafelyLeaveServer);
-                    }
+                publish.state = PublishState::Failure(e, publish.state.hash_and_file_size());
+
+                if should_disconnect {
+                    return iced::Task::done(Message::SafelyLeaveServer);
                 }
-                (PublishRequestResult::Cancelled, Some((_, publish))) => {
-                    tracing::debug!("Publish request cancelled");
-                    publish.state = PublishState::Cancelled(publish.state.hash_and_file_size());
-                }
-                (_, None) => {
-                    tracing::warn!("Publish request resulted with an unknown nonce");
-                }
+            }
+            (PublishRequestResult::Cancelled, Some((_, publish))) => {
+                tracing::debug!("Publish request cancelled");
+                publish.state = PublishState::Cancelled(publish.state.hash_and_file_size());
+            }
+            (_, None) => {
+                tracing::warn!("Publish request resulted with an unknown nonce");
             }
         }
         iced::Task::none()
@@ -1864,7 +1951,7 @@ impl AppState {
                     ReadSubscribingPeerError::SelfAddress => false,
                 };
 
-                if should_disconnect && !self.safely_closing {
+                if should_disconnect {
                     log_status_change::<LogErrorStatus>(
                         &mut self.status_manager,
                         format!("Lost connection to server: {e}"),
@@ -2010,8 +2097,8 @@ impl AppState {
         // Clear the status message before starting the subscribe attempt.
         self.clear_status_message();
 
-        // Let state know that a modal dialog is open.
-        self.modal = true;
+        // Let state know that a modal file dialog is open.
+        self.modal_state = ModalState::ExternalDialog;
 
         let (hash_hex, extension) =
             if let ConnectionState::Connected(ConnectedState { hash_input, .. }) =
@@ -2053,7 +2140,7 @@ impl AppState {
         path: Option<PathBuf>,
         hash_hex: &str,
     ) -> iced::Task<Message> {
-        self.modal = false;
+        self.modal_state = ModalState::None;
 
         // Ensure a path was chosen, otherwise safely cancel.
         let Some(path) = path else {
@@ -2291,7 +2378,12 @@ impl AppState {
                     }
                 };
 
-                if should_disconnect && !self.safely_closing {
+                if should_disconnect
+                    && !matches!(
+                        &self.connection_state,
+                        ConnectionState::SafelyLeaveStalling { .. }
+                    )
+                {
                     log_status_change::<LogErrorStatus>(
                         &mut self.status_manager,
                         format!("Lost connection to server: {e}"),
@@ -2677,6 +2769,7 @@ impl AppState {
         nonce: Nonce,
         transfer_type: FileYeetCommandType,
     ) -> iced::Task<Message> {
+        self.modal_state = ModalState::None;
         let ConnectionState::Connected(ConnectedState {
             peers,
             downloads,
@@ -3600,9 +3693,13 @@ impl AppState {
         nonce: Nonce,
         transfer_type: FileYeetCommandType,
     ) -> iced::Task<Message> {
+        #[inline]
         fn remove_transfer<T: Transfer>(transfers: &mut Vec<T>, nonce: Nonce) {
             if let Some(i) = transfers.iter().position(|t| t.base().nonce == nonce) {
+                tracing::debug!("Removing transfer {:#}", transfers[i].base().hash);
                 transfers.remove(i);
+            } else {
+                tracing::warn!("No transfer found to remove");
             }
         }
 
@@ -3610,7 +3707,6 @@ impl AppState {
             downloads, uploads, ..
         }) = &mut self.connection_state
         {
-            tracing::debug!("Removing transfer");
             match transfer_type {
                 FileYeetCommandType::Sub => remove_transfer(downloads, nonce),
                 FileYeetCommandType::Pub => remove_transfer(uploads, nonce),
@@ -3621,14 +3717,90 @@ impl AppState {
         iced::Task::none()
     }
 
+    #[tracing::instrument(skip(self, event))]
+    fn update_unhandled_event(
+        &mut self,
+        window: iced::window::Id,
+        event: &iced::Event,
+    ) -> iced::Task<Message> {
+        match event {
+            // Check for a close window request to allow safe closing.
+            iced::Event::Window(window::Event::CloseRequested) => {
+                tracing::debug!("`CloseRequested` event received");
+
+                if self.main_window.map_or_else(
+                    || {
+                        log_status_change::<LogErrorStatus>(
+                            &mut self.status_manager,
+                            "Main window not available at close event".to_owned(),
+                        );
+                        false
+                    },
+                    |w| w != window,
+                ) || matches!(
+                    self.connection_state,
+                    ConnectionState::SafelyLeaveStalling { .. }
+                ) {
+                    // Allow force closing if the safe exit is taking too long for the user.
+                    // Also allows non-main windows to close immediately.
+                    iced::window::close(window)
+                } else {
+                    // If the main window is requesting to close during a managed modal state, just close the modal dialog instead.
+                    if let ModalState::Confirmation { title, .. } = &self.modal_state {
+                        tracing::debug!("Close requested while confirmation `{title}` is open, dismissing modal");
+                        self.modal_state = ModalState::None;
+                        return iced::Task::none();
+                    }
+
+                    // Start the safe exit process.
+                    self.safely_close(CloseType::Application)
+                }
+            }
+
+            // Check for mouse movement to update whether tooltips display.
+            iced::Event::Mouse(iced::mouse::Event::CursorMoved { .. }) => {
+                // Update the time of last cursor movement.
+                self.last_mouse_move = Some(Instant::now());
+                iced::Task::none()
+            }
+
+            // Check if the escape key was pressed to close modals.
+            iced::Event::Keyboard(iced::keyboard::Event::KeyReleased {
+                key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+                ..
+            }) => {
+                // TODO: If multiple windows are ever open, will need to verify that the escape
+                //       key is active to the main window before closing the modal.
+                if let ModalState::Confirmation { title, .. } = &self.modal_state {
+                    // If an internally managed modal is open, close it.
+                    tracing::debug!("Escape key pressed, dismissing confirmation modal '{title}'");
+                    self.modal_state = ModalState::None;
+                    iced::Task::none()
+                } else {
+                    // Otherwise, ignore the escape key.
+                    iced::Task::none()
+                }
+            }
+
+            // Silently ignore all other events.
+            _ => iced::Task::none(),
+        }
+    }
+
     /// Try to safely close.
     #[tracing::instrument(skip(self))]
     fn safely_close(&mut self, close_type: CloseType) -> iced::Task<Message> {
-        if self.safely_closing {
+        if matches!(
+            &self.connection_state,
+            ConnectionState::SafelyLeaveStalling { .. }
+        ) {
             tracing::warn!("Already safely closing, ignoring additional close request");
             return iced::Task::none();
         }
-        self.safely_closing = true;
+        let mut connection_state = std::mem::replace(
+            &mut self.connection_state,
+            ConnectionState::new_safely_leave_stalling(),
+        );
         tracing::debug!("Safely leaving server");
 
         // If connected, close the connection and save the current state.
@@ -3637,7 +3809,7 @@ impl AppState {
             downloads,
             publishes,
             ..
-        }) = &mut self.connection_state
+        }) = &mut connection_state
         {
             self.options.last_publishes = publishes
                 .drain(..)
@@ -3724,9 +3896,6 @@ impl AppState {
         }
 
         if let Some(port_mapping) = self.port_mapping.take() {
-            // Set the state to `Stalling` before waiting for the safe close to complete.
-            self.connection_state = ConnectionState::new_stalling();
-
             let port_mapping_timeout = Duration::from_millis(500);
             iced::Task::perform(
                 tokio::time::timeout(port_mapping_timeout, async move {
@@ -3801,8 +3970,8 @@ fn sort_nonce<T: NonceItem>(items: &mut [T]) {
 }
 
 /// Helper for creating a horizontal line.
-fn horizontal_line<'c>() -> iced::Element<'c, Message> {
-    widget::rule::horizontal(3).into()
+fn horizontal_line() -> widget::Rule<'static> {
+    widget::rule::horizontal(3)
 }
 
 /// A trait to log status messages at different levels.

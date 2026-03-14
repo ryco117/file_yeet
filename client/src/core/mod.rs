@@ -93,10 +93,10 @@ pub enum PrepareConnectionError {
     #[error("Failed to create local endpoint: {0}")]
     EndpointCreation(std::io::Error),
 
-    #[error("Failed to connect to server: {0}")]
+    #[error("{0}")]
     ConnectToServer(#[from] ConnectToServerError),
 
-    #[error("Failed to determine our local address: {0}")]
+    #[error("{0}")]
     LocalAddress(#[from] ProbeLocalAddressError),
 
     #[error("Invalid gateway address: {0}")]
@@ -108,7 +108,7 @@ pub enum PrepareConnectionError {
     #[error("Socket ping request failed: {0}")]
     SocketPing(#[from] SocketPingError),
 
-    #[error("Port override request failed: {0}")]
+    #[error("{0}")]
     PortOverride(#[from] PortOverrideError),
 }
 

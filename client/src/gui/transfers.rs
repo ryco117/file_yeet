@@ -484,8 +484,17 @@ impl Transfer for DownloadTransfer {
                         ),
                         widget::rule::horizontal(2),
                         timed_tooltip(
+                            widget::button(widget::text("Pause Transfer").size(12))
+                                .on_press(Message::PauseDownload(self.base.nonce))
+                                .style(button_style)
+                                .width(iced::Length::Fill),
+                            "Pause the download, it can be safely resumed",
+                            mouse_move_elapsed,
+                        ),
+                        widget::rule::horizontal(2),
+                        timed_tooltip(
                             widget::button(widget::text("Cancel Transfer").size(12))
-                                .on_press(Message::CancelTransfer(
+                                .on_press(Message::ModalCancelTransferConfirmation(
                                     self.base.nonce,
                                     FileYeetCommandType::Sub
                                 ))
@@ -519,11 +528,6 @@ impl Transfer for DownloadTransfer {
                 widget::row!(
                     "Transferring...",
                     widget::progress_bar(0.0..=1., *p).girth(24),
-                    tooltip_button(
-                        "Pause",
-                        Message::PauseDownload(self.base.nonce),
-                        "Pause the download, it can be safely resumed",
-                    ),
                     context_menu,
                 )
                 .spacing(6)
@@ -541,7 +545,10 @@ impl Transfer for DownloadTransfer {
                 ),
                 tooltip_button(
                     "Cancel",
-                    Message::CancelTransfer(self.base.nonce, FileYeetCommandType::Sub),
+                    Message::ModalCancelTransferConfirmation(
+                        self.base.nonce,
+                        FileYeetCommandType::Sub
+                    ),
                     "Cancel the download, abandoning progress",
                 ),
             )
@@ -555,7 +562,10 @@ impl Transfer for DownloadTransfer {
                 widget::progress_bar(0.0..=1., *progress_animation).girth(24),
                 tooltip_button(
                     "Cancel",
-                    Message::CancelTransfer(self.base.nonce, FileYeetCommandType::Sub),
+                    Message::ModalCancelTransferConfirmation(
+                        self.base.nonce,
+                        FileYeetCommandType::Sub
+                    ),
                     "Cancel the download, abandoning progress",
                 ),
             )
@@ -729,7 +739,10 @@ impl Transfer for UploadTransfer {
                     widget::progress_bar(0.0..=1., *p).girth(24),
                     tooltip_button(
                         "Cancel",
-                        Message::CancelTransfer(self.base.nonce, FileYeetCommandType::Pub),
+                        Message::ModalCancelTransferConfirmation(
+                            self.base.nonce,
+                            FileYeetCommandType::Pub
+                        ),
                         "Cancel the upload. The peer may attempt to recover the transfer later",
                     ),
                 )

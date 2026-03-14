@@ -84,7 +84,7 @@ struct Cli {
     #[arg(long, requires = "tls_cert")]
     tls_key: Option<PathBuf>,
 
-    /// Allow using a self-signed certificate. Insecure and disabled by default. Conflicts with providing a TLS certificate file.
+    /// Allow using a self-signed certificate. Insecure and `false` by default. Conflicts with providing a TLS certificate file.
     #[arg(long, conflicts_with = "tls_cert")]
     self_sign_certificate: bool,
 }
@@ -109,9 +109,10 @@ async fn main() {
     // Ensure the user understands the risks of not providing TLS certificate and key files.
     if args.tls_cert.is_none() {
         if args.self_sign_certificate {
-            tracing::warn!("No TLS certificate provided, using a self-signed certificate. This means a man-in-the-middle attack is possible and would allow an attack to read the file hashes a target is publishing or subscribing to.");
+            tracing::warn!("No TLS certificate provided, using a self-signed certificate. This means a man-in-the-middle attack is possible and would allow an attack to read the file hashes a target is publishing or subscribing to, as well as modify any requests and responses.");
         } else {
             tracing::warn!("No TLS certificate provided, and self-signed certificates are not enabled. This means the server will not be able to accept any connections. To fix this, provide a TLS certificate and key with --tls-cert and --tls-key, or enable self-signed certificates with --self-sign-certificate.");
+            tracing::warn!("Aborting server startup.");
             return;
         }
     }
@@ -495,11 +496,7 @@ async fn handle_publish(
     tracing::debug!("Handling publish request from {peer_address}");
     /// Helper to remove a publisher from the list of peers sharing a file hash.
     #[tracing::instrument(skip(publishers))]
-    async fn try_remove_publisher(
-        session_nonce: Nonce,
-        hash: HashBytes,
-        publishers: PublishersRef,
-    ) {
+    async fn remove_publisher(session_nonce: Nonce, hash: HashBytes, publishers: PublishersRef) {
         // Remove the client from the list of peers publishing this hash.
         let mut publishers = publishers.write().await;
         if let std::collections::hash_map::Entry::Occupied(mut entry) = publishers.entry(hash) {
@@ -602,9 +599,9 @@ async fn handle_publish(
         }
 
         // Remove any reference there may be to this publish task.
-        try_remove_publisher(session_nonce, hash, publishers).await;
+        remove_publisher(session_nonce, hash, publishers).await;
 
-        tracing::info!("Finishing publish task for client {hash:#}",);
+        tracing::info!("Finishing publish task for client {peer_address} {hash:#}");
     });
 
     Ok(())

@@ -39,4 +39,5 @@ USER file_yeet
 # Expose the port that the server will be running on
 EXPOSE 7828
 
-CMD ["file_yeet_server", "--bind-ip=0.0.0.0", "--bind-port=7828"]
+# TODO: Allow user to choose either the self-signed certificate arg or specify the path to the certificate and key files
+CMD ["file_yeet_server", "--bind-ip=0.0.0.0", "--bind-port=7828", "--self-sign-certificate"]

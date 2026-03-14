@@ -10,7 +10,7 @@ Connections use the [quinn](https://github.com/quinn-rs/quinn) library to commun
 ### Server
 ```text
 $ cargo r --bin file_yeet_server -- -h
-The command line arguments for the server
+The command line interface for `file_yeet_server`
 
 Usage: file_yeet_server [OPTIONS]
 
@@ -23,6 +23,12 @@ Options:
           Optional limit to the number of connections the server will accept. Must be a positive integer less than 2^32
   -v, --verbose
           Enable verbose logging
+      --tls-cert <TLS_CERT>
+          Path to a PEM-encoded TLS certificate file. Requires --tls-key
+      --tls-key <TLS_KEY>
+          Path to a PEM-encoded TLS private key file. Requires --tls-cert
+      --self-sign-certificate
+          Allow using a self-signed certificate. Insecure and `false` by default. Conflicts with providing a TLS certificate file
   -h, --help
           Print help
   -V, --version
@@ -44,7 +50,7 @@ docker build -t file_yeet_server:local .
 $ cargo r --bin file_yeet_client -- -h
 The command line interface for `file_yeet_client`
 
-Usage: file_yeet_client.exe [OPTIONS] [COMMAND]
+Usage: file_yeet_client [OPTIONS] [COMMAND]
 
 Commands:
   pub   Publish a file to the server. Peers will download from this client directly
@@ -68,6 +74,8 @@ Options:
           Enable verbose debug logging
   -l, --log-to-stdout
           Log to stdout instead of trying to log to a file
+      --skip-server-cert-validation
+          Skip server certificate validation. Generally not recommended, but may be useful for testing or homebrew servers
   -h, --help
           Print help
   -V, --version

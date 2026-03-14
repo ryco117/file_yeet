@@ -19,7 +19,7 @@ pub const HASH_BYTE_COUNT: usize = 256 / 8;
 
 /// The maximum number of milliseconds of inactivity before a QUIC connection is closed.
 /// Same for both the server and the client.
-pub const QUIC_TIMEOUT_MILLIS: u32 = 120_000;
+pub const QUIC_TIMEOUT_MILLIS: u32 = 240_000;
 
 /// Code sent on a graceful disconnect.
 pub const GOODBYE_CODE: quinn::VarInt = quinn::VarInt::from_u32(0);
@@ -50,6 +50,9 @@ impl std::fmt::Debug for HashBytes {
             .expect("Hex encoding of hash failed");
 
         if f.alternate() {
+            // Alternate flag is often considered the "pretty-print" flag. We print the hash in the following format:
+            // `abc123…def456`, where the first 3 bytes and last 3 bytes of the hash are shown, and the middle is truncated with an ellipsis.
+
             // Write the first 3 bytes of the hash as hex.
             const TRUNCATED_CHAR_COUNT: usize = 6; // 3 bytes * 2 chars/byte.
             write!(f, "{}", &hex[..TRUNCATED_CHAR_COUNT])?;
