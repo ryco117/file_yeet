@@ -8,8 +8,8 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     core::FileAccessError,
     gui::{
-        generate_nonce, text_horizontal_scrollbar, timed_tooltip, IncomingPublishSession, Message,
-        Nonce, NonceItem, ERROR_RED_COLOR,
+        fonts, generate_nonce, strings, text_horizontal_scrollbar, timed_tooltip,
+        IncomingPublishSession, Message, Nonce, NonceItem, ERROR_RED_COLOR,
     },
     settings::SavedPublish,
 };
@@ -139,7 +139,7 @@ pub fn draw_publishes<'a>(
                         file_path_scrollable,
                     ),
                     tooltip_button(
-                        "Cancel",
+                        strings::CANCEL,
                         Message::CancelPublish(pi.nonce),
                         "Cancel the hashing process. The publish is not removed",
                     ),
@@ -160,7 +160,7 @@ pub fn draw_publishes<'a>(
                         widget::button(
                             widget::text("📋")
                                 .size(14)
-                                .font(iced::Font::with_name("Noto Emoji"))
+                                .font(iced::Font::with_name(fonts::EMOJI_NAME))
                         )
                         .on_press(Message::CopyHash(pi.nonce)),
                         "Copy hash to clipboard",
@@ -172,7 +172,7 @@ pub fn draw_publishes<'a>(
                         "Rehash the file, necessary if the file has changed",
                     ),
                     tooltip_button(
-                        "Cancel",
+                        strings::CANCEL,
                         Message::CancelPublish(pi.nonce),
                         "Stop accepting new uploads for this file. The hash is not forgotten",
                     ),
@@ -188,30 +188,33 @@ pub fn draw_publishes<'a>(
                     )
                     .width(iced::Length::Fill),
                     tooltip_button(
-                        "Retry",
+                        strings::RETRY,
                         Message::RetryPublish(pi.nonce),
-                        "Attempt to publish again",
+                        strings::RETRY_PUBLISH_TOOLTIP,
                     ),
                     tooltip_button(
-                        "Remove",
+                        strings::REMOVE,
                         Message::RemovePublish(pi.nonce),
-                        "Remove this item, forgetting the hash. The file is untouched",
+                        strings::REMOVE_PUBLISH_TOOLTIP,
                     ),
                 ),
 
                 // Display a publish that was intentionally cancelled.
                 PublishState::Cancelled(_) => widget::row!(
-                    widget::column!(widget::text("Cancelled").size(12), file_path_scrollable)
-                        .width(iced::Length::Fill),
+                    widget::column!(
+                        widget::text(strings::CANCELLED).size(12),
+                        file_path_scrollable
+                    )
+                    .width(iced::Length::Fill),
                     tooltip_button(
-                        "Retry",
+                        strings::RETRY,
                         Message::RetryPublish(pi.nonce),
-                        "Attempt to publish again",
+                        strings::RETRY_PUBLISH_TOOLTIP,
                     ),
                     tooltip_button(
-                        "Remove",
+                        strings::REMOVE,
                         Message::RemovePublish(pi.nonce),
-                        "Remove this item, forgetting the hash. The file is untouched",
+                        strings::REMOVE_PUBLISH_TOOLTIP,
                     ),
                 ),
             }

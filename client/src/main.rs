@@ -115,7 +115,7 @@ fn main() {
         .title(core::APP_TITLE)
         .subscription(gui::AppState::subscription)
         .theme(gui::AppState::theme)
-        .font(gui::EMOJI_FONT)
+        .font(gui::fonts::EMOJI)
         .window(iced::window::Settings {
             min_size: Some(iced::Size::new(850., 300.)),
             exit_on_close_request: false,

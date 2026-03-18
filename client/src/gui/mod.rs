@@ -33,6 +33,7 @@ use crate::{
         SERVER_CONNECTION_TIMEOUT,
     },
     gui::{
+        confirmation::ConfirmationDialog,
         publish::{draw_publishes, Publish, PublishItem, PublishRequestResult, PublishState},
         transfers::{
             update_download_result, update_upload_result, DownloadMultiPeer, DownloadPartRange,
@@ -47,7 +48,9 @@ use crate::{
     },
 };
 
+mod confirmation;
 mod debug_state;
+pub mod fonts;
 mod publish;
 mod strings;
 mod subscriptions;
@@ -77,9 +80,6 @@ const ERROR_RED_COLOR: iced::Color = iced::Color::from_rgb(1., 0.35, 0.45);
 
 /// The yellow used to display warnings to the user.
 const WARN_YELLOW_COLOR: iced::Color = iced::Color::from_rgb(1., 0.85, 0.35);
-
-/// Font capable of rendering emojis.
-pub static EMOJI_FONT: &[u8] = include_bytes!("../../NotoEmoji-Regular.ttf");
 
 /// The delay of mouse inactivity before showing tooltips.
 const TOOLTIP_WAIT_DURATION: Duration = Duration::from_millis(500);
@@ -291,11 +291,7 @@ pub enum ModalState {
     #[default]
     None,
     ExternalDialog,
-    Confirmation {
-        title: String,
-        message: String,
-        confirm_action: Box<Message>,
-    },
+    Confirmation(ConfirmationDialog),
 }
 impl ModalState {
     /// Returns true if and only if no modal dialog is currently open, allowing normal interactions.
@@ -363,12 +359,11 @@ pub enum Message {
     /// Copy the server address to the clipboard.
     CopyServer,
 
+    /// Show a modal confirmation dialog with the given state.
+    ModalConfirmation(ConfirmationDialog),
+
     /// Leave the server and disconnect.
     SafelyLeaveServer,
-
-    /// Show a confirmation dialog before leaving the server.
-    //  TODO: Replace with a generic confirmation message.
-    ModalLeaveServerConfirmation,
 
     /// Complete the server disconnection process without further asynchronous actions.
     LeftServer,
@@ -443,10 +438,6 @@ pub enum Message {
 
     /// Remove a publish item.
     RemovePublish(Nonce),
-
-    /// Show a confirmation dialog before cancelling a transfer.
-    //  TODO: Replace with a generic confirmation message.
-    ModalCancelTransferConfirmation(Nonce, FileYeetCommandType),
 
     /// Dismiss the currently open confirmation modal without taking any action.
     DismissModal,
@@ -622,15 +613,21 @@ impl AppState {
                 tracing::debug!("Copying server address to clipboard");
                 iced::clipboard::write(self.options.server_address.clone())
             }
-            Message::SafelyLeaveServer => self.safely_close(CloseType::Connections),
-            Message::ModalLeaveServerConfirmation => {
-                self.modal_state = ModalState::Confirmation {
-                    title: "Leave Server?".to_owned(),
-                    message: "Are you sure you want to leave the server? All active transfers will be cancelled. Partial download progress will be saved, if any.".to_owned(),
-                    confirm_action: Box::new(Message::SafelyLeaveServer),
-                };
+            Message::ModalConfirmation(dialog) => {
+                tracing::debug!("Showing confirmation dialog '{}'", dialog.title);
+
+                // Warn if a modal dialog was opened while already modal. This should never happen.
+                if !self.modal_state.is_non_modal() {
+                    log_status_change::<LogErrorStatus>(
+                        &mut self.status_manager,
+                        "Opening a confirmation dialog while another modal was open".to_owned(),
+                    );
+                }
+
+                self.modal_state = ModalState::Confirmation(dialog);
                 iced::Task::none()
             }
+            Message::SafelyLeaveServer => self.safely_close(CloseType::Connections),
             Message::LeftServer => {
                 tracing::debug!("Left server, now disconnected");
                 self.connection_state = ConnectionState::Disconnected;
@@ -719,26 +716,12 @@ impl AppState {
             Message::CancelPublish(nonce) => self.update_cancel_publish(nonce),
             Message::RetryPublish(nonce) => self.update_retry_publish(nonce),
             Message::RemovePublish(nonce) => self.update_remove_publish(nonce),
-            Message::ModalCancelTransferConfirmation(nonce, transfer_type) => {
-                let (title, message) = match transfer_type {
-                    FileYeetCommandType::Sub => (
-                        "Cancel Download?".to_owned(),
-                        "Are you sure you want to cancel this download? All progress will be lost."
-                            .to_owned(),
-                    ),
-                    FileYeetCommandType::Pub => (
-                        "Cancel Upload?".to_owned(),
-                        "Are you sure you want to cancel this upload? The peer may attempt to recover the transfer later if the file is being published.".to_owned(),
-                    ),
-                };
-                self.modal_state = ModalState::Confirmation {
-                    title,
-                    message,
-                    confirm_action: Box::new(Message::CancelTransfer(nonce, transfer_type)),
-                };
-                iced::Task::none()
-            }
             Message::DismissModal => {
+                if self.modal_state.is_non_modal() {
+                    tracing::warn!("Attempted to dismiss modal dialog when no modal was open");
+                } else {
+                    tracing::debug!("Dismissing modal dialog");
+                }
                 self.modal_state = ModalState::None;
                 iced::Task::none()
             }
@@ -833,20 +816,20 @@ impl AppState {
             .unwrap_or_default();
 
         // If a confirmation dialog is active, display it instead of the main content.
-        if let ModalState::Confirmation {
+        if let ModalState::Confirmation(ConfirmationDialog {
             title,
             message,
             confirm_action,
-        } = &self.modal_state
+        }) = &self.modal_state
         {
             return widget::container(
                 widget::container(
                     widget::column![
-                        widget::text(title.as_str()).size(18),
+                        widget::text(title).size(18),
                         horizontal_line(),
-                        widget::text(message.as_str()),
+                        widget::text(message),
                         widget::row![
-                            widget::button("Accept")
+                            widget::button(strings::ACCEPT)
                                 .on_press(*confirm_action.clone())
                                 .style(widget::button::danger),
                             timed_tooltip(
@@ -1087,13 +1070,18 @@ impl AppState {
     fn draw_transfers<'a, I, T: Transfer + 'a>(
         transfers: I,
         mouse_move_elapsed: &Duration,
+        is_non_modal: bool,
     ) -> iced::Element<'a, Message>
     where
         I: IntoIterator<Item = &'a T>,
     {
-        widget::column(transfers.into_iter().map(|t| t.draw(mouse_move_elapsed)))
-            .spacing(6)
-            .into()
+        widget::column(
+            transfers
+                .into_iter()
+                .map(|t| t.draw(mouse_move_elapsed, is_non_modal)),
+        )
+        .spacing(6)
+        .into()
     }
 
     /// Draw the main application controls when connected to a server.
@@ -1112,8 +1100,8 @@ impl AppState {
         if self.modal_state.is_non_modal() {
             publish_button = publish_button.on_press(Message::PublishClicked);
             hash_text_input = hash_text_input.on_input(Message::HashInputChanged);
-            leave_server_button =
-                leave_server_button.on_press(Message::ModalLeaveServerConfirmation);
+            leave_server_button = leave_server_button
+                .on_press(Message::ModalConfirmation(confirmation::leave_server()));
 
             // Enable the download button if the hash is valid.
             if HASH_EXT_REGEX.is_match(&connected_state.hash_input) {
@@ -1148,7 +1136,7 @@ impl AppState {
                 widget::button(
                     widget::text("📋")
                         .size(14)
-                        .font(iced::Font::with_name("Noto Emoji"))
+                        .font(iced::Font::with_name(fonts::EMOJI_NAME))
                 )
                 .on_press(Message::CopyServer),
                 "Copy server address to clipboard",
@@ -1205,15 +1193,21 @@ impl AppState {
                     (false, true) => draw_publishes(&connected_state.publishes, mouse_move_elapsed),
 
                     // Only publishes are empty, show uploads.
-                    (true, false) => {
-                        Self::draw_transfers(&connected_state.uploads, mouse_move_elapsed)
-                    }
+                    (true, false) => Self::draw_transfers(
+                        &connected_state.uploads,
+                        mouse_move_elapsed,
+                        self.modal_state.is_non_modal(),
+                    ),
 
                     // Show both publishes and uploads. Separate them with a line.
                     (false, false) => widget::column!(
                         draw_publishes(&connected_state.publishes, mouse_move_elapsed),
                         horizontal_line(),
-                        Self::draw_transfers(&connected_state.uploads, mouse_move_elapsed),
+                        Self::draw_transfers(
+                            &connected_state.uploads,
+                            mouse_move_elapsed,
+                            self.modal_state.is_non_modal()
+                        ),
                     )
                     .spacing(12)
                     .into(),
@@ -1221,9 +1215,11 @@ impl AppState {
             }
 
             // Create a list of download attempts.
-            TransferView::Downloads => {
-                Self::draw_transfers(&connected_state.downloads, mouse_move_elapsed)
-            }
+            TransferView::Downloads => Self::draw_transfers(
+                &connected_state.downloads,
+                mouse_move_elapsed,
+                self.modal_state.is_non_modal(),
+            ),
         };
 
         widget::container(
@@ -1619,7 +1615,7 @@ impl AppState {
                 publishes.push(publish);
 
                 if cfg!(debug_assertions) && !is_nonce_sorted(publishes) {
-                    tracing::error!("Publishes not sorted by nonce after adding new publish");
+                    tracing::error!("{}", strings::PUBLISHES_NOT_SORTED_BY_NONCE);
                     sort_nonce(publishes);
                 }
 
@@ -1742,7 +1738,7 @@ impl AppState {
                 publishes.push(publish);
 
                 if cfg!(debug_assertions) && !is_nonce_sorted(publishes) {
-                    tracing::error!("Publishes not sorted by nonce after adding new publish");
+                    tracing::error!("{}", strings::PUBLISHES_NOT_SORTED_BY_NONCE);
                     sort_nonce(publishes);
                 }
 
@@ -1764,9 +1760,10 @@ impl AppState {
                 if let Some((_, publish)) = publish {
                     // Check existing publishes for duplicate hashes.
                     // `check_duplicate_hash` will log a warning if a duplicate is found.
-                    publishes
-                        .iter()
-                        .any(|pi| check_duplicate_hash(pi, &hash, &mut self.status_manager));
+                    publishes.iter().any(|pi| {
+                        pi.nonce != nonce
+                            && check_duplicate_hash(pi, &hash, &mut self.status_manager)
+                    });
 
                     (nonce, &publish.cancellation_token, &publish.path)
                 } else {
@@ -1862,7 +1859,7 @@ impl AppState {
                 if should_disconnect {
                     log_status_change::<LogErrorStatus>(
                         &mut self.status_manager,
-                        format!("Lost connection to server: {e}"),
+                        format!("{}: {e}", strings::LOST_CONNECTION_TO_SERVER),
                     );
                 }
 
@@ -1919,16 +1916,16 @@ impl AppState {
                 let data = if let Some(c) = ConnectionsManager::instance().get_connection_sync(peer)
                 {
                     if cfg!(debug_assertions) {
-                        tracing::debug!("Reusing connection to peer {peer}");
+                        tracing::debug!("{}: {peer}", strings::REUSE_EXISTING_PEER_DEBUG);
                     } else {
-                        tracing::debug!("Reusing connection to peer");
+                        tracing::debug!("{}", strings::REUSE_EXISTING_PEER_DEBUG);
                     }
                     PeerConnectionOrTarget::Connection(c)
                 } else {
                     if cfg!(debug_assertions) {
-                        tracing::debug!("Creating new connection to peer {peer}");
+                        tracing::debug!("{}: {peer}", strings::CREATING_NEW_CONNECTION_DEBUG);
                     } else {
-                        tracing::debug!("Creating new connection to peer");
+                        tracing::debug!("{}", strings::CREATING_NEW_CONNECTION_DEBUG);
                     }
                     PeerConnectionOrTarget::Target(endpoint.clone(), peer)
                 };
@@ -1954,7 +1951,7 @@ impl AppState {
                 if should_disconnect {
                     log_status_change::<LogErrorStatus>(
                         &mut self.status_manager,
-                        format!("Lost connection to server: {e}"),
+                        format!("{}: {e}", strings::LOST_CONNECTION_TO_SERVER),
                     );
                     iced::Task::done(Message::SafelyLeaveServer)
                 } else {
@@ -2046,7 +2043,8 @@ impl AppState {
                     Ok(f) => f,
                     Err(e) => {
                         return UploadResult::Failure(Arc::new(format!(
-                            "Failed to open the file: {e}"
+                            "{}: {e}",
+                            strings::FAILED_TO_OPEN_FILE
                         )))
                     }
                 };
@@ -2386,7 +2384,7 @@ impl AppState {
                 {
                     log_status_change::<LogErrorStatus>(
                         &mut self.status_manager,
-                        format!("Lost connection to server: {e}"),
+                        format!("{}: {e}", strings::LOST_CONNECTION_TO_SERVER),
                     );
                     iced::Task::done(Message::SafelyLeaveServer)
                 } else {
@@ -3078,7 +3076,7 @@ impl AppState {
                     // Allow cancelling the resume request.
                     () = cancellation_token.cancelled() => {
                         tracing::debug!("Cancelling the resume request");
-                        Err(Some(Arc::new("Cancelled".to_owned())))
+                        Err(Some(Arc::new(strings::CANCELLED.to_owned())))
                     }
 
                     // Await the resume request to complete.
@@ -3272,7 +3270,7 @@ impl AppState {
         else {
             log_status_change::<LogWarnStatus>(
                 &mut self.status_manager,
-                "Download not in multi-peer transferring state".to_owned(),
+                strings::DOWNLOAD_NOT_MULTI_PEER_TRANSFERRING.to_owned(),
             );
             return iced::Task::none();
         };
@@ -3386,7 +3384,7 @@ impl AppState {
             ) {
                 log_status_change::<LogWarnStatus>(
                     &mut self.status_manager,
-                    "Download not in multi-peer transferring state".to_owned(),
+                    strings::DOWNLOAD_NOT_MULTI_PEER_TRANSFERRING.to_owned(),
                 );
             }
             return iced::Task::none();
@@ -3579,7 +3577,10 @@ impl AppState {
             ..
         }) = &mut t.progress
         else {
-            tracing::warn!("Download not in multi-peer transferring state");
+            log_status_change::<LogWarnStatus>(
+                &mut self.status_manager,
+                strings::DOWNLOAD_NOT_MULTI_PEER_TRANSFERRING.to_owned(),
+            );
             return iced::Task::none();
         };
         tracing::warn!("Multi-peer download failed: {error}");
@@ -3746,7 +3747,9 @@ impl AppState {
                     iced::window::close(window)
                 } else {
                     // If the main window is requesting to close during a managed modal state, just close the modal dialog instead.
-                    if let ModalState::Confirmation { title, .. } = &self.modal_state {
+                    if let ModalState::Confirmation(ConfirmationDialog { title, .. }) =
+                        &self.modal_state
+                    {
                         tracing::debug!("Close requested while confirmation `{title}` is open, dismissing modal");
                         self.modal_state = ModalState::None;
                         return iced::Task::none();
@@ -3771,7 +3774,9 @@ impl AppState {
             }) => {
                 // TODO: If multiple windows are ever open, will need to verify that the escape
                 //       key is active to the main window before closing the modal.
-                if let ModalState::Confirmation { title, .. } = &self.modal_state {
+                if let ModalState::Confirmation(ConfirmationDialog { title, .. }) =
+                    &self.modal_state
+                {
                     // If an internally managed modal is open, close it.
                     tracing::debug!("Escape key pressed, dismissing confirmation modal '{title}'");
                     self.modal_state = ModalState::None;
@@ -4151,16 +4156,16 @@ fn open_download_streams(
                 .await
             {
                 if cfg!(debug_assertions) {
-                    tracing::debug!("Reusing connection to peer {peer}");
+                    tracing::debug!("{}: {peer}", strings::REUSE_EXISTING_PEER_DEBUG);
                 } else {
-                    tracing::debug!("Reusing connection to peer");
+                    tracing::debug!("{}", strings::REUSE_EXISTING_PEER_DEBUG);
                 }
                 PeerConnectionOrTarget::Connection(c)
             } else {
                 if cfg!(debug_assertions) {
-                    tracing::debug!("Creating new connection to peer {peer}");
+                    tracing::debug!("{}: {peer}", strings::CREATING_NEW_CONNECTION_DEBUG);
                 } else {
-                    tracing::debug!("Creating new connection to peer");
+                    tracing::debug!("{}", strings::CREATING_NEW_CONNECTION_DEBUG);
                 }
                 PeerConnectionOrTarget::Target(endpoint, peer)
             };
@@ -4197,16 +4202,16 @@ async fn first_matching_download(
             .await
         {
             if cfg!(debug_assertions) {
-                tracing::debug!("Reusing connection to peer {peer}");
+                tracing::debug!("{}: {peer}", strings::REUSE_EXISTING_PEER_DEBUG);
             } else {
-                tracing::debug!("Reusing connection to peer");
+                tracing::debug!("{}", strings::REUSE_EXISTING_PEER_DEBUG);
             }
             PeerConnectionOrTarget::Connection(c)
         } else {
             if cfg!(debug_assertions) {
-                tracing::debug!("Creating new connection to peer {peer}");
+                tracing::debug!("{}: {peer}", strings::CREATING_NEW_CONNECTION_DEBUG);
             } else {
-                tracing::debug!("Creating new connection to peer");
+                tracing::debug!("{}", strings::CREATING_NEW_CONNECTION_DEBUG);
             }
             PeerConnectionOrTarget::Target(endpoint.clone(), peer)
         };
@@ -4365,7 +4370,7 @@ async fn partial_download(
         Ok(f) => f,
         Err(e) => {
             return DownloadResult::Failure(
-                Arc::new(format!("Failed to open the file: {e}")),
+                Arc::new(format!("{}: {e}", strings::FAILED_TO_OPEN_FILE)),
                 RecoverableState::Recoverable(None),
             )
         }
