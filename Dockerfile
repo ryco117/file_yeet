@@ -29,9 +29,10 @@ RUN addgroup -g 1000 -S file_yeet && \
 
 # Copy the compiled binary from the builder stage
 COPY --from=builder /usr/src/file_yeet/server/target/release/file_yeet_server /usr/local/bin/file_yeet_server
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 # Make sure the binary is executable
-RUN chmod +x /usr/local/bin/file_yeet_server
+RUN chmod +x /usr/local/bin/file_yeet_server /usr/local/bin/docker-entrypoint.sh
 
 # Switch to non-root user
 USER file_yeet
@@ -39,5 +40,4 @@ USER file_yeet
 # Expose the port that the server will be running on
 EXPOSE 7828
 
-# TODO: Allow user to choose either the self-signed certificate arg or specify the path to the certificate and key files
-CMD ["file_yeet_server", "--bind-ip=0.0.0.0", "--bind-port=7828", "--self-sign-certificate"]
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]

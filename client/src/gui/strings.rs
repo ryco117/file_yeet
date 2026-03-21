@@ -1,5 +1,5 @@
-//! This file contains user-facing strings used in the GUI.
-//! This will help transition to code supporting multiple languages in the future, reduce string duplication, and make it easier to find and edit user-facing strings.
+//! This file contains (mostly user-facing) strings used in the GUI.
+//! This module is to help transition to the code supporting multiple languages in the future, reduce string duplication, and make it easier to edit user-facing strings that appear in multiple places.
 
 // Simple button/label strings.
 pub const ACCEPT: &str = "Accept";

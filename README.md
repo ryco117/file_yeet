@@ -43,6 +43,26 @@ docker build -t file_yeet_server:local .
 ```
 **Note**: The docker container must be run with `--net=host` to ensure that the container executable has visibility of the client's IP address, instead of a docker intermediary address.
 
+By default, the container starts the server with `--self-sign-certificate`.
+
+To run with the default self-signed certificate:
+```bash
+docker run --rm --net=host file_yeet_server:local
+```
+
+To run with mounted TLS certificate and key files instead, mount them into the container and set `FILE_YEET_TLS_CERT` and `FILE_YEET_TLS_KEY`:
+```bash
+docker run --rm --net=host \
+  -v "$PWD/certs:/certs:ro" \
+  -e FILE_YEET_TLS_CERT=/certs/server.crt \
+  -e FILE_YEET_TLS_KEY=/certs/server.key \
+  file_yeet_server:local
+```
+
+Optional environment variables:
+- `FILE_YEET_BIND_IP` overrides the bind IP address. Defaults to `0.0.0.0`.
+- `FILE_YEET_BIND_PORT` overrides the bind port. Defaults to `7828`.
+
 
 ### Client
 ![Client GUI screenshot](images/file_yeet_client-accept-size-before-download.png)

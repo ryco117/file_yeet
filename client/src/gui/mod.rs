@@ -1144,8 +1144,15 @@ impl AppState {
             ),
             leave_server_button,
             widget::space().width(iced::Length::Fill),
-            "Our External Address:",
-            widget::text(&connected_state.external_address.1),
+            timed_tooltip(
+                widget::row![
+                    "Our External Address:",
+                    connected_state.external_address.1.as_str()
+                ]
+                .spacing(6),
+                "The address the server sees us as",
+                mouse_move_elapsed
+            ),
         )
         .align_y(iced::alignment::Alignment::Center)
         .spacing(6);
