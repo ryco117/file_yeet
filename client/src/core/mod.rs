@@ -10,6 +10,7 @@ use std::{
 use bytes::BufMut as _;
 use file_yeet_shared::{BiStream, HashBytes, ReadIpPortError, SocketAddrHelper, GOODBYE_CODE};
 use futures_util::TryFutureExt;
+use quinn::crypto::rustls::QuicClientConfig;
 use rustls::pki_types::CertificateDer;
 use sha2::Digest as _;
 use tokio::{
@@ -31,6 +32,40 @@ pub static HASH_EXT_REGEX: std::sync::LazyLock<regex::Regex> = std::sync::LazyLo
     regex::Regex::new(r"^\s*(?P<hash>[0-9a-fA-F]{64})(?::(?P<ext>\w+))?\s*$")
         .expect("Failed to compile the hash hex regex")
 });
+
+/// Lazily initialized shared QUIC transport configuration. Sets sane timeouts and keep-alive policies.
+pub static DEFAULT_TRANSPORT_CONFIG: std::sync::LazyLock<Arc<quinn::TransportConfig>> =
+    std::sync::LazyLock::new(|| {
+        // Set custom keep alive policies.
+        let mut transport_config = quinn::TransportConfig::default();
+        transport_config.max_idle_timeout(Some(quinn::IdleTimeout::from(quinn::VarInt::from_u32(
+            file_yeet_shared::QUIC_TIMEOUT_MILLIS,
+        ))));
+
+        // Send keep alive packets at a fraction of the idle timeout.
+        transport_config.keep_alive_interval(Some(Duration::from_millis(
+            file_yeet_shared::QUIC_TIMEOUT_MILLIS as u64 / 6,
+        )));
+
+        Arc::new(transport_config)
+    });
+
+/// Lazily initialized shared QUIC client configuration that skips certificate verification.
+/// Used for peer-to-peer connections where we use self-signed certificates and don't want to rely on a CA.
+/// # Panics
+/// If the QUIC client configuration cannot be created from the Rustls client configuration.
+pub static SKIP_CERT_VERIFICATION_CONFIG: std::sync::LazyLock<Arc<QuicClientConfig>> =
+    std::sync::LazyLock::new(|| {
+        let config = QuicClientConfig::try_from(
+            rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(SkipServerCertVerification::new())
+                .with_no_client_auth(),
+        )
+        .expect("Failed to create a QUIC client configuration");
+
+        Arc::new(config)
+    });
 
 /// Use a sane default timeout for server connections.
 pub const SERVER_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1558,36 +1593,17 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerCertVerification {
 }
 
 /// Helper for building the agreed upon QUIC transport configuration for connections.
-fn default_transport_config() -> quinn::TransportConfig {
-    // Set custom keep alive policies.
-    let mut transport_config = quinn::TransportConfig::default();
-    transport_config.max_idle_timeout(Some(quinn::IdleTimeout::from(quinn::VarInt::from_u32(
-        file_yeet_shared::QUIC_TIMEOUT_MILLIS,
-    ))));
-
-    // Send keep alive packets at a fraction of the idle timeout.
-    transport_config.keep_alive_interval(Some(Duration::from_millis(
-        file_yeet_shared::QUIC_TIMEOUT_MILLIS as u64 / 6,
-    )));
-
-    // TODO: Create the Arc once and clone when required.
-    transport_config
+#[inline]
+fn default_transport_config() -> Arc<quinn::TransportConfig> {
+    DEFAULT_TRANSPORT_CONFIG.clone()
 }
 
 /// Build a QUIC client config that will skip server verification.
 /// # Panics
 /// If the QUIC client configuration cannot be created from the Rustls client configuration.
 fn configure_peer_verification() -> quinn::ClientConfig {
-    let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(
-        rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(SkipServerCertVerification::new())
-            .with_no_client_auth(),
-    )
-    .expect("Failed to create a QUIC client configuration");
-
-    let mut client_config = quinn::ClientConfig::new(Arc::new(crypto));
-    client_config.transport_config(Arc::new(default_transport_config()));
+    let mut client_config = quinn::ClientConfig::new(SKIP_CERT_VERIFICATION_CONFIG.clone());
+    client_config.transport_config(default_transport_config());
     client_config
 }
 
@@ -1596,6 +1612,6 @@ fn configure_peer_verification() -> quinn::ClientConfig {
 /// If the QUIC client configuration cannot be created from the Rustls client configuration with platform verifier.
 fn configure_server_verification() -> Result<quinn::ClientConfig, rustls::Error> {
     let mut client_config = quinn::ClientConfig::try_with_platform_verifier()?;
-    client_config.transport_config(Arc::new(default_transport_config()));
+    client_config.transport_config(default_transport_config());
     Ok(client_config)
 }

@@ -32,7 +32,7 @@ const TRANSFER_SPEED_UPDATE_INTERVAL: Duration = Duration::from_millis(400);
 #[derive(Clone, Debug)]
 pub enum RecoverableState {
     /// The failure is likely recoverable, and the transfer will resume from existing partial progress.
-    //  TODO: Separate the recoverable state by ranges or from disk.
+    /// If the `Option` is `None`, will attempt to recover progress from the file on-disk.
     Recoverable(Option<Arc<FileIntervals<std::ops::Range<u64>>>>),
 
     /// The failure is not recoverable and the transfer must be restarted from scratch.
