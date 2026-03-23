@@ -36,11 +36,11 @@ use crate::{
         confirmation::ConfirmationDialog,
         publish::{draw_publishes, Publish, PublishItem, PublishRequestResult, PublishState},
         transfers::{
-            update_download_result, update_upload_result, DownloadMultiPeer, DownloadPartRange,
-            DownloadResult, DownloadSinglePeer, DownloadState, DownloadStrategy, DownloadTransfer,
-            DownloadTransferringState, MultiPeerDownloadResult, MultiPeerDownloadResumeError,
-            RecoverableState, Transfer, TransferBase, TransferSnapshot, UploadResult, UploadState,
-            UploadTransfer,
+            update_download_result, update_upload_result, DownloadFailure, DownloadMultiPeer,
+            DownloadPartRange, DownloadResult, DownloadSinglePeer, DownloadState, DownloadStrategy,
+            DownloadTransfer, DownloadTransferringState, MultiPeerDownloadResult,
+            MultiPeerDownloadResumeError, RecoverableState, Transfer, TransferBase,
+            TransferSnapshot, UploadFailure, UploadResult, UploadState, UploadTransfer,
         },
     },
     settings::{
@@ -460,7 +460,7 @@ pub enum Message {
     /// Handle the result of hashing a partial file for resume.
     ResumeFromPartialHashFile(
         Nonce,
-        Result<(Hasher, u64, PeerRequestStream), Option<Arc<String>>>,
+        Result<(Hasher, u64, PeerRequestStream), Option<DownloadFailure>>,
     ),
 
     /// Handle the result of a download transfer.
@@ -746,7 +746,7 @@ impl AppState {
             Message::MultiPeerDownloadTransferResulted(nonce, range, connection_id, result) => self
                 .update_multi_peer_download_transfer_resulted(nonce, range, connection_id, result),
             Message::SaveFailedMultiPeerDownloadResume(nonce, e) => {
-                self.update_save_failed_multi_peer_download_resume(nonce, &e)
+                self.update_save_failed_multi_peer_download_resume(nonce, e)
             }
             Message::UploadTransferResulted(nonce, r) => self.update_upload_resulted(nonce, r),
             Message::OpenFile(path) => {
@@ -2048,12 +2048,7 @@ impl AppState {
             async move {
                 let file = match tokio::fs::File::open(path.as_ref()).await {
                     Ok(f) => f,
-                    Err(e) => {
-                        return UploadResult::Failure(Arc::new(format!(
-                            "{}: {e}",
-                            strings::FAILED_TO_OPEN_FILE
-                        )))
-                    }
+                    Err(e) => return UploadResult::Failure(UploadFailure::OpenFile(Arc::new(e))),
                 };
 
                 // Try to upload the file to the peer connection.
@@ -2063,9 +2058,9 @@ impl AppState {
                     match crate::core::read_publish_range(&mut streams, file_size).await {
                         Ok(range) => range,
                         Err(e) => {
-                            return UploadResult::Failure(Arc::new(format!(
-                                "Failed to read peer upload range: {e}"
-                            )));
+                            return UploadResult::Failure(UploadFailure::ReadPeerUploadRange(
+                                Arc::new(e),
+                            ));
                         }
                     };
                 if let Some(l) = NonZeroU64::new(upload_length) {
@@ -2088,7 +2083,7 @@ impl AppState {
                         Some(&progress_lock),
                     )) => match result {
                         Ok(()) => UploadResult::Success((start_index)..(start_index + upload_length)),
-                        Err(e) => UploadResult::Failure(Arc::new(format!("Upload failed: {e}"))),
+                        Err(e) => UploadResult::Failure(UploadFailure::Transfer(Arc::new(e))),
                     }
                 }
             },
@@ -3060,12 +3055,12 @@ impl AppState {
                 Some(&progress_lock),
             ))
             .await
-            .map_err(|e| Some(Arc::new(format!("{e}"))))?;
+            .map_err(|e| Some(DownloadFailure::ResumeHashFile(Arc::new(e))))?;
 
             // Get the list of peers to resume the download from.
             let peers = crate::core::subscribe(&server, hash, Some(external_address))
                 .await
-                .map_err(|e| Some(Arc::new(format!("{e}"))))?;
+                .map_err(|e| Some(DownloadFailure::ResumeSubscribe(Arc::new(e))))?;
 
             // Get a request stream to the peer to resume the download.
             // TODO: We should prefer resuming with multiple peers when available.
@@ -3083,7 +3078,7 @@ impl AppState {
                     // Allow cancelling the resume request.
                     () = cancellation_token.cancelled() => {
                         tracing::debug!("Cancelling the resume request");
-                        Err(Some(Arc::new(strings::CANCELLED.to_owned())))
+                        Err(Some(DownloadFailure::ResumeCancelled))
                     }
 
                     // Await the resume request to complete.
@@ -3099,7 +3094,7 @@ impl AppState {
     fn update_resume_partial_hash(
         &mut self,
         nonce: Nonce,
-        result: Result<(Hasher, u64, PeerRequestStream), Option<Arc<String>>>,
+        result: Result<(Hasher, u64, PeerRequestStream), Option<DownloadFailure>>,
     ) -> iced::Task<Message> {
         let ConnectionState::Connected(ConnectedState {
             peers, downloads, ..
@@ -3160,10 +3155,10 @@ impl AppState {
             Err(e) => {
                 let e = if let Some(e) = e {
                     tracing::warn!("Failed to resume partial hash: {e}");
-                    Arc::new(e.to_string())
+                    e
                 } else {
                     tracing::info!("Failed to connect to peer to resume partial hash");
-                    Arc::new("No reachable peers".into())
+                    DownloadFailure::NoReachablePeers
                 };
 
                 // No file interval needs to be stored for synchronous download type.
@@ -3252,11 +3247,11 @@ impl AppState {
             Ok(peer_streams) => peer_streams,
 
             Err(e) => {
-                let err = format!("Failed to prepare output file: {e}");
+                let err = DownloadFailure::PrepareOutputFile(e);
                 tracing::warn!("{err}");
                 update_download_result(
                     &mut t.progress,
-                    DownloadResult::Failure(Arc::new(err), RecoverableState::NonRecoverable),
+                    DownloadResult::Failure(err, RecoverableState::NonRecoverable),
                     active_peers,
                     nonce,
                 );
@@ -3387,7 +3382,7 @@ impl AppState {
                 DownloadState::Paused(_) | DownloadState::Done(_)
             ) && !matches!(
                 result,
-                MultiPeerDownloadResult::Cancelled | MultiPeerDownloadResult::Failure(_)
+                MultiPeerDownloadResult::Cancelled | MultiPeerDownloadResult::Failure
             ) {
                 log_status_change::<LogWarnStatus>(
                     &mut self.status_manager,
@@ -3441,6 +3436,9 @@ impl AppState {
                             t.base.path.clone(),
                         ),
                         move |r| {
+                            if let DownloadResult::Failure(e, _) = &r {
+                                tracing::warn!("Multi-peer download chunk failed: {e}");
+                            }
                             Message::MultiPeerDownloadTransferResulted(
                                 nonce,
                                 next_chunk,
@@ -3473,9 +3471,7 @@ impl AppState {
                 }
             }
 
-            MultiPeerDownloadResult::Failure(e) => {
-                tracing::warn!("Multi-peer download chunk failed: {e}");
-
+            MultiPeerDownloadResult::Failure => {
                 // Remove this peer from the download since something has gone wrong.
                 if let Some(connection) = peers.remove(&connection_id) {
                     remove_nonce_for_peer(&connection, active_peers, nonce);
@@ -3506,11 +3502,11 @@ impl AppState {
                     .unwrap_or(RecoverableState::NonRecoverable);
 
                     // Set the download as failed with recoverable partial state.
-                    let err = "No peers remaining to complete the download".to_owned();
+                    let err = DownloadFailure::NoPeersRemaining;
                     tracing::warn!("{err}");
                     update_download_result(
                         &mut t.progress,
-                        DownloadResult::Failure(err.into(), recovered_intervals),
+                        DownloadResult::Failure(err, recovered_intervals),
                         active_peers,
                         nonce,
                     );
@@ -3561,7 +3557,7 @@ impl AppState {
     fn update_save_failed_multi_peer_download_resume(
         &mut self,
         nonce: Nonce,
-        error: &MultiPeerDownloadResumeError,
+        error: MultiPeerDownloadResumeError,
     ) -> iced::Task<Message> {
         let ConnectionState::Connected(ConnectedState {
             peers, downloads, ..
@@ -3618,7 +3614,10 @@ impl AppState {
 
         update_download_result(
             &mut t.progress,
-            DownloadResult::Failure(Arc::new(error.to_string()), recovered_intervals),
+            DownloadResult::Failure(
+                DownloadFailure::MultiPeerResume(Arc::new(error)),
+                recovered_intervals,
+            ),
             peers,
             nonce,
         );
@@ -4340,7 +4339,7 @@ async fn full_download(
                     } else {
                         RecoverableState::NonRecoverable
                     };
-                    DownloadResult::Failure(Arc::new(format!("Download failed: {e}")), recoverable)
+                    DownloadResult::Failure(DownloadFailure::Transfer(Arc::new(e)), recoverable)
                 }
             }
         }
@@ -4377,7 +4376,7 @@ async fn partial_download(
         Ok(f) => f,
         Err(e) => {
             return DownloadResult::Failure(
-                Arc::new(format!("{}: {e}", strings::FAILED_TO_OPEN_FILE)),
+                DownloadFailure::OpenFile(Arc::new(e)),
                 RecoverableState::Recoverable(None),
             )
         }
@@ -4402,7 +4401,7 @@ async fn partial_download(
                 } else {
                     RecoverableState::NonRecoverable
                 };
-                DownloadResult::Failure(Arc::new(format!("Download failed: {e}")), recoverable)
+                DownloadResult::Failure(DownloadFailure::Transfer(Arc::new(e)), recoverable)
             },
         }
     }
@@ -4516,7 +4515,7 @@ async fn multi_peer_download_next_chunk(
         Err(e) => {
             tracing::error!("Failed to create download request for multi-peer chunk: {e}");
             return DownloadResult::Failure(
-                Arc::new("Failed to create download request".to_owned()),
+                DownloadFailure::CreateRequest(Arc::new(e)),
                 RecoverableState::Recoverable(None),
             );
         }
@@ -4549,18 +4548,18 @@ async fn multi_peer_download_verify(
                     tracing::info!("Successful multi-peer download of hash {file_hash}");
                     DownloadResult::Success
                 } else {
-                    let err = "File size does not match".to_owned();
+                    let err = DownloadFailure::FileSizeMismatch;
                     tracing::warn!("{err}");
-                    DownloadResult::Failure(Arc::new(err), RecoverableState::NonRecoverable)
+                    DownloadResult::Failure(err, RecoverableState::NonRecoverable)
                 }
             } else {
-                let err = "File hash does not match".to_owned();
+                let err = DownloadFailure::FileHashMismatch;
                 tracing::warn!("{err}");
-                DownloadResult::Failure(Arc::new(err), RecoverableState::NonRecoverable)
+                DownloadResult::Failure(err, RecoverableState::NonRecoverable)
             }
         }
         Err(e) => DownloadResult::Failure(
-            Arc::new(format!("Failed to hash file: {e}")),
+            DownloadFailure::HashFile(Arc::new(e)),
             RecoverableState::NonRecoverable,
         ),
     }

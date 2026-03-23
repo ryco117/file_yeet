@@ -16,7 +16,8 @@ use crate::{
     core::{
         humanize_bytes,
         intervals::{FileIntervals, RangeData},
-        FileYeetCommandType, SubscribeError,
+        ConnectionIntoStreamError, DownloadError, FileAccessError, FileYeetCommandType,
+        ReadPubRangeError, SubscribeError, UploadError,
     },
     gui::{
         confirmation, remove_nonce_for_peer, strings, text_horizontal_scrollbar, timed_tooltip,
@@ -31,10 +32,54 @@ const TRANSFER_SPEED_UPDATE_INTERVAL: Duration = Duration::from_millis(400);
 #[derive(Clone, Debug)]
 pub enum RecoverableState {
     /// The failure is likely recoverable, and the transfer will resume from existing partial progress.
+    //  TODO: Separate the recoverable state by ranges or from disk.
     Recoverable(Option<Arc<FileIntervals<std::ops::Range<u64>>>>),
 
     /// The failure is not recoverable and the transfer must be restarted from scratch.
     NonRecoverable,
+}
+
+/// The distinct failures that can occur while downloading.
+#[derive(Clone, Debug, thiserror::Error)]
+pub enum DownloadFailure {
+    #[error("{0}")]
+    ResumeHashFile(Arc<FileAccessError>),
+
+    #[error("{0}")]
+    ResumeSubscribe(Arc<SubscribeError>),
+
+    #[error("Cancelled")]
+    ResumeCancelled,
+
+    #[error("No reachable peers")]
+    NoReachablePeers,
+
+    #[error("Failed to prepare output file: {0}")]
+    PrepareOutputFile(Arc<std::io::Error>),
+
+    #[error("Download failed: {0}")]
+    Transfer(Arc<DownloadError>),
+
+    #[error("Failed to open the file: {0}")]
+    OpenFile(Arc<std::io::Error>),
+
+    #[error("Failed to create download request: {0}")]
+    CreateRequest(Arc<ConnectionIntoStreamError>),
+
+    #[error("No peers remaining to complete the download")]
+    NoPeersRemaining,
+
+    #[error("{0}")]
+    MultiPeerResume(Arc<MultiPeerDownloadResumeError>),
+
+    #[error("File size does not match")]
+    FileSizeMismatch,
+
+    #[error("File hash does not match")]
+    FileHashMismatch,
+
+    #[error("Failed to hash file: {0}")]
+    HashFile(Arc<FileAccessError>),
 }
 
 /// The result of a file download with a single peer.
@@ -46,9 +91,8 @@ pub enum DownloadResult {
 
     /// The transfer failed.
     /// `RecoverableState` indicates which ranges of the file can be recovered, if any.
-    //  TODO: Use a more specific error type than `String`.
     #[error("{0}")]
-    Failure(Arc<String>, RecoverableState),
+    Failure(DownloadFailure, RecoverableState),
 
     /// The transfer was cancelled.
     #[error("Transfer cancelled")]
@@ -56,18 +100,15 @@ pub enum DownloadResult {
 }
 
 /// The result of a file download with multiple peers.
-#[derive(Clone, Debug, thiserror::Error)]
+#[derive(Clone, Copy, Debug)]
 pub enum MultiPeerDownloadResult {
     /// The transfer succeeded.
-    #[error("Transfer succeeded")]
     Success,
 
     /// The transfer failed.
-    #[error("{0}")]
-    Failure(Arc<String>),
+    Failure,
 
     /// The transfer was cancelled.
-    #[error("Transfer cancelled")]
     Cancelled,
 }
 
@@ -75,7 +116,7 @@ impl From<DownloadResult> for MultiPeerDownloadResult {
     fn from(value: DownloadResult) -> Self {
         match value {
             DownloadResult::Success => MultiPeerDownloadResult::Success,
-            DownloadResult::Failure(msg, _) => MultiPeerDownloadResult::Failure(msg),
+            DownloadResult::Failure(_, _) => MultiPeerDownloadResult::Failure,
             DownloadResult::Cancelled => MultiPeerDownloadResult::Cancelled,
         }
     }
@@ -96,14 +137,27 @@ pub enum MultiPeerDownloadResumeError {
 
 /// The result of a file upload with a peer.
 #[derive(Clone, Debug, thiserror::Error)]
+pub enum UploadFailure {
+    #[error("Failed to open the file: {0}")]
+    OpenFile(Arc<std::io::Error>),
+
+    #[error("Failed to read peer upload range: {0}")]
+    ReadPeerUploadRange(Arc<ReadPubRangeError>),
+
+    #[error("Upload failed: {0}")]
+    Transfer(Arc<UploadError>),
+}
+
+/// The result of a file upload with a peer.
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum UploadResult {
     /// The transfer succeeded at uploading the specified range.
     #[error("Transfer succeeded")]
     Success(std::ops::Range<u64>),
 
-    /// The transfer failed with the specified error message.
+    /// The transfer failed with the specified error.
     #[error("{0}")]
-    Failure(Arc<String>),
+    Failure(UploadFailure),
 
     /// The transfer was cancelled.
     #[error("Transfer cancelled")]

@@ -32,9 +32,6 @@ pub const RETRY_DOWNLOAD_TOOLTIP: &str =
 pub const TRANSFERRING_ELLIPSIS: &str = "Transferring...";
 pub const REMOVE_TRANSFER_TOOLTIP: &str = "Remove this item. The file is not touched";
 
-// File strings.
-pub const FAILED_TO_OPEN_FILE: &str = "Failed to open the file";
-
 // Peer strings.
 pub const REUSE_EXISTING_PEER_DEBUG: &str = "Reusing existing connection to peer";
 pub const CREATING_NEW_CONNECTION_DEBUG: &str = "Creating new connection to peer";
