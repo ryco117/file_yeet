@@ -245,6 +245,10 @@ pub enum ReadIpPortError {
     /// The IP address received was empty.
     #[error("The received IP address was empty")]
     UnspecifiedAddress,
+
+    /// The address port received was zero.
+    #[error("The received port was zero")]
+    UnspecifiedPort,
 }
 
 /// Try to read a valid IP address and port from the stream.
@@ -277,6 +281,9 @@ pub async fn read_ip_and_port(
 
     // Read the requested port from the stream.
     let port = stream.read_u16().await?;
+    if port == 0 {
+        return Err(ReadIpPortError::UnspecifiedPort);
+    }
 
     Ok((ip, port))
 }

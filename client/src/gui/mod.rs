@@ -830,7 +830,7 @@ impl AppState {
                         widget::text(message),
                         widget::row![
                             widget::button(strings::ACCEPT)
-                                .on_press(*confirm_action.clone())
+                                .on_press_with(|| confirm_action.as_ref().clone())
                                 .style(widget::button::danger),
                             timed_tooltip(
                                 widget::button("Back").on_press(Message::DismissModal),
@@ -1766,7 +1766,8 @@ impl AppState {
                 let publish = binary_find_nonce(publishes, nonce);
                 if let Some((_, publish)) = publish {
                     // Check existing publishes for duplicate hashes.
-                    // `check_duplicate_hash` will log a warning if a duplicate is found.
+                    // `check_duplicate_hash` will log a warning if a duplicate is found, but still
+                    // continue to update the item.
                     publishes.iter().any(|pi| {
                         pi.nonce != nonce
                             && check_duplicate_hash(pi, &hash, &mut self.status_manager)
@@ -3125,8 +3126,11 @@ impl AppState {
                 );
 
                 // Resuming from partial file, update progress accordingly.
-                download_transferring.progress_animation =
-                    start_index as f32 / t.base.file_size as f32;
+                download_transferring.progress_animation = if t.base.file_size > 0 {
+                    start_index as f32 / t.base.file_size as f32
+                } else {
+                    0.
+                };
 
                 t.progress = DownloadState::Transferring(download_transferring);
                 let cancellation_token = t.base.cancellation_token.clone();
@@ -4070,6 +4074,8 @@ fn should_disconnect_on_write_error(error: &quinn::WriteError) -> bool {
 
 /// Check if a `ReadIpPortError` indicates the server connection is lost and we should disconnect.
 fn should_disconnect_on_read_ip_port_error(error: &ReadIpPortError) -> bool {
+    use file_yeet_shared::ReadIpPortError;
+
     fn should_disconnect_on_read_exact_error(error: &quinn::ReadExactError) -> bool {
         // `ReadExactError` contains either `ReadError` or `FinishedEarly`.
         // Check if it contains a ReadError that indicates disconnection.
@@ -4080,17 +4086,17 @@ fn should_disconnect_on_read_ip_port_error(error: &ReadIpPortError) -> bool {
     }
 
     match error {
-        file_yeet_shared::ReadIpPortError::ReadIp(error) => {
-            should_disconnect_on_read_exact_error(error)
-        }
-        file_yeet_shared::ReadIpPortError::ReadPort(io_error) => {
+        ReadIpPortError::ReadIp(error) => should_disconnect_on_read_exact_error(error),
+        ReadIpPortError::ReadPort(io_error) => {
             // Check if this io::Error wraps a quinn ReadExactError.
             io_error
                 .get_ref()
                 .and_then(|e| e.downcast_ref::<quinn::ReadExactError>())
                 .is_some_and(should_disconnect_on_read_exact_error)
         }
-        file_yeet_shared::ReadIpPortError::UnspecifiedAddress => false,
+
+        // The server should not be sending unspecified addresses, but it is recoverable.
+        ReadIpPortError::UnspecifiedAddress | ReadIpPortError::UnspecifiedPort => false,
     }
 }
 

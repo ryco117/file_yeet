@@ -451,7 +451,11 @@ impl Transfer for DownloadTransfer {
                 };
 
                 // Update the progress bar with the fraction of the file downloaded.
-                *progress_animation = bytes_transferred as f32 / self.base.file_size as f32;
+                *progress_animation = if self.base.file_size > 0 {
+                    bytes_transferred as f32 / self.base.file_size as f32
+                } else {
+                    0.
+                };
 
                 // Update the transfer speed in human readable units.
                 if snapshot
