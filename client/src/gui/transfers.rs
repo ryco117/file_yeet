@@ -3,7 +3,7 @@ use std::{
     net::SocketAddr,
     num::NonZeroU64,
     path::PathBuf,
-    sync::Arc,
+    sync::{atomic::AtomicU64, Arc},
     time::{Duration, Instant},
 };
 
@@ -214,7 +214,7 @@ impl TransferSnapshot {
 pub struct DownloadSinglePeer {
     pub peer_string: String,
     pub peer: quinn::Connection,
-    pub progress_lock: Arc<RwLock<u64>>,
+    pub byte_progress: Arc<AtomicU64>,
 }
 
 #[derive(Debug)]
@@ -222,8 +222,8 @@ pub struct DownloadPartRange {
     /// The byte range for this part.
     pub range: std::ops::Range<u64>,
 
-    /// An atomic lock for the progress of this range.
-    pub progress_lock: Arc<RwLock<u64>>,
+    /// An atomic counter for the progress of this range.
+    pub byte_progress: Arc<AtomicU64>,
 
     /// A bool to quickly check whether the progress is complete.
     /// It should be true if and only if `progress_lock` equals the length of `range`.
@@ -234,7 +234,7 @@ impl DownloadPartRange {
     pub fn new(range: std::ops::Range<u64>) -> Self {
         Self {
             range,
-            progress_lock: Arc::new(RwLock::new(0)),
+            byte_progress: Arc::new(AtomicU64::new(0)),
             completed: false,
         }
     }
@@ -244,7 +244,7 @@ impl DownloadPartRange {
         let size = range.end - range.start;
         Self {
             range,
-            progress_lock: Arc::new(RwLock::new(size)),
+            byte_progress: Arc::new(AtomicU64::new(size)),
             completed: true,
         }
     }
@@ -363,7 +363,7 @@ pub enum UploadState {
     /// The transfer is in progress.
     Transferring {
         peer: quinn::Connection,
-        progress_lock: Arc<RwLock<u64>>,
+        progress_lock: Arc<AtomicU64>,
         progress_animation: f32,
         requested_size: Arc<RwLock<Option<NonZeroU64>>>,
         snapshot: TransferSnapshot,
@@ -441,13 +441,14 @@ impl Transfer for DownloadTransfer {
             }) => {
                 // Get the total bytes transferred at the current moment.
                 let bytes_transferred = match strategy {
-                    DownloadStrategy::SinglePeer(DownloadSinglePeer { progress_lock, .. }) => {
-                        *progress_lock.blocking_read()
+                    DownloadStrategy::SinglePeer(DownloadSinglePeer { byte_progress, .. }) => {
+                        byte_progress.load(std::sync::atomic::Ordering::Relaxed)
                     }
-                    DownloadStrategy::MultiPeer(DownloadMultiPeer { intervals, .. }) => intervals
-                        .ranges()
-                        .iter()
-                        .fold(0u64, |acc, r| acc + *r.progress_lock.blocking_read()),
+                    DownloadStrategy::MultiPeer(DownloadMultiPeer { intervals, .. }) => {
+                        intervals.ranges().iter().fold(0u64, |acc, r| {
+                            acc + r.byte_progress.load(std::sync::atomic::Ordering::Relaxed)
+                        })
+                    }
                 };
 
                 // Update the progress bar with the fraction of the file downloaded.
@@ -777,7 +778,7 @@ impl Transfer for UploadTransfer {
             ..
         } = &mut self.progress
         {
-            let bytes_transferred = *progress_lock.blocking_read();
+            let bytes_transferred = progress_lock.load(std::sync::atomic::Ordering::Relaxed);
             if let Some(requested_size) = *requested_size.blocking_read() {
                 // Update the progress bar with the most recent value.
                 *progress_animation = bytes_transferred as f32 / requested_size.get() as f32;

@@ -3,7 +3,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
     num::{NonZeroU16, NonZeroUsize},
     path::Path,
-    sync::Arc,
+    sync::{atomic::AtomicU64, Arc},
     time::Duration,
 };
 
@@ -885,7 +885,7 @@ impl DownloadError {
 
 /// Download a slice of a file from the peer. Initiates the download by specifying the range of bytes to download.
 /// The caller is responsible for opening the file but this function will seek to the specified starting offset before writing.
-/// The caller may optionally provide a `RwLock<u64>` to track the number of bytes downloaded so far.
+/// The caller may optionally provide an `AtomicU64` to track the number of bytes downloaded so far.
 /// If a hasher is provided in the `file_offsets`, the downloaded data will update the hash state.
 /// Furthermore, if an expected hash is provided in the `file_offsets` then the final hash will be verified against it and an error will be returned if there is a mismatch.
 #[tracing::instrument(skip(peer_streams, file, file_offsets, byte_progress))]
@@ -893,7 +893,7 @@ pub async fn download_partial_from_peer(
     peer_streams: &mut BiStream,
     file: &mut tokio::fs::File,
     file_offsets: DownloadOffsetState,
-    byte_progress: Option<&RwLock<u64>>,
+    byte_progress: Option<&AtomicU64>,
 ) -> Result<(), DownloadError> {
     // Determine the range of bytes to download and an existing hasher state.
     let DownloadOffsetState { range, mut hasher } = file_offsets;
@@ -948,8 +948,8 @@ pub async fn download_partial_from_peer(
             bytes_written += size;
 
             // Update the caller with the number of bytes written.
-            if let Some(progress) = byte_progress.as_ref() {
-                *progress.write().await = bytes_written;
+            if let Some(progress) = byte_progress {
+                progress.store(bytes_written, std::sync::atomic::Ordering::Relaxed);
             }
         }
     }
@@ -990,7 +990,7 @@ pub async fn download_from_peer(
     peer_streams: &mut BiStream,
     file_size: u64,
     output_path: &Path,
-    byte_progress: Option<&RwLock<u64>>,
+    byte_progress: Option<&AtomicU64>,
 ) -> Result<(), DownloadError> {
     tracing::info!("Downloading entire file from peer...");
 
@@ -1177,7 +1177,7 @@ pub async fn upload_to_peer(
     start_index: u64,
     upload_length: u64,
     mut reader: tokio::io::BufReader<tokio::fs::File>,
-    byte_progress: Option<&RwLock<u64>>,
+    byte_progress: Option<&AtomicU64>,
 ) -> Result<(), UploadError> {
     // Ensure that the file reader is at the starting index for the upload.
     reader
@@ -1218,7 +1218,7 @@ pub async fn upload_to_peer(
 
         // Update the caller with the number of bytes sent to the peer.
         if let Some(progress) = byte_progress.as_ref() {
-            *progress.write().await = bytes_sent;
+            progress.store(bytes_sent, std::sync::atomic::Ordering::Relaxed);
         }
     }
 

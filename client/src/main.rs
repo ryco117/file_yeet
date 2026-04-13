@@ -1,4 +1,9 @@
-use std::{io::Write as _, num::NonZeroU16, path::Path, sync::Arc};
+use std::{
+    io::Write as _,
+    num::NonZeroU16,
+    path::Path,
+    sync::{atomic::AtomicU64, Arc},
+};
 
 use file_yeet_shared::{BiStream, HashBytes, GOODBYE_CODE, GOODBYE_MESSAGE};
 use futures_util::{stream::FuturesUnordered, StreamExt};
@@ -438,7 +443,7 @@ async fn subscribe_command(
     };
 
     // Create a background task to update the download progress visually.
-    let progress = Arc::new(tokio::sync::RwLock::new(0));
+    let progress = Arc::new(AtomicU64::new(0));
     let progress_clone = progress.clone();
     manager.task_tracker.spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
@@ -456,7 +461,7 @@ async fn subscribe_command(
             }
 
             // Estimate the download speed.
-            let bytes_read = *progress.read().await;
+            let bytes_read = progress.load(std::sync::atomic::Ordering::Relaxed);
             let speed = (bytes_read - last_progress) as f64
                 / now.duration_since(last_instant).as_secs_f64();
             let human_speed = human_bytes::human_bytes(speed);

@@ -2014,7 +2014,7 @@ impl AppState {
         };
 
         let upload_nonce = generate_nonce();
-        let progress_lock = Arc::new(RwLock::new(0));
+        let progress_lock = Arc::new(AtomicU64::new(0));
         let cancellation_token = CancellationToken::new();
         let peer_string = peer.connection.remote_address().to_string();
         let requested_size = Arc::new(RwLock::new(None));
@@ -2486,12 +2486,12 @@ impl AppState {
             let peer_stream = peer_streams.head;
 
             // Set the transfer state for a single peer download.
-            let byte_progress = Arc::new(RwLock::new(0));
+            let byte_progress = Arc::new(AtomicU64::new(0));
             transfer.progress =
                 DownloadState::new_transferring(DownloadStrategy::SinglePeer(DownloadSinglePeer {
                     peer_string: peer_stream.connection.remote_address().to_string(),
                     peer: peer_stream.connection.clone(),
-                    progress_lock: byte_progress.clone(),
+                    byte_progress: byte_progress.clone(),
                 }));
             let cancellation_token = transfer.base.cancellation_token.clone();
 
@@ -2526,7 +2526,7 @@ impl AppState {
             // This is to allow each concurrent chunk to write into the file at the correct position.
             let output_path = output_path.clone();
             iced::Task::perform(
-                async move { create_sized_file(file_size, &output_path) },
+                async move { create_sized_file(file_size, &output_path).await },
                 move |r| {
                     Message::PrepareMultiPeerDownloadResulted(
                         nonce,
@@ -2859,7 +2859,7 @@ impl AppState {
                 .convert_ranges(
                     |r| {
                         let start = r.start();
-                        start..start + *r.progress_lock.blocking_read()
+                        start..start + r.byte_progress.load(std::sync::atomic::Ordering::Relaxed)
                     },
                     merge_adjacent_ranges,
                 )
@@ -3116,12 +3116,12 @@ impl AppState {
         match result {
             // Resume the download with the partial hash.
             Ok((digest, start_index, request)) => {
-                let progress = Arc::new(RwLock::new(start_index));
+                let progress = Arc::new(AtomicU64::new(start_index));
                 let mut download_transferring = DownloadTransferringState::new(
                     DownloadStrategy::SinglePeer(DownloadSinglePeer {
                         peer_string: request.connection.remote_address().to_string(),
                         peer: request.connection.clone(),
-                        progress_lock: progress.clone(),
+                        byte_progress: progress.clone(),
                     }),
                 );
 
@@ -3314,7 +3314,7 @@ impl AppState {
             }
 
             let interval = DownloadPartRange::new(chunk.clone());
-            let progress = interval.progress_lock.clone();
+            let progress = interval.byte_progress.clone();
             if let Err(e) = intervals.add_interval(interval) {
                 // Should never happen since we just got the chunk from `next_download_chunk`.
                 // Log and treat as though no chunk is available.
@@ -3421,7 +3421,7 @@ impl AppState {
                     };
 
                     let interval = DownloadPartRange::new(next_chunk.clone());
-                    let progress = interval.progress_lock.clone();
+                    let progress = interval.byte_progress.clone();
                     if let Err(e) = intervals.add_interval(interval) {
                         // Should never happen since we just got the chunk from `next_download_chunk`.
                         // Log and do not proceed with this chunk.
@@ -3495,7 +3495,7 @@ impl AppState {
                     let recovered_intervals = intervals.convert_ranges(
                         |r| {
                             let start = r.start();
-                            start..start + *r.progress_lock.blocking_read()
+                            start..start + r.byte_progress.load(std::sync::atomic::Ordering::Relaxed)
                         },
                         merge_adjacent_ranges,
                     )
@@ -3517,7 +3517,8 @@ impl AppState {
                 } else {
                     // Remove the failed interval so it can be retried later.
                     if let Some(mut i) = intervals.remove_interval_at(old_range.start) {
-                        let bytes_downloaded = *i.progress_lock.blocking_read();
+                        let bytes_downloaded =
+                            i.byte_progress.load(std::sync::atomic::Ordering::Relaxed);
                         if bytes_downloaded > 0 {
                             // Attempt to save the partial progress of the interval.
                             i.range.end = bytes_downloaded + i.start();
@@ -3600,7 +3601,7 @@ impl AppState {
         .convert_ranges(
             |r| {
                 let start = r.start();
-                start..start + *r.progress_lock.blocking_read()
+                start..start + r.byte_progress.load(std::sync::atomic::Ordering::Relaxed)
             },
             merge_adjacent_ranges,
         ) {
@@ -3871,7 +3872,10 @@ impl AppState {
                             .convert_ranges(
                                 |r| {
                                     let start = r.start();
-                                    start..start + *r.progress_lock.blocking_read()
+                                    let end = start
+                                        + r.byte_progress
+                                            .load(std::sync::atomic::Ordering::Relaxed);
+                                    start..end
                                 },
                                 merge_adjacent_ranges,
                             )
@@ -4317,7 +4321,7 @@ async fn try_peer_connection(
 async fn full_download(
     peer_stream: PeerRequestStream,
     cancellation_token: CancellationToken,
-    byte_progress: Arc<RwLock<u64>>,
+    byte_progress: Arc<AtomicU64>,
     hash: HashBytes,
     file_size: u64,
     output_path: Arc<PathBuf>,
@@ -4355,9 +4359,12 @@ async fn full_download(
 /// Helper to create an output file with the desired size.
 /// The work is synchronous, but is not guaranteed to be fast.
 #[tracing::instrument()]
-fn create_sized_file(file_size: u64, output_path: &std::path::Path) -> Result<(), std::io::Error> {
-    let file = std::fs::File::create(output_path)?;
-    file.set_len(file_size)?;
+async fn create_sized_file(
+    file_size: u64,
+    output_path: &std::path::Path,
+) -> Result<(), std::io::Error> {
+    let file = tokio::fs::File::create(output_path).await?;
+    file.set_len(file_size).await?;
     tracing::debug!("Created output file with size");
     Ok(())
 }
@@ -4368,7 +4375,7 @@ fn create_sized_file(file_size: u64, output_path: &std::path::Path) -> Result<()
 async fn partial_download(
     peer_stream: PeerRequestStream,
     cancellation_token: CancellationToken,
-    byte_progress: Arc<RwLock<u64>>,
+    byte_progress: Arc<AtomicU64>,
     hash: HashBytes,
     file_range: std::ops::Range<u64>,
     output_path: Arc<PathBuf>,
@@ -4508,7 +4515,7 @@ async fn multi_peer_download_next_chunk(
     peer: quinn::Connection,
     hash: HashBytes,
     cancellation_token: CancellationToken,
-    progress: Arc<RwLock<u64>>,
+    progress: Arc<AtomicU64>,
     range: std::ops::Range<u64>,
     file_path: Arc<PathBuf>,
 ) -> DownloadResult {
