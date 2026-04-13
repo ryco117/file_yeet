@@ -609,10 +609,6 @@ pub enum SubscribeError {
     /// Failed to read response from the server.
     #[error("Failed to read response from the server: {0}")]
     ReadResponse(#[from] ReadIpPortError),
-
-    /// Failed to parse a peer address from the server response.
-    #[error("Failed to parse a peer address from the server response: {0}")]
-    ParseAddress(#[from] std::net::AddrParseError),
 }
 
 /// Perform a subscribe request to the server.

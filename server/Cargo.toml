@@ -20,6 +20,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
 
+# Specify release profile here for Docker server builds. Otherwise, the root Cargo.toml is used.
 [profile.release]
 lto = true
 strip = true

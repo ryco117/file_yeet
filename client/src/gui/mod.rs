@@ -2372,11 +2372,9 @@ impl AppState {
                         should_disconnect_on_read_ip_port_error(read_error)
                     }
 
-                    // These errors don't indicate a lost connection.
-                    // TODO: Consider matching on the `ErrorKind` enum for an educated guess.
-                    SubscribeError::ReadSizeFailedWithKind(_) | SubscribeError::ParseAddress(_) => {
-                        false
-                    }
+                    // These errors don't indicate a lost connection, even though the stream was
+                    // disrupted.
+                    SubscribeError::ReadSizeFailedWithKind(_) => false,
                 };
 
                 if should_disconnect
