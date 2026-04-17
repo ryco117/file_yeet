@@ -1501,11 +1501,40 @@ impl AppState {
                         self.save_on_exit = true;
                     }
 
+                    let status_manager = &mut self.status_manager;
                     let tasks = self
                         .options
                         .last_publishes
                         .drain(..)
-                        .map(|p| {
+                        .filter_map(|p| {
+                            // Verify the file still exists and has the expected size.
+                            match std::fs::metadata(&p.path) {
+                                Ok(metadata) => {
+                                    if let Some((_, expected_size)) = p.hash_and_file_size {
+                                        if metadata.len() != expected_size {
+                                            log_status_change::<LogWarnStatus>(
+                                                status_manager,
+                                                format!(
+                                                    "Skipping saved publish {:?}: file size changed (expected {}, got {})",
+                                                    p.path, expected_size, metadata.len()
+                                                ),
+                                            );
+                                            return None;
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    log_status_change::<LogWarnStatus>(
+                                        status_manager,
+                                        format!(
+                                            "Skipping saved publish {:?}: {}",
+                                            p.path, e
+                                        ),
+                                    );
+                                    return None;
+                                }
+                            }
+
                             let message = if let Some(hfs) = p.hash_and_file_size {
                                 Message::PublishFileHashed {
                                     publish: CreateOrExistingPublish::Create(Arc::new(p.path)),
@@ -1518,7 +1547,7 @@ impl AppState {
                                     Arc::new(p.path),
                                 ))
                             };
-                            iced::Task::done(message)
+                            Some(iced::Task::done(message))
                         })
                         .chain(
                             self.options

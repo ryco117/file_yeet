@@ -802,9 +802,9 @@ dependencies = [
 
 [[package]]
 name = "crab_nat"
-version = "0.7.5"
+version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc76761c9c5bda2f353fceb5ca692671288072c870f04776929bf14b10bf5ee7"
+checksum = "2ee6b8eaaec72851c6914625d70908689dc15a20f4004a94dc245fc173e09c15"
 dependencies = [
  "bytes",
  "displaydoc",
