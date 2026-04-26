@@ -458,10 +458,8 @@ pub enum Message {
     ResumePausedDownload(Nonce),
 
     /// Handle the result of hashing a partial file for resume.
-    ResumeFromPartialHashFile(
-        Nonce,
-        Result<(Hasher, u64, PeerRequestStream), Option<DownloadFailure>>,
-    ),
+    /// Failure is `None` if there are no peers sharing.
+    ResumeFromPartialHashFile(Nonce, Result<ResumeDownloadPlan, Option<DownloadFailure>>),
 
     /// Handle the result of a download transfer.
     DownloadTransferResulted(Nonce, DownloadResult),
@@ -1515,8 +1513,8 @@ impl AppState {
                                             log_status_change::<LogWarnStatus>(
                                                 status_manager,
                                                 format!(
-                                                    "Skipping saved publish {:?}: file size changed (expected {}, got {})",
-                                                    p.path, expected_size, metadata.len()
+                                                    "Skipping saved publish {}: file size changed (expected {expected_size}, got {})",
+                                                    p.path.display(), metadata.len()
                                                 ),
                                             );
                                             return None;
@@ -1527,8 +1525,8 @@ impl AppState {
                                     log_status_change::<LogWarnStatus>(
                                         status_manager,
                                         format!(
-                                            "Skipping saved publish {:?}: {}",
-                                            p.path, e
+                                            "Skipping saved publish {}: {e}",
+                                            p.path.display()
                                         ),
                                     );
                                     return None;
@@ -3076,6 +3074,7 @@ impl AppState {
         }
 
         // Create a future to resume the download.
+        let cancellation_token_for_streams = cancellation_token.clone();
         let resume_future = async move {
             // Get the file size and digest state of the chosen file to publish.
             let (_, current_file_size, digest) = Box::pin(crate::core::file_size_and_hasher(
@@ -3090,13 +3089,40 @@ impl AppState {
                 .await
                 .map_err(|e| Some(DownloadFailure::ResumeSubscribe(Arc::new(e))))?;
 
-            // Get a request stream to the peer to resume the download.
-            // TODO: We should prefer resuming with multiple peers when available.
-            let request = first_matching_download(&endpoint, &peers, hash, final_file_size)
-                .await
-                .ok_or(None)?;
+            // Group peers by file size and find those matching our expected size.
+            let Some(matching_peers) = group_peers_by_size(peers).remove(&final_file_size) else {
+                return Err(None);
+            };
 
-            Ok((digest, current_file_size, request))
+            // Connect to all matching peers concurrently.
+            let streams = open_download_streams(
+                &endpoint,
+                hash,
+                matching_peers,
+                &cancellation_token_for_streams,
+            )
+            .await;
+
+            // Prefer multi-peer flow when multiple peers connected successfully.
+            if let Some(peer_streams) = nonempty::NonEmpty::collect(streams) {
+                // Use a single peer if only one peer is available or if the file is small enough that resuming with multiple peers would not be worth it.
+                if peer_streams.tail.is_empty() || final_file_size - current_file_size < 500_000_000
+                {
+                    Ok(ResumeDownloadPlan::SinglePeer(
+                        digest,
+                        current_file_size,
+                        peer_streams.head,
+                    ))
+                } else {
+                    // TODO: Avoid getting a partial hash state if we are able to resume as a multi-peer download.
+                    Ok(ResumeDownloadPlan::MultiPeer(
+                        current_file_size,
+                        peer_streams,
+                    ))
+                }
+            } else {
+                Err(None)
+            }
         };
 
         // Resume the transfer.
@@ -3122,7 +3148,7 @@ impl AppState {
     fn update_resume_partial_hash(
         &mut self,
         nonce: Nonce,
-        result: Result<(Hasher, u64, PeerRequestStream), Option<DownloadFailure>>,
+        result: Result<ResumeDownloadPlan, Option<DownloadFailure>>,
     ) -> iced::Task<Message> {
         let ConnectionState::Connected(ConnectedState {
             peers, downloads, ..
@@ -3141,8 +3167,8 @@ impl AppState {
         };
 
         match result {
-            // Resume the download with the partial hash.
-            Ok((digest, start_index, request)) => {
+            // Resume the download with the partial hash using a single peer.
+            Ok(ResumeDownloadPlan::SinglePeer(digest, start_index, request)) => {
                 let progress = Arc::new(AtomicU64::new(start_index));
                 let mut download_transferring = DownloadTransferringState::new(
                     DownloadStrategy::SinglePeer(DownloadSinglePeer {
@@ -3180,6 +3206,51 @@ impl AppState {
                     ),
                     move |r| Message::DownloadTransferResulted(nonce, r),
                 )
+            }
+
+            // Resume with multiple peers, treating already-downloaded bytes as a completed interval.
+            Ok(ResumeDownloadPlan::MultiPeer(current_file_size, peer_streams)) => {
+                let mut intervals = FileIntervals::new(t.base.file_size);
+                if current_file_size > 0 {
+                    let completed = DownloadPartRange::new_completed(0..current_file_size);
+                    if let Err(e) = intervals.add_interval(completed) {
+                        tracing::error!("Failed to add completed interval for resume: {e}");
+                        update_download_result(
+                            &mut t.progress,
+                            DownloadResult::Failure(
+                                DownloadFailure::NoReachablePeers,
+                                RecoverableState::Recoverable(None),
+                            ),
+                            peers,
+                            nonce,
+                        );
+                        return iced::Task::none();
+                    }
+                }
+
+                // `PrepareMultiPeerDownloadResulted` will assign `peers` and `peers_string`.
+                let mut download_transferring = DownloadTransferringState::new(
+                    DownloadStrategy::MultiPeer(DownloadMultiPeer {
+                        peers: HashMap::new(),
+                        peers_string: String::new(),
+                        intervals,
+                    }),
+                );
+
+                // Resuming from partial file, update progress accordingly.
+                download_transferring.progress_animation = if t.base.file_size > 0 {
+                    current_file_size as f32 / t.base.file_size as f32
+                } else {
+                    0.
+                };
+
+                t.progress = DownloadState::Transferring(download_transferring);
+
+                // Delegate to existing multi-peer download preparation to register peers and start chunks.
+                iced::Task::done(Message::PrepareMultiPeerDownloadResulted(
+                    nonce,
+                    Ok(peer_streams),
+                ))
             }
 
             // Failed to resume the download.
@@ -4225,51 +4296,15 @@ fn open_download_streams(
     futures_util::future::join_all(futures).then(async |results| results.into_iter().flatten())
 }
 
-/// Helper to connect to peer publishing a known hash and file size.
-#[tracing::instrument(skip(endpoint, peers_with_size))]
-async fn first_matching_download(
-    endpoint: &quinn::Endpoint,
-    peers_with_size: &[(SocketAddr, u64)],
-    hash: HashBytes,
-    expected_size: u64,
-) -> Option<PeerRequestStream> {
-    // Filter the peers to find those with the expected file size.
-    let filtered_peers = peers_with_size
-        .iter()
-        .filter_map(|(peer, file_size)| file_size.eq(&expected_size).then_some(*peer));
+/// The result of preparing to resume a download from a partial file.
+/// Determines whether to use single-peer or multi-peer strategy.
+#[derive(Clone, Debug)]
+pub enum ResumeDownloadPlan {
+    /// Resume with a single peer, continuing the hash verification inline.
+    SinglePeer(Hasher, u64, PeerRequestStream),
 
-    for peer in filtered_peers {
-        // Create a new connection or open a stream on an existing one.
-        let peer = if let Some(c) = ConnectionsManager::instance()
-            .get_connection_async(peer)
-            .await
-        {
-            if cfg!(debug_assertions) {
-                tracing::debug!("{}: {peer}", strings::REUSE_EXISTING_PEER_DEBUG);
-            } else {
-                tracing::debug!("{}", strings::REUSE_EXISTING_PEER_DEBUG);
-            }
-            PeerConnectionOrTarget::Connection(c)
-        } else {
-            if cfg!(debug_assertions) {
-                tracing::debug!("{}: {peer}", strings::CREATING_NEW_CONNECTION_DEBUG);
-            } else {
-                tracing::debug!("{}", strings::CREATING_NEW_CONNECTION_DEBUG);
-            }
-            PeerConnectionOrTarget::Target(endpoint.clone(), peer)
-        };
-
-        // Attempt to connect to the peer.
-        let r = try_peer_connection(peer, hash, FileYeetCommandType::Sub).await;
-
-        // Return the first successful connection.
-        if r.is_some() {
-            return r;
-        }
-    }
-
-    // No matching peer found.
-    None
+    /// Resume with multiple peers, treating the already-downloaded bytes as a completed interval.
+    MultiPeer(u64, nonempty::NonEmpty<PeerRequestStream>),
 }
 
 /// Either an existing peer connection or a local endpoint and peer address to connect to.
