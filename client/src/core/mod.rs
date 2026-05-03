@@ -27,9 +27,9 @@ pub type Hasher = sha2::Sha256;
 pub static APP_TITLE: &str = env!("CARGO_PKG_NAME");
 
 /// Lazily initialized regex for parsing hash hex strings.
-/// Produces capture groups `hash` and `ext` for the hash and optional extension.
+/// Produces capture groups `bytes`, `hash`, and `ext` for the byte count, hash, and file extension, respectively.
 pub static HASH_EXT_REGEX: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-    regex::Regex::new(r"^\s*(?P<hash>[0-9a-fA-F]{64})(?::(?P<ext>\w+))?\s*$")
+    regex::Regex::new(r"^\s*(?:(?P<bytes>[0-9]+):)?(?P<hash>[0-9a-fA-F]{64})(?::(?P<ext>\w+))?\s*$")
         .expect("Failed to compile the hash hex regex")
 });
 
@@ -70,9 +70,9 @@ pub static SKIP_CERT_VERIFICATION_CONFIG: std::sync::LazyLock<Arc<QuicClientConf
 /// Use a sane default timeout for server connections.
 pub const SERVER_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
 /// Sane default timeout for listening for a peer.
-pub const PEER_LISTEN_TIMEOUT: Duration = Duration::from_millis(1500);
+pub const PEER_HOLEPUNCH_LISTEN_TIMEOUT: Duration = Duration::from_millis(1500);
 /// Sane default timeout for peer connection attempts. Should try to connect for a longer time than listening.
-pub const PEER_CONNECT_TIMEOUT: Duration = Duration::from_millis(2000);
+pub const PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Define a sane number of maximum retries.
 pub const MAX_PEER_CONNECTION_ATTEMPTS: NonZeroUsize = NonZeroUsize::new(10).unwrap();
@@ -363,7 +363,7 @@ pub async fn new_renewal_interval(lifetime_seconds: u64) -> tokio::time::Interva
     let mut interval = tokio::time::interval(
         Duration::from_secs(lifetime_seconds)
             .div_f64(3.)
-            .max(Duration::from_secs(120)),
+            .max(Duration::from_mins(2)),
     );
     interval.tick().await; // Skip the first tick.
     interval
@@ -691,7 +691,7 @@ pub async fn udp_holepunch(
 ) -> Option<(quinn::Connection, BiStream)> {
     // Poll incoming connections that are handled by a background task.
     let manager = ConnectionsManager::instance();
-    let listen_future = manager.await_peer(peer_address, PEER_LISTEN_TIMEOUT);
+    let listen_future = manager.await_peer(peer_address, PEER_HOLEPUNCH_LISTEN_TIMEOUT);
 
     // Attempt to connect to the peer's public address.
     let connect_future = tokio::time::timeout(
@@ -834,6 +834,19 @@ async fn connect_to_peer(
     None
 }
 
+/// Helper to create an output file with the desired size.
+/// The work is not guaranteed to be fast.
+#[tracing::instrument()]
+pub async fn create_sized_file(
+    file_size: u64,
+    output_path: &std::path::Path,
+) -> Result<(), std::io::Error> {
+    tracing::debug!("Creating output file with desired size");
+    let file = tokio::fs::File::create(output_path).await?;
+    file.set_len(file_size).await?;
+    Ok(())
+}
+
 /// The range of bytes to download and an optional starting hash state.
 /// If no hasher is provided, no hash will be computed or verified.
 pub struct DownloadOffsetState {
@@ -924,9 +937,7 @@ pub async fn download_partial_from_peer(
 
         if size > 0 {
             // Ensure we don't write more bytes than were requested in the handshake.
-            let size = usize::try_from(download_size - bytes_written)
-                .map(|x| x.min(size))
-                .unwrap_or(size);
+            let size = usize::try_from(download_size - bytes_written).map_or(size, |x| x.min(size));
 
             // Write the bytes to the file and update the hash.
             let bb = &buf[..size];
@@ -945,7 +956,7 @@ pub async fn download_partial_from_peer(
 
             // Update the caller with the number of bytes written.
             if let Some(progress) = byte_progress {
-                progress.store(bytes_written, std::sync::atomic::Ordering::Relaxed);
+                progress.fetch_add(size, std::sync::atomic::Ordering::Relaxed);
             }
         }
     }
@@ -1231,6 +1242,7 @@ pub async fn upload_to_peer(
 /// Turn a byte count into a human readable string.
 #[allow(clippy::cast_precision_loss)]
 pub fn humanize_bytes(bytes: u64) -> String {
+    // TODO: Replace with something that can write to a buffer instead of allocating a new string.
     human_bytes::human_bytes(bytes as f64)
 }
 

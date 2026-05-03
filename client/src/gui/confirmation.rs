@@ -12,6 +12,15 @@ pub struct ConfirmationDialog {
     pub message: Cow<'static, str>,
     pub confirm_action: Box<Message>,
 }
+impl std::fmt::Display for ConfirmationDialog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if f.alternate() {
+            write!(f, "{}: {}", self.title, self.message)
+        } else {
+            write!(f, "{}", self.title)
+        }
+    }
+}
 
 /// A confirmation dialog for leaving a server. This will cancel all active transfers, but any partial download progress will be saved.
 pub fn leave_server() -> ConfirmationDialog {

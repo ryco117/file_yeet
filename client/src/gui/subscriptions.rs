@@ -2,6 +2,7 @@ use std::{net::SocketAddr, sync::Arc, time::Instant};
 
 use crab_nat::PortMapping;
 use file_yeet_shared::{BiStream, HashBytes, ReadIpPortError, GOODBYE_CODE, GOODBYE_MESSAGE};
+use futures_util::SinkExt as _;
 use iced::Subscription;
 use tokio::io::AsyncWriteExt as _;
 use tokio_util::sync::CancellationToken;
@@ -10,7 +11,8 @@ use crate::{
     core::{ConnectionsManager, ReadSubscribingPeerError},
     gui::{
         publish::{Publish, PublishItem, PublishRequestResult, PublishState},
-        Message, Nonce, PeerRequestStream, TOOLTIP_WAIT_DURATION,
+        transfers::{DownloadState, DownloadTransfer},
+        IncomingSubscribePeers, Message, Nonce, PeerRequestStream, TOOLTIP_WAIT_DURATION,
     },
 };
 
@@ -90,6 +92,20 @@ struct PortMappingData {
 impl std::hash::Hash for PortMappingData {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.mapping.gateway().hash(state);
+    }
+}
+
+/// Data for `check_new_peers`.
+struct CheckNewPeersData {
+    pub nonce: Nonce,
+    pub hash: HashBytes,
+    pub server: quinn::Connection,
+    pub external_address: SocketAddr,
+}
+impl std::hash::Hash for CheckNewPeersData {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.hash.hash(state);
+        self.nonce.hash(state);
     }
 }
 
@@ -340,14 +356,17 @@ fn connected_peer_request_loop(
 }
 
 /// Listen for incoming QUIC connections, renew NAT traversal port mappings, and manage new publish requests from peers directly and from the server.
-pub fn connected<'a, I>(
+pub fn connected<'a, PI, DI>(
     endpoint: &quinn::Endpoint,
+    server: &quinn::Connection,
     external_address: &SocketAddr,
     port_mapping: Option<&PortMapping>,
-    publishes: I,
+    downloads: DI,
+    publishes: PI,
 ) -> Subscription<Message>
 where
-    I: IntoIterator<Item = &'a PublishItem>,
+    DI: IntoIterator<Item = &'a DownloadTransfer>,
+    PI: IntoIterator<Item = &'a PublishItem>,
 {
     // Create a task to listen for incoming connections to our QUIC endpoint.
     let incoming_connections = {
@@ -398,6 +417,55 @@ where
         ))
     });
 
+    // For each download that needs peers, query every minute for new peers from the server.
+    let downloads = downloads.into_iter().filter_map(|download| {
+        let DownloadTransfer {
+            base,
+            progress: DownloadState::NoPeersAvailable(_),
+            ..
+        } = download
+        else {
+            return None;
+        };
+
+        // Subscribe to the server for new peers to download from.
+        Some(Subscription::run_with(
+            CheckNewPeersData {
+                nonce: base.nonce,
+                hash: base.hash,
+                server: server.clone(),
+                external_address: *external_address,
+            },
+            |data: &CheckNewPeersData| {
+                let server = data.server.clone();
+                let &CheckNewPeersData {
+                    nonce,
+                    hash,
+                    external_address,
+                    ..
+                } = data;
+                iced::stream::channel(2, async move |mut output| {
+                    let mut interval = crate::core::new_renewal_interval(60).await;
+                    loop {
+                        // Wait for a minute before checking for new peers again.
+                        interval.tick().await;
+
+                        // Attempt to start a download where the final size hasn't been accepted yet.
+                        tracing::debug!("Checking for new peers for {hash:#}");
+                        let result = crate::core::subscribe(&server, hash, Some(external_address))
+                            .await
+                            .map(|peers| IncomingSubscribePeers::existing(peers, nonce))
+                            .map_err(Arc::new);
+                        output
+                            .send(Message::SubscribePeersResult(result))
+                            .await
+                            .unwrap();
+                    }
+                })
+            },
+        ))
+    });
+
     // Create a listener for each peer that may want a new request stream.
     let peer_requests = ConnectionsManager::instance().filter_map(|(peer_addr, connection)| {
         let crate::core::IncomingPeerState::Connected(connection) = connection else {
@@ -420,6 +488,7 @@ where
             .into_iter()
             .chain(port_mapping)
             .chain(pubs)
+            .chain(downloads)
             .chain(peer_requests),
     )
 }

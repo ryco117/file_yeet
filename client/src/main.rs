@@ -345,12 +345,14 @@ async fn subscribe_command(
     manager: Manager<'_>,
 ) -> Result<(), SubscribeCommandError> {
     // Parse the hash and optional extension with regex.
-    let (hash_hex, ext) = match HASH_EXT_REGEX.captures(&hash_ext) {
+    // Use the expected file size (if present) to pre-filter peers reporting a different size.
+    let (expected_bytes, hash_hex, ext) = match HASH_EXT_REGEX.captures(&hash_ext) {
         Some(c) => (
-            c.get(1)
+            c.name("bytes").and_then(|m| m.as_str().parse::<u64>().ok()),
+            c.name("hash")
                 .ok_or(SubscribeCommandError::InvalidHashFormat)?
                 .as_str(),
-            c.get(2).map(|m| m.as_str()),
+            c.name("ext").map(|m| m.as_str()),
         ),
         None => return Err(SubscribeCommandError::ParseHashFailed),
     };
@@ -396,6 +398,14 @@ async fn subscribe_command(
         return Err(SubscribeCommandError::NoPeers);
     }
 
+    // If a specific file size was encoded in the hash string, filter out peers claiming a different size.
+    if let Some(expected) = expected_bytes {
+        peers.retain(|(_, size)| *size == expected);
+        if peers.is_empty() {
+            return Err(SubscribeCommandError::NoPeers);
+        }
+    }
+
     // Try to connect to multiple peers concurrently with a list of connection futures.
     let mut connection_attempts = FuturesUnordered::new();
     for (peer_address, file_size) in peers.drain(..) {
@@ -409,11 +419,12 @@ async fn subscribe_command(
 
     // Iterate through the connection attempts as they resolve.
     // Allow the user to accept or reject the download from each peer until the first accepted connection.
+    // TODO: Allow for a multi-peer strategy, refactoring code from `gui/mod.rs`.
     let peer_connection = loop {
         match connection_attempts.next().await {
             Some(Some((c, mut b, file_size))) => {
-                let consent =
-                    file_consent_cli(file_size, &output).expect("Failed to read user input");
+                let consent = expected_bytes.is_some_and(|b| b == file_size)
+                    || file_consent_cli(file_size, &output).expect("Failed to read user input");
                 if consent {
                     break Some((c, b, file_size));
                 }

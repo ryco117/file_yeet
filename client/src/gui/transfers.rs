@@ -14,14 +14,15 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     core::{
-        humanize_bytes,
+        create_sized_file, humanize_bytes,
         intervals::{FileIntervals, RangeData},
         ConnectionIntoStreamError, DownloadError, FileAccessError, FileYeetCommandType,
         ReadPubRangeError, SubscribeError, UploadError,
     },
     gui::{
-        confirmation, remove_nonce_for_peer, strings, text_horizontal_scrollbar, timed_tooltip,
-        CreateOrExistingPublish, Message, Nonce, NonceItem, PeerRequestStream, ERROR_RED_COLOR,
+        confirmation, full_download, remove_nonce_for_peer, strings, text_horizontal_scrollbar,
+        timed_tooltip, CreateOrExisting, Message, Nonce, NonceItem, PeerRequestStream,
+        ERROR_RED_COLOR,
     },
 };
 
@@ -31,12 +32,33 @@ const TRANSFER_SPEED_UPDATE_INTERVAL: Duration = Duration::from_millis(400);
 /// The recoverable state of a failed transfer.
 #[derive(Clone, Debug)]
 pub enum RecoverableState {
-    /// The failure is likely recoverable, and the transfer will resume from existing partial progress.
-    /// If the `Option` is `None`, will attempt to recover progress from the file on-disk.
-    Recoverable(Option<Arc<FileIntervals<std::ops::Range<u64>>>>),
+    /// The partial progress is recoverable from existing saved intervals.
+    RecoverableIntervals(Arc<FileIntervals<std::ops::Range<u64>>>),
 
-    /// The failure is not recoverable and the transfer must be restarted from scratch.
+    /// The partial progress is recoverable from what is currently saved on disk.
+    RecoverableOnDisk,
+
+    /// The partial progress is not recoverable and the transfer must be restarted from scratch.
     NonRecoverable,
+}
+impl RecoverableState {
+    /// Returns `true` if the failed transfer can be resumed without restarting from scratch.
+    pub fn is_recoverable(&self) -> bool {
+        !matches!(self, RecoverableState::NonRecoverable)
+    }
+
+    /// If the recoverable state contains intervals, attempt to unwrap and return them.
+    pub fn into_intervals(self) -> Option<FileIntervals<std::ops::Range<u64>>> {
+        match self {
+            RecoverableState::RecoverableIntervals(intervals) => {
+                Some(Arc::try_unwrap(intervals).unwrap_or_else(|arc| {
+                    tracing::warn!("Failed to unwrap Arc for saved intervals");
+                    (*arc).clone()
+                }))
+            }
+            _ => None,
+        }
+    }
 }
 
 /// The distinct failures that can occur while downloading.
@@ -51,9 +73,6 @@ pub enum DownloadFailure {
     #[error("Cancelled")]
     ResumeCancelled,
 
-    #[error("No reachable peers")]
-    NoReachablePeers,
-
     #[error("Failed to prepare output file: {0}")]
     PrepareOutputFile(Arc<std::io::Error>),
 
@@ -66,11 +85,8 @@ pub enum DownloadFailure {
     #[error("Failed to create download request: {0}")]
     CreateRequest(Arc<ConnectionIntoStreamError>),
 
-    #[error("No peers remaining to complete the download")]
-    NoPeersRemaining,
-
     #[error("{0}")]
-    MultiPeerResume(Arc<MultiPeerDownloadResumeError>),
+    MultiPeerResume(MultiPeerDownloadResumeError),
 
     #[error("File size does not match")]
     FileSizeMismatch,
@@ -80,6 +96,9 @@ pub enum DownloadFailure {
 
     #[error("Failed to hash file: {0}")]
     HashFile(Arc<FileAccessError>),
+
+    #[error("Corrupted save state")]
+    CorruptedIntervalState,
 }
 
 /// The result of a file download with a single peer.
@@ -306,11 +325,25 @@ impl DownloadTransferringState {
     }
 }
 
+/// The consent state for a download waiting for peers to become available.
+///
+/// When [`DownloadConsentState::AwaitingConsent`], no file size has been agreed upon yet.
+/// When [`DownloadConsentState::Consented`], the file size is known and partial recovery state is tracked.
+/// This encoding prevents invalid combinations like a recoverable state with no known file size.
+#[derive(Clone, Debug)]
+pub enum DownloadConsentState {
+    /// No file size has been agreed to; user will need to choose from available options.
+    AwaitingConsent,
+
+    /// File size in the transfer base has been agreed to. Waiting for peers to reconnect, with optional partial progress.
+    Consented(RecoverableState),
+}
+
 /// The state of a download transfer with a peer.
 #[derive(Debug)]
 pub enum DownloadState {
     /// The transfer is awaiting a connection attempt.
-    Connecting,
+    Connecting(DownloadConsentState),
 
     /// The transfer is awaiting user confirmation with a list of connected peers.
     Consent(nonempty::NonEmpty<PeerRequestStream>),
@@ -327,8 +360,14 @@ pub enum DownloadState {
         progress: Arc<RwLock<f32>>,
     },
 
+    /// No peers are currently sharing the file. Periodically re-queries for peers.
+    NoPeersAvailable(DownloadConsentState),
+
     /// The transfer has completed.
     Done(DownloadResult),
+
+    /// A dummy state used for handling memory safely. Should never be visible to the user.
+    Dummy,
 }
 impl DownloadState {
     /// If the progress state contains a peer connection, return it.
@@ -421,6 +460,72 @@ pub struct DownloadTransfer {
     pub progress: DownloadState,
     pub publish_on_success: bool,
     pub context_menu_visible: bool,
+}
+impl DownloadTransfer {
+    /// Helper to initialize a `DownloadTransfer` into the `Transferring` state and create a `Task` for beginning a new download.
+    pub fn start_new(
+        &mut self,
+        peer_streams: nonempty::NonEmpty<PeerRequestStream>,
+    ) -> iced::Task<Message> {
+        let nonce = self.base.nonce;
+        let file_size = self.base.file_size;
+        let output_path = self.base.path.clone();
+
+        if peer_streams.tail.is_empty() {
+            // Single peer download strategy.
+            let peer_stream = peer_streams.head;
+
+            // Set the transfer state for a single peer download.
+            let byte_progress = Arc::new(AtomicU64::new(0));
+            self.progress =
+                DownloadState::new_transferring(DownloadStrategy::SinglePeer(DownloadSinglePeer {
+                    peer_string: peer_stream.connection.remote_address().to_string(),
+                    peer: peer_stream.connection.clone(),
+                    byte_progress: byte_progress.clone(),
+                }));
+            let hash = self.base.hash;
+            let cancellation_token = self.base.cancellation_token.clone();
+
+            // Download the full file from the peer.
+            iced::Task::perform(
+                full_download(
+                    peer_stream,
+                    cancellation_token,
+                    byte_progress,
+                    hash,
+                    file_size,
+                    output_path.clone(),
+                ),
+                move |r| Message::DownloadTransferResulted(nonce, r),
+            )
+        } else {
+            // Set the transfer state for a multi-peer download.
+            // We add all connections to the transfer state since these connections were already added to the peers manager.
+            let peers: HashMap<_, _> = peer_streams
+                .iter()
+                .map(|p| (p.connection.stable_id(), p.connection.clone()))
+                .collect();
+            let peers_string = DownloadMultiPeer::generate_peers_string(&peers);
+            self.progress =
+                DownloadState::new_transferring(DownloadStrategy::MultiPeer(DownloadMultiPeer {
+                    peers,
+                    peers_string,
+                    intervals: FileIntervals::new(file_size),
+                }));
+
+            // Start by creating the output file with the necessary size.
+            // This is to allow each concurrent chunk to write into the file at the correct position.
+            iced::Task::perform(
+                async move { create_sized_file(file_size, &output_path).await },
+                move |r| {
+                    Message::PrepareMultiPeerDownloadResulted(
+                        nonce,
+                        r.map(|()| peer_streams).map_err(Arc::new),
+                    )
+                },
+            )
+        }
+    }
 }
 impl NonceItem for DownloadTransfer {
     fn nonce(&self) -> Nonce {
@@ -526,7 +631,7 @@ impl Transfer for DownloadTransfer {
         };
 
         let progress = match &self.progress {
-            DownloadState::Connecting => Element::from("Connecting..."),
+            DownloadState::Connecting(_) => Element::from("Connecting..."),
 
             DownloadState::Consent(_) => widget::row!(
                 widget::text(format!(
@@ -642,6 +747,20 @@ impl Transfer for DownloadTransfer {
             .spacing(6)
             .into(),
 
+            DownloadState::NoPeersAvailable(_) => widget::row!(
+                "No peers available, retrying...",
+                widget::space().width(iced::Length::Fill),
+                tooltip_button(
+                    strings::CANCEL,
+                    is_non_modal.then(|| {
+                        Message::ModalConfirmation(confirmation::cancel_download(self.base.nonce))
+                    }),
+                    strings::CANCEL_DOWNLOAD_TOOLTIP,
+                ),
+            )
+            .spacing(6)
+            .into(),
+
             DownloadState::Done(r) => {
                 let remove = tooltip_button(
                     strings::REMOVE,
@@ -664,9 +783,7 @@ impl Transfer for DownloadTransfer {
                             let publish_button = tooltip_button(
                                 "Reyeet",
                                 Some(Message::PublishFileHashed {
-                                    publish: CreateOrExistingPublish::Create(
-                                        self.base.path.clone(),
-                                    ),
+                                    publish: CreateOrExisting::Create(self.base.path.clone()),
                                     hash: self.base.hash,
                                     file_size: self.base.file_size,
                                     new_hash: true,
@@ -686,7 +803,7 @@ impl Transfer for DownloadTransfer {
                                 .spacing(12),
                             )
                         }
-                        DownloadResult::Failure(_, RecoverableState::Recoverable(_)) => {
+                        DownloadResult::Failure(_, r) if r.is_recoverable() => {
                             Element::<Message>::from(
                                 widget::row!(
                                     tooltip_button(
@@ -703,6 +820,10 @@ impl Transfer for DownloadTransfer {
                     },
                 )
                 .into()
+            }
+
+            DownloadState::Dummy => {
+                Element::from("DUMMY STATE - SHOULD NEVER BE VISIBLE (Check logs)")
             }
         };
 

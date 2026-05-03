@@ -19,6 +19,7 @@ impl SavedPublish {
 }
 
 /// The saveable information for a download transfer with partial or no progress.
+//  TODO: Instead of `intervals`, use a consent state here to save downloads without a consented download size, similar to the `DownloadConsentState` in `gui/transfers.rs`.
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub struct SavedDownload {
     pub hash: HashBytes,
