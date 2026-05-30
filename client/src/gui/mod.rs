@@ -765,7 +765,7 @@ impl AppState {
             Message::PublishOnSuccessToggle(nonce, publish_on_success) => {
                 self.update_publish_on_success_toggle(nonce, publish_on_success)
             }
-            Message::ResumePausedDownload(nonce) => self.update_resume_paused(nonce),
+            Message::ResumePausedDownload(nonce) => self.update_resume_paused(nonce, None),
             Message::ResumeFromPartialHashFile(nonce, result) => {
                 self.update_resume_partial_hash(nonce, result)
             }
@@ -2721,9 +2721,9 @@ impl AppState {
                 if let DownloadConsentState::Consented(recoverable) = consent_state {
                     return if recoverable.is_recoverable() {
                         // Recoverable, set the progress to paused using the existing state and resume.
-                        // TODO: This doesn't utilize the fact that we already have peers, fix (Refactor common logic from the ResumePausedDownload handler).
                         transfer.progress = DownloadState::Paused(recoverable.into_intervals());
-                        iced::Task::done(Message::ResumePausedDownload(nonce))
+
+                        self.update_resume_paused(nonce, Some(peers))
                     } else {
                         // Not recoverable, start a new download using the connected peers.
                         transfer.start_new(peers)
@@ -3053,7 +3053,7 @@ impl AppState {
                 binary_find_nonce_mut(downloads, nonce).map(|(_, t)| {
                     // Cancel the download's tasks.
                     t.base.cancellation_token.cancel();
-                    tracing::debug!("Cancelled download {}", t.base.hash_hex);
+                    tracing::debug!("Cancelled download {:#}", t.base.hash_hex);
 
                     // Mark the download as cancelled.
                     update_download_result(
@@ -3202,7 +3202,11 @@ impl AppState {
 
     /// Update the state to resume a paused transfer.
     #[tracing::instrument(skip(self))]
-    fn update_resume_paused(&mut self, nonce: Nonce) -> iced::Task<Message> {
+    fn update_resume_paused(
+        &mut self,
+        nonce: Nonce,
+        download_peers: Option<nonempty::NonEmpty<PeerRequestStream>>,
+    ) -> iced::Task<Message> {
         let ConnectionState::Connected(ConnectedState {
             endpoint,
             server,
@@ -3287,39 +3291,48 @@ impl AppState {
                     intervals,
                 }));
 
+            if let Some(peers) = download_peers {
+                // We already have peers from the subscribe step, so we can skip directly to opening streams with those peers.
+                return iced::Task::done(Message::PrepareMultiPeerDownloadResulted(
+                    nonce,
+                    Ok(peers),
+                ));
+            }
+
             // Return a task to prepare the multi-peer download.
             // We don't need to create the file; in fact we get to reuse the existing progress.
             let future = async move {
-                // Get the list of peers to resume the download from.
-                let peers =
-                    match crate::core::subscribe(&server, hash, Some(external_address)).await {
-                        Ok(peers) => peers,
-                        Err(e) => {
-                            // TODO: Handle subscribe failed correctly. Some failures may indicate
-                            //       server connection has broken.
-                            return Message::SaveFailedMultiPeerDownloadResume(
-                                nonce,
-                                Arc::new(e).into(),
-                            );
+                let streams_result = resume_download_connections(
+                    &endpoint,
+                    &server,
+                    hash,
+                    external_address,
+                    final_file_size,
+                    &cancellation_token,
+                )
+                .await;
+
+                match streams_result {
+                    Ok(peer_streams) => {
+                        Message::PrepareMultiPeerDownloadResulted(nonce, Ok(peer_streams))
+                    }
+                    Err(e) => match e {
+                        ResumeConnectionsError::SubscribeFailed(e) => {
+                            Message::SaveFailedMultiPeerDownloadResume(nonce, Arc::new(e).into())
                         }
-                    };
-
-                let Some(peers) = group_peers_by_size(peers).remove(&final_file_size) else {
-                    return Message::SaveFailedMultiPeerDownloadResume(
-                        nonce,
-                        MultiPeerDownloadResumeError::NoPeersAvailable,
-                    );
-                };
-
-                if let Some(peers) = nonempty::NonEmpty::collect(
-                    open_download_streams(&endpoint, hash, peers, &cancellation_token).await,
-                ) {
-                    Message::PrepareMultiPeerDownloadResulted(nonce, Ok(peers))
-                } else {
-                    Message::SaveFailedMultiPeerDownloadResume(
-                        nonce,
-                        MultiPeerDownloadResumeError::NoPeersReachable,
-                    )
+                        ResumeConnectionsError::NoPeersAvailable => {
+                            Message::SaveFailedMultiPeerDownloadResume(
+                                nonce,
+                                MultiPeerDownloadResumeError::NoPeersAvailable,
+                            )
+                        }
+                        ResumeConnectionsError::NoPeersReachable => {
+                            Message::SaveFailedMultiPeerDownloadResume(
+                                nonce,
+                                MultiPeerDownloadResumeError::NoPeersReachable,
+                            )
+                        }
+                    },
                 }
             };
             return iced::Task::perform(future, std::convert::identity);
@@ -3331,52 +3344,52 @@ impl AppState {
         // Create a future to resume the download.
         let resume_future = async move {
             // Get the file size and digest state of the chosen file to publish.
-            let (_, current_file_size, digest) = Box::pin(crate::core::file_size_and_hasher(
-                &path,
-                Some(&progress_lock),
-            ))
-            .await
-            .map_err(|e| Some(DownloadFailure::ResumeHashFile(Arc::new(e))))?;
+            let current_file_size = std::fs::metadata(path.as_ref())
+                .map_err(|e| {
+                    Some(DownloadFailure::ResumeHashFile(Arc::new(
+                        crate::core::FileAccessError::Open(e),
+                    )))
+                })?
+                .len();
 
-            // Get the list of peers to resume the download from.
-            let peers = crate::core::subscribe(&server, hash, Some(external_address))
-                .await
-                .map_err(|e| Some(DownloadFailure::ResumeSubscribe(Arc::new(e))))?;
-
-            // Group peers by file size and find those matching our expected size.
-            let Some(matching_peers) = group_peers_by_size(peers).remove(&final_file_size) else {
-                return Err(None);
-            };
-
-            // Connect to all matching peers concurrently.
-            let streams = open_download_streams(
+            let peer_streams = resume_download_connections(
                 &endpoint,
+                &server,
                 hash,
-                matching_peers,
+                external_address,
+                final_file_size,
                 &cancellation_token_for_streams,
             )
-            .await;
+            .await
+            .map_err(|e| match e {
+                ResumeConnectionsError::SubscribeFailed(e) => {
+                    Some(DownloadFailure::ResumeSubscribe(Arc::new(e)))
+                }
+                ResumeConnectionsError::NoPeersAvailable
+                | ResumeConnectionsError::NoPeersReachable => None,
+            })?;
 
             // Prefer multi-peer flow when multiple peers connected successfully.
-            if let Some(peer_streams) = nonempty::NonEmpty::collect(streams) {
-                // Use a single peer if only one peer is available or if the file is small enough that resuming with multiple peers would not be worth it.
-                if peer_streams.tail.is_empty() || final_file_size - current_file_size < 500_000_000
-                {
-                    Ok(ResumeDownloadPlan::SinglePeer(
-                        digest,
-                        current_file_size,
-                        peer_streams.head,
-                    ))
-                } else {
-                    // TODO: Avoid getting a partial hash state if we are able to resume as a multi-peer download.
-                    //       Currently, the work to get the partial hash state is wasted.
-                    Ok(ResumeDownloadPlan::MultiPeer(
-                        current_file_size,
-                        peer_streams,
-                    ))
-                }
+            // Use a single peer if only one peer is available or if the file is small enough that resuming with multiple peers would not be worth it.
+            if peer_streams.tail.is_empty() || final_file_size - current_file_size < 500_000_000 {
+                // Get the file size and digest state of the chosen file to publish.
+                let (_, current_file_size, digest) = Box::pin(crate::core::file_size_and_hasher(
+                    &path,
+                    Some(&progress_lock),
+                ))
+                .await
+                .map_err(|e| Some(DownloadFailure::ResumeHashFile(Arc::new(e))))?;
+
+                Ok(ResumeDownloadPlan::SinglePeer(
+                    digest,
+                    current_file_size,
+                    peer_streams.head,
+                ))
             } else {
-                Err(None)
+                Ok(ResumeDownloadPlan::MultiPeer(
+                    current_file_size,
+                    peer_streams,
+                ))
             }
         };
 
@@ -3973,6 +3986,7 @@ impl AppState {
             }
         };
 
+        // TODO: Some failures may indicate server connection has broken.
         if matches!(
             &error,
             MultiPeerDownloadResumeError::NoPeersAvailable
@@ -4888,4 +4902,41 @@ async fn multi_peer_download_verify(
     };
     tracing::warn!("{err}");
     DownloadResult::Failure(err, RecoverableState::NonRecoverable)
+}
+
+/// The possible failure states when attempting to prepare connections to resume a download.
+enum ResumeConnectionsError {
+    SubscribeFailed(crate::core::SubscribeError),
+    NoPeersAvailable,
+    NoPeersReachable,
+}
+
+/// Helper to resume a download by subscribing to the server for a hash and connecting to peers with the expected file size.
+async fn resume_download_connections(
+    endpoint: &quinn::Endpoint,
+    server: &quinn::Connection,
+    hash: HashBytes,
+    external_address: SocketAddr,
+    final_file_size: u64,
+    cancellation_token: &CancellationToken,
+) -> Result<nonempty::NonEmpty<PeerRequestStream>, ResumeConnectionsError> {
+    // Get the list of peers to resume the download from.
+    let peers = crate::core::subscribe(server, hash, Some(external_address))
+        .await
+        .map_err(ResumeConnectionsError::SubscribeFailed)?;
+
+    // Group peers by file size and find those matching our expected size.
+    let Some(matching_peers) = group_peers_by_size(peers).remove(&final_file_size) else {
+        return Err(ResumeConnectionsError::NoPeersAvailable);
+    };
+
+    // Connect to all matching peers concurrently.
+    let mut streams =
+        open_download_streams(endpoint, hash, matching_peers, cancellation_token).await;
+
+    if let Some(first) = streams.next() {
+        Ok(nonempty::NonEmpty::from((first, streams.collect())))
+    } else {
+        Err(ResumeConnectionsError::NoPeersReachable)
+    }
 }
