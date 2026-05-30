@@ -831,8 +831,8 @@ async fn handle_admin_connection(
         // Read more bytes into the unfilled portion of the buffer.
         let n = match read_half.read(&mut buf[filled..]).await {
             Ok(0) | Err(_) => return, // EOF or read error
-                Ok(n) => n,
-            };
+            Ok(n) => n,
+        };
         filled += n;
 
         // Process all complete lines in the buffer.
@@ -871,6 +871,10 @@ async fn handle_admin_connection(
                     "  help         Show this help message\n",
                 )
                 .into(),
+                "quit" | "exit" => {
+                    // Close the connection by returning from the handler.
+                    return;
+                }
                 _ => "Unknown command. Type 'help' for available commands.\n".into(),
             };
 
