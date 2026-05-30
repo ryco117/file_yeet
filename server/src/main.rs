@@ -871,10 +871,6 @@ async fn handle_admin_connection(
                     "  help         Show this help message\n",
                 )
                 .into(),
-                "quit" | "exit" => {
-                    // Close the connection by returning from the handler.
-                    return;
-                }
                 _ => "Unknown command. Type 'help' for available commands.\n".into(),
             };
 
