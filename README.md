@@ -21,6 +21,8 @@ Options:
           The port the server will bind to [default: 7828]
   -m, --max-connections <MAX_CONNECTIONS>
           Optional limit to the number of connections the server will accept. Must be a positive integer less than 2^32
+      --max-connections-per-ip <MAX_CONNECTIONS_PER_IP>
+          Optional limit to the number of simultaneous connections from a single IP address. Useful when multiple users share an IP due to NAT
   -v, --verbose
           Enable verbose logging
       --tls-cert <TLS_CERT>
@@ -29,6 +31,8 @@ Options:
           Path to a PEM-encoded TLS private key file. Requires --tls-cert
       --self-sign-certificate
           Allow using a self-signed certificate. Insecure and `false` by default. Conflicts with providing a TLS certificate file
+      --admin-port <ADMIN_PORT>
+          Optionally bind an admin server to this port on localhost (127.0.0.1) for querying runtime information via a simple line-based text protocol (e.g. with `netcat`)
   -h, --help
           Print help
   -V, --version

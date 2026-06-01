@@ -7,15 +7,18 @@ RUN apk add --no-cache musl-dev
 # Set up workspace
 WORKDIR /usr/src/file_yeet
 
-# Copy shared library first (dependency)
-COPY shared/ ./shared/
+# Copy workspace manifests and lock file first to leverage Docker layer caching
+COPY Cargo.toml Cargo.lock ./
 
-# Copy server code
+# Copy client manifest only (no source needed — satisfies workspace member resolution)
+COPY client/Cargo.toml ./client/
+
+# Copy shared library and server source
+COPY shared/ ./shared/
 COPY server/ ./server/
 
 # Build the server binary in release mode for smaller size
-WORKDIR /usr/src/file_yeet/server
-RUN cargo build --release --bin file_yeet_server
+RUN cargo build --release -p file_yeet_server
 
 # Runtime stage - minimal Alpine Linux
 FROM alpine:latest
@@ -28,7 +31,7 @@ RUN addgroup -g 1000 -S file_yeet && \
     adduser -u 1000 -S file_yeet -G file_yeet
 
 # Copy the compiled binary from the builder stage
-COPY --from=builder /usr/src/file_yeet/server/target/release/file_yeet_server /usr/local/bin/file_yeet_server
+COPY --from=builder /usr/src/file_yeet/target/release/file_yeet_server /usr/local/bin/file_yeet_server
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 # Make sure the binary is executable

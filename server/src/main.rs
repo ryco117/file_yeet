@@ -17,7 +17,7 @@ use rand::seq::SliceRandom;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::{mpsc, RwLock},
+    sync::{mpsc, Mutex, RwLock},
 };
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
@@ -73,6 +73,11 @@ struct Cli {
     #[arg(short, long)]
     max_connections: Option<NonZeroU32>,
 
+    /// Optional limit to the number of simultaneous connections from a single IP address.
+    /// Useful when multiple users share an IP due to NAT.
+    #[arg(long)]
+    max_connections_per_ip: Option<NonZeroU32>,
+
     /// Enable verbose logging.
     #[arg(short, long)]
     verbose: bool,
@@ -97,6 +102,53 @@ struct Cli {
 
 /// A mapping between file hashes and the addresses of connected peers that are publishing the file.
 type PublishersRef = Arc<RwLock<HashMap<HashBytes, HashMap<Nonce, PublishedFile>>>>;
+
+/// A mapping between IP addresses (IPv4 are mapped to IPv6, IPv6 are unmodified) and the number of active connections from that IP.
+type IpConnectionMap = Arc<Mutex<HashMap<Ipv6Addr, u32>>>;
+
+/// RAII(-ish) guard that decrements the per-IP connection count when `release` is called.
+struct IpConnectionGuard {
+    ip: Ipv6Addr,
+    map: IpConnectionMap,
+}
+impl IpConnectionGuard {
+    /// Create a new `IpConnectionGuard` for the given IP and map.
+    /// The connection count for the IP will be incremented by 1.
+    async fn try_new(ip: Ipv6Addr, map: &IpConnectionMap, max: NonZeroU32) -> Option<Self> {
+        let mut m = map.lock().await;
+        let count = m.entry(ip).or_insert(0);
+        if *count >= max.get() {
+            return None;
+        }
+        *count += 1;
+
+        Some(Self {
+            ip,
+            map: map.clone(),
+        })
+    }
+
+    /// Decrement the connection count for this guard's IP in the map. If the count reaches 0, remove the entry from the map.
+    async fn release(self) {
+        let mut m = self.map.lock().await;
+        if let std::collections::hash_map::Entry::Occupied(mut e) = m.entry(self.ip) {
+            let n = e.get_mut();
+            if *n <= 1 {
+                if *n == 0 {
+                    tracing::warn!(
+                        "Per-IP connection count for {} is already 0 when releasing guard",
+                        self.ip
+                    );
+                }
+                e.remove();
+            } else {
+                *n -= 1;
+            }
+        } else {
+            tracing::warn!("Failed to find IP in connection map when releasing guard");
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -195,7 +247,8 @@ async fn main() {
             publishers,
             global_cancellation_token.clone(),
             task_master.clone(),
-            args.max_connections
+            args.max_connections,
+            args.max_connections_per_ip,
         ) => {}
     }
 
@@ -222,7 +275,9 @@ async fn handle_incoming_clients_loop(
     global_cancellation_token: CancellationToken,
     task_master: TaskTracker,
     max_connections: Option<NonZeroU32>,
+    max_connections_per_ip: Option<NonZeroU32>,
 ) {
+    let ip_connection_map: IpConnectionMap = Arc::new(Mutex::new(HashMap::new()));
     tracing::debug!("Starting incoming clients loop");
     while let Some(connecting) = local_end.accept().await {
         // Check if the server has reached the maximum number of connections.
@@ -234,8 +289,30 @@ async fn handle_incoming_clients_loop(
             continue;
         }
 
+        // Check if this IP has reached the per-IP connection limit.
+        let ip_guard = if let Some(max_per_ip) = max_connections_per_ip {
+            let ip = file_yeet_shared::ipv6_mapped(connecting.remote_address().ip());
+            if let Some(guard) =
+                IpConnectionGuard::try_new(ip, &ip_connection_map, max_per_ip).await
+            {
+                Some(guard)
+            } else {
+                tracing::warn!("Per-IP connection limit reached for {ip}");
+                connecting.refuse();
+                continue;
+            }
+        } else {
+            None
+        };
+
         // Attempt to complete the handshake with the client, else continue.
         let Ok(connecting) = connecting.accept() else {
+            // TODO: Move this inside `handle_quic_connection` and enum the failure.
+            // Decrement the per-IP connection count if applicable when the client disconnects.
+            if let Some(guard) = ip_guard {
+                guard.release().await;
+            }
+
             continue;
         };
 
@@ -273,6 +350,11 @@ async fn handle_incoming_clients_loop(
                         }
                     }
                 }
+            }
+
+            // Decrement the per-IP connection count if applicable when the client disconnects.
+            if let Some(guard) = ip_guard {
+                guard.release().await;
             }
         });
     }
@@ -839,9 +921,7 @@ async fn handle_admin_connection(
         while let Some(nl) = buf[..filled].iter().position(|&b| b == b'\n') {
             // Trim the trailing newline and any CR.
             let raw = &buf[..nl];
-            let cmd = std::str::from_utf8(raw)
-                .map(|s| s.trim_end_matches('\r').trim())
-                .unwrap_or("");
+            let cmd = std::str::from_utf8(raw).map_or("", |s| s.trim_end_matches('\r').trim());
 
             let response: std::borrow::Cow<'static, str> = match cmd {
                 "connections" => {
