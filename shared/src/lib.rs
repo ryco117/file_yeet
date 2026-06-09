@@ -38,6 +38,18 @@ impl HashBytes {
         Self { bytes }
     }
 }
+impl From<[u8; HASH_BYTE_COUNT]> for HashBytes {
+    fn from(bytes: [u8; HASH_BYTE_COUNT]) -> Self {
+        Self { bytes }
+    }
+}
+impl From<sha2::digest::Output<sha2::Sha256>> for HashBytes {
+    fn from(output: sha2::digest::Output<sha2::Sha256>) -> Self {
+        Self {
+            bytes: output.into(),
+        }
+    }
+}
 
 /// Implement a reasonable `Debug` for the `HashBytes` type.
 impl std::fmt::Debug for HashBytes {

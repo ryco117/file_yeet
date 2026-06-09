@@ -18,6 +18,7 @@ use file_yeet_shared::{
 };
 use futures_util::FutureExt as _;
 use iced::{widget, window, Element};
+use sha2::Digest as _;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
@@ -46,7 +47,8 @@ use crate::{
         },
     },
     settings::{
-        load_settings, save_settings, AppSettings, PortMappingSetting, SavedDownload, SavedPublish,
+        load_settings, save_settings, AppSettings, PortMappingSetting, SavedDownload,
+        SavedDownloadState, SavedPublish,
     },
 };
 
@@ -2168,20 +2170,35 @@ impl AppState {
             if let ConnectionState::Connected(ConnectedState { hash_input, .. }) =
                 &self.connection_state
             {
-                let Some(p) = HASH_EXT_REGEX.captures(hash_input).and_then(|captures| {
-                    let bytes = captures
-                        .name("bytes")
-                        .and_then(|b| b.as_str().parse::<u64>().ok());
+                // Parse a set of regex captures from the hash input.
+                let parse_captures = |captures: regex::Captures<'_>| {
+                    // File size in bytes, optional.
+                    let bytes = captures.name("bytes").and_then(|b| {
+                        b.as_str()
+                            .parse::<u64>()
+                            .map_err(|e| {
+                                log_status_change::<LogWarnStatus>(
+                                    &mut self.status_manager,
+                                    format!("Failed to parse file size: {e}"),
+                                );
+                            })
+                            .ok()
+                    });
+
+                    // Hash capture is required.
                     let Some(hash) = captures.name("hash").map(|h| h.as_str().to_string()) else {
-                        tracing::error!(
-                            "Subscribe started but unable to match `hash` capture group"
+                        log_status_change::<LogErrorStatus>(
+                            &mut self.status_manager,
+                            "Subscribe started but unable to match `hash` capture group".into(),
                         );
                         return None;
                     };
+
                     let extension = captures.name("ext").map(|e| e.as_str().to_string());
                     Some((bytes, hash, extension))
-                }) else {
-                    tracing::warn!("Subscribe started with invalid hash input");
+                };
+
+                let Some(p) = HASH_EXT_REGEX.captures(hash_input).and_then(parse_captures) else {
                     return iced::Task::none();
                 };
                 p
@@ -2341,24 +2358,32 @@ impl AppState {
                 hash,
                 file_size,
                 path,
-                intervals: saved_intervals,
+                state: saved_intervals,
             } = saved_download;
 
-            let intervals = if let Some(intervals) = saved_intervals {
-                // Recreate the file intervals from the saved ranges.
-                let mut file_intervals = FileIntervals::new(file_size);
-                for interval in intervals {
-                    if let Err(e) = file_intervals.add_interval(interval) {
-                        log_status_change::<LogErrorStatus>(
-                            &mut self.status_manager,
-                            format!("Failed to recover partial download {hash:#}: {e}"),
-                        );
-                        return iced::Task::none();
+            let intervals = match saved_intervals {
+                // Consented downloads with partial progress.
+                SavedDownloadState::ConsentedDownloadIntervals(intervals) => {
+                    // Recreate the file intervals from the saved ranges.
+                    let mut file_intervals = FileIntervals::new(file_size);
+                    for interval in intervals {
+                        if let Err(e) = file_intervals.add_interval(interval) {
+                            log_status_change::<LogErrorStatus>(
+                                &mut self.status_manager,
+                                format!("Failed to recover partial download {hash:#}: {e}"),
+                            );
+                            return iced::Task::none();
+                        }
                     }
+                    Some(file_intervals)
                 }
-                Some(file_intervals)
-            } else {
-                None
+                SavedDownloadState::ConsentedDownloadOnDisk => None,
+
+                // No size has been consented to, no partial progress.
+                SavedDownloadState::NotConsented => {
+                    // If the download was not consented to we take a different path.
+                    return self.update_subscribe_path_chosen(path, &hash.to_string(), None);
+                }
             };
 
             (hash, file_size, path, intervals)
@@ -3335,23 +3360,19 @@ impl AppState {
                     },
                 }
             };
+
+            // We always use this multi-peer strategy when existing intervals are present.
             return iced::Task::perform(future, std::convert::identity);
         }
 
         let cancellation_token_for_streams = cancellation_token.clone();
         let progress_lock = Arc::new(RwLock::new(0.));
 
-        // Create a future to resume the download.
-        let resume_future = async move {
-            // Get the file size and digest state of the chosen file to publish.
-            let current_file_size = std::fs::metadata(path.as_ref())
-                .map_err(|e| {
-                    Some(DownloadFailure::ResumeHashFile(Arc::new(
-                        crate::core::FileAccessError::Open(e),
-                    )))
-                })?
-                .len();
-
+        // Create a future to resume the download without existing intervals.
+        // This includes the hashing state of a multi-peer download.
+        let resume_future = async move |current_file_size: u64,
+                                        path: &std::path::Path,
+                                        progress_lock: &RwLock<_>| {
             let peer_streams = resume_download_connections(
                 &endpoint,
                 &server,
@@ -3373,12 +3394,10 @@ impl AppState {
             // Use a single peer if only one peer is available or if the file is small enough that resuming with multiple peers would not be worth it.
             if peer_streams.tail.is_empty() || final_file_size - current_file_size < 500_000_000 {
                 // Get the file size and digest state of the chosen file to publish.
-                let (_, current_file_size, digest) = Box::pin(crate::core::file_size_and_hasher(
-                    &path,
-                    Some(&progress_lock),
-                ))
-                .await
-                .map_err(|e| Some(DownloadFailure::ResumeHashFile(Arc::new(e))))?;
+                let (_, current_file_size, digest) =
+                    Box::pin(crate::core::file_size_and_hasher(path, Some(progress_lock)))
+                        .await
+                        .map_err(|e| Some(DownloadFailure::ResumeHashFile(Arc::new(e))))?;
 
                 Ok(ResumeDownloadPlan::SinglePeer(
                     digest,
@@ -3399,18 +3418,80 @@ impl AppState {
         // Resume the transfer.
         iced::Task::perform(
             async move {
+                // Get the file size and digest state of the chosen file to publish.
+                let current_file_size = match std::fs::metadata(path.as_ref()) {
+                    Ok(m) => m.len(),
+                    Err(e) => {
+                        return Message::ResumeFromPartialHashFile(
+                            nonce,
+                            Err(Some(DownloadFailure::ResumeHashFile(Arc::new(
+                                crate::core::FileAccessError::Open(e),
+                            )))),
+                        )
+                    }
+                };
+
+                // If the file has already been downloaded in its entirety, we can skip to verifying the hash and finishing the download.
+                if current_file_size == final_file_size {
+                    // TODO: Reuse existing logic and set the state to `DownloadState::HashingFile` with a new `Message`.
+                    let (_, current_file_size, digest) = match Box::pin(
+                        crate::core::file_size_and_hasher(path.as_ref(), Some(&progress_lock)),
+                    )
+                    .await
+                    {
+                        Ok(r) => r,
+                        Err(e) => {
+                            return Message::ResumeFromPartialHashFile(
+                                nonce,
+                                Err(Some(DownloadFailure::ResumeHashFile(Arc::new(e)))),
+                            )
+                        }
+                    };
+                    if current_file_size == final_file_size {
+                        return if hash == digest.finalize().into() {
+                            tracing::info!("{}", crate::gui::strings::SUCCESSFUL_DOWNLOAD);
+                            Message::DownloadTransferResulted(nonce, DownloadResult::Success)
+                        } else {
+                            Message::DownloadTransferResulted(
+                                nonce,
+                                DownloadResult::Failure(
+                                    DownloadFailure::FileHashMismatch,
+                                    RecoverableState::NonRecoverable,
+                                ),
+                            )
+                        };
+                    }
+                    // If for some reason the metadata size was wrong, fallback to reaching out to peers to complete.
+                }
+
                 tokio::select! {
                     // Allow cancelling the resume request.
                     () = cancellation_token.cancelled() => {
                         tracing::debug!("Cancelling the resume request");
-                        Err(Some(DownloadFailure::ResumeCancelled))
+                        Message::ResumeFromPartialHashFile(nonce, Err(Some(DownloadFailure::ResumeCancelled)))
                     }
 
                     // Await the resume request to complete.
-                    result = resume_future => result,
+                    mut result = resume_future(current_file_size, &path, &progress_lock) => {
+                        // Check if we just finished hashing the entire expected file size.
+                        if let Ok(ResumeDownloadPlan::SinglePeer(digest, file_size, _)) = &mut result {
+                            if *file_size == final_file_size {
+                                let digest = std::mem::take(digest);
+                                return if hash == digest.finalize().into() {
+                                    Message::DownloadTransferResulted(nonce, DownloadResult::Success)
+                                } else {
+                                    Message::DownloadTransferResulted(nonce, DownloadResult::Failure(
+                                        DownloadFailure::FileHashMismatch,
+                                        RecoverableState::NonRecoverable,
+                                    ))
+                                };
+                            }
+                        }
+                        Message::ResumeFromPartialHashFile(nonce, result)
+                    },
                 }
             },
-            move |r| Message::ResumeFromPartialHashFile(nonce, r),
+            std::convert::identity,
         )
     }
 
@@ -4226,21 +4307,43 @@ impl AppState {
                     d.base.cancellation_token.cancel();
 
                     // Ensure all downloads that were in-progress are saved.
-                    let intervals = match d.progress {
+                    let state = match d.progress {
                         // States where no save progress is available or needed.
                         DownloadState::Transferring(DownloadTransferringState {
                             strategy: DownloadStrategy::SinglePeer(_),
                             ..
                         })
-                        | DownloadState::HashingFile { .. } => None,
+                        | DownloadState::HashingFile { .. } => {
+                            SavedDownloadState::ConsentedDownloadOnDisk
+                        }
 
-                        // States where saved intervals are available.
-                        DownloadState::Paused(intervals) => intervals,
+                        // Static download states.
+                        DownloadState::Paused(Some(intervals)) => {
+                            SavedDownloadState::ConsentedDownloadIntervals(intervals.into_ranges())
+                        }
+                        DownloadState::Paused(None) => SavedDownloadState::ConsentedDownloadOnDisk,
                         DownloadState::Done(DownloadResult::Failure(_, r))
                             if r.is_recoverable() =>
                         {
-                            r.into_intervals()
+                            if let Some(intervals) = r.into_intervals() {
+                                SavedDownloadState::ConsentedDownloadIntervals(
+                                    intervals.into_ranges(),
+                                )
+                            } else {
+                                SavedDownloadState::ConsentedDownloadOnDisk
+                            }
                         }
+                        DownloadState::NoPeersAvailable(DownloadConsentState::Consented(
+                            saved_intervals,
+                        )) if saved_intervals.is_recoverable() => {
+                            if let Some(i) = saved_intervals.into_intervals() {
+                                SavedDownloadState::ConsentedDownloadIntervals(i.into_ranges())
+                            } else {
+                                SavedDownloadState::ConsentedDownloadOnDisk
+                            }
+                        }
+
+                        // Save the interval progresses at this moment.
                         DownloadState::Transferring(DownloadTransferringState {
                             strategy:
                                 DownloadStrategy::MultiPeer(DownloadMultiPeer { intervals, .. }),
@@ -4259,23 +4362,21 @@ impl AppState {
                             .map_or_else(
                                 |e| {
                                     tracing::error!("Failed to convert multi-peer intervals: {e}");
-                                    None
+
+                                    // Since the conversion failed (somehow) and we can't assume the file is contiguous, start from scratch.
+                                    SavedDownloadState::ConsentedDownloadIntervals(Vec::new())
                                 },
-                                Some,
+                                |i| SavedDownloadState::ConsentedDownloadIntervals(i.into_ranges()),
                             ),
-                        DownloadState::NoPeersAvailable(DownloadConsentState::Consented(
-                            saved_intervals,
-                        )) if saved_intervals.is_recoverable() => saved_intervals.into_intervals(),
 
                         // In other cases, do not save the download.
                         _ => return None,
-                    }
-                    .map(FileIntervals::into_ranges);
+                    };
                     Some(SavedDownload {
                         hash: d.base.hash,
                         file_size: d.base.file_size,
                         path: d.base.path.as_ref().clone(),
-                        intervals,
+                        state,
                     })
                 }));
 
@@ -4890,7 +4991,7 @@ async fn multi_peer_download_verify(
         Ok((calc_file_size, calc_file_hash)) => {
             if calc_file_hash == file_hash {
                 if calc_file_size == file_size {
-                    tracing::info!("Successful multi-peer download of hash {file_hash}");
+                    tracing::info!("{}", crate::gui::strings::SUCCESSFUL_DOWNLOAD);
                     return DownloadResult::Success;
                 }
                 DownloadFailure::FileSizeMismatch

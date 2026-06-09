@@ -6,7 +6,7 @@ license = "MIT"
 
 [dependencies]
 bytes = "1.11"
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.6", features = ["derive"] }
 displaydoc = "0.2"
 file_yeet_shared = { path = "../shared" }
 futures-util = "0.3"
@@ -15,7 +15,7 @@ rand = "0.10"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pki-types = { version = "1.14", features = ["std"] }
 thiserror = "2.0"
-tokio = { version = "1.49", features = ["io-util", "macros", "net", "rt-multi-thread", "signal"] }
+tokio = { version = "1.52", features = ["io-util", "macros", "net", "rt-multi-thread", "signal"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"

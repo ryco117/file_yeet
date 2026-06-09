@@ -969,8 +969,7 @@ pub async fn download_partial_from_peer(
 
     if let Some((hasher, Some(expected_hash))) = hasher.take() {
         // Ensure the file hash is correct.
-        let downloaded_hash = HashBytes::new(hasher.finalize().into());
-        if expected_hash == downloaded_hash {
+        if expected_hash == hasher.finalize().into() {
             tracing::info!("Validated download hash");
         } else {
             return Err(DownloadError::HashMismatch);

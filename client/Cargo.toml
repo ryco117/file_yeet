@@ -8,7 +8,7 @@ license = "MIT"
 bytes = "1.11"
 chrono = "0.4"
 circular-buffer = "1.2"
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.6", features = ["derive"] }
 crab_nat = { version = "0.7", features = ["tracing"] }
 dirs = "6.0"
 displaydoc = "0.2"
@@ -18,7 +18,7 @@ futures-channel = "0.3"
 futures-util = "0.3"
 human_bytes = { version = "0.4", features = ["fast"] }
 iced = { version = "0.14", features = ["tokio"] }
-netdev = "0.43"
+netdev = "0.44"
 nonempty = "0.12"
 open = "5.3"
 quinn = "0.11"
@@ -29,7 +29,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.11"
 thiserror = "2.0"
-tokio = { version = "1.48", features = ["fs", "macros", "net", "rt-multi-thread", "signal"] }
+tokio = { version = "1.52", features = ["fs", "macros", "net", "rt-multi-thread", "signal"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
 tracing-appender = "0.2"

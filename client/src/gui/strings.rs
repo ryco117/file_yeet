@@ -27,6 +27,7 @@ pub const DOWNLOAD_NOT_MULTI_PEER_TRANSFERRING: &str =
 pub const CANCEL_DOWNLOAD_TOOLTIP: &str = "Cancel the download, abandoning progress";
 pub const RETRY_DOWNLOAD_TOOLTIP: &str =
     "Retry the download attempt, reusing any saved partial progress";
+pub const SUCCESSFUL_DOWNLOAD: &str = "Successful download, verified hash and file size";
 
 // Transfer strings. Remnant of when uploads/downloads shared more code.
 pub const TRANSFERRING_ELLIPSIS: &str = "Transferring...";
