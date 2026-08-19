@@ -5,7 +5,7 @@ edition = "2021"
 license = "MIT"
 
 [dependencies]
-bytes = "1.11"
+bytes = "1.12"
 faster-hex = "0.10"
 num_enum = "0.7"
 quinn = "0.11"
@@ -14,4 +14,4 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 serde = { version = "1.0", features = ["derive"] }
 sha2 = "0.11"
 thiserror = "2.0"
-tokio = "1.52"
+tokio = "1.53"

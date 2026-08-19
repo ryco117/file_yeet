@@ -12,7 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use circular_buffer::CircularBuffer;
+use circular_buffer::FixedCircularBuffer;
 use file_yeet_shared::{
     BiStream, HashBytes, ReadIpPortError, DEFAULT_PORT, GOODBYE_CODE, GOODBYE_MESSAGE,
 };
@@ -298,7 +298,7 @@ impl ConnectionState {
 #[derive(Default)]
 struct StatusManager {
     pub message: Option<(String, LogLevel)>,
-    pub history: CircularBuffer<MAX_LOG_HISTORY_LINES, (String, LogLevel)>,
+    pub history: FixedCircularBuffer<(String, LogLevel), MAX_LOG_HISTORY_LINES>,
     pub history_visible: bool,
 }
 

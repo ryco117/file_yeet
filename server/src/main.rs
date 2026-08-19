@@ -186,13 +186,14 @@ async fn main() {
     tracing::info!("Using bind address: {bind_address:?}");
 
     // Load or generate a certificate and private key for QUIC.
-    let (server_cert, server_key) =
-        if let (Some(cert_path), Some(key_path)) = (args.tls_cert, args.tls_key) {
-            load_tls_files(&cert_path, &key_path).expect("Failed to load TLS certificate and key")
-        } else {
-            file_yeet_shared::generate_self_signed_cert()
-                .expect("Failed to generate self-signed certificate")
-        };
+    let (server_cert, server_key) = if let (Some(cert_path), Some(key_path)) =
+        (args.tls_cert.as_ref(), args.tls_key.as_ref())
+    {
+        load_tls_files(cert_path, key_path).expect("Failed to load TLS certificate and key")
+    } else {
+        file_yeet_shared::generate_self_signed_cert()
+            .expect("Failed to generate self-signed certificate")
+    };
     tracing::debug!("TLS certificate and key ready");
 
     let mut server_config = quinn::ServerConfig::with_single_cert(vec![server_cert], server_key)
@@ -219,7 +220,7 @@ async fn main() {
     let global_cancellation_token = CancellationToken::new();
     let task_master = TaskTracker::new();
 
-    // Optionally start an admin server bound to localhost.
+    // Optionally, start an admin server bound to localhost.
     if let Some(admin_port) = args.admin_port {
         task_master.spawn(admin_server_loop(
             admin_port,
@@ -228,6 +229,35 @@ async fn main() {
             global_cancellation_token.clone(),
             task_master.clone(),
         ));
+    }
+
+    // Optionally, start a task to periodically reload the TLS certificate and key files if they are provided.
+    if let (Some(cert_path), Some(key_path)) = (args.tls_cert, args.tls_key) {
+        let local_endpoint = local_end.clone();
+        task_master.spawn(async move {
+            let mut duration = tokio::time::interval(std::time::Duration::from_hours(1));
+            duration.tick().await;
+            loop {
+                duration.tick().await;
+                match load_tls_files(&cert_path, &key_path) {
+                    Ok((server_cert, server_key)) => {
+                        if let Err(e) =
+                            quinn::ServerConfig::with_single_cert(vec![server_cert], server_key)
+                                .map(|config| {
+                                    local_endpoint.set_server_config(Some(config));
+                                })
+                        {
+                            tracing::error!("Quinn failed to accept the server certificates: {e}");
+                        } else {
+                            tracing::info!("Successfully reloaded TLS certificate and key: cert - {} and key - {}", cert_path.display(), key_path.display());
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to reload TLS certificate and key: {e}");
+                    }
+                }
+            }
+        });
     }
 
     // Create a loop to handle QUIC connections, but allow Ctrl+C to cancel the loop.

@@ -1,15 +1,15 @@
 [package]
 name = "file_yeet_client"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 license = "MIT"
 
 [dependencies]
-bytes = "1.11"
+bytes = "1.12"
 chrono = "0.4"
-circular-buffer = "1.2"
+circular-buffer = "2.0"
 clap = { version = "4.6", features = ["derive"] }
-crab_nat = { version = "0.7", features = ["tracing"] }
+crab_nat = { version = "0.8", features = ["tracing"] }
 dirs = "6.0"
 displaydoc = "0.2"
 faster-hex = "0.10"
@@ -18,18 +18,18 @@ futures-channel = "0.3"
 futures-util = "0.3"
 human_bytes = { version = "0.4", features = ["fast"] }
 iced = { version = "0.14", features = ["tokio"] }
-netdev = "0.44"
+netdev = "0.46"
 nonempty = "0.12"
-open = "5.3"
+open = "5.4"
 quinn = "0.11"
-regex = "1.12"
+regex = "1.13"
 rfd = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.11"
 thiserror = "2.0"
-tokio = { version = "1.52", features = ["fs", "macros", "net", "rt-multi-thread", "signal"] }
+tokio = { version = "1.53", features = ["fs", "macros", "net", "rt-multi-thread", "signal"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
 tracing-appender = "0.2"

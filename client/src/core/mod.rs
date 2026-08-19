@@ -334,7 +334,7 @@ async fn try_port_mapping(
     local_address: SocketAddr,
 ) -> Result<crab_nat::PortMapping, crab_nat::MappingFailure> {
     crab_nat::PortMapping::new(
-        gateway,
+        gateway.into(),
         local_address.ip(),
         crab_nat::InternetProtocol::Udp,
         std::num::NonZeroU16::new(local_address.port()).expect("Socket address has no port"),
