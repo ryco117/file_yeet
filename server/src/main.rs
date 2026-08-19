@@ -235,11 +235,18 @@ async fn main() {
     // Optionally, start a task to periodically reload the TLS certificate and key files if they are provided.
     if let (Some(cert_path), Some(key_path)) = (args.tls_cert, args.tls_key) {
         let local_endpoint = local_end.clone();
+        let cancellation_token = global_cancellation_token.clone();
+
         task_master.spawn(async move {
             let mut duration = tokio::time::interval(std::time::Duration::from_hours(1));
             duration.tick().await;
             loop {
-                duration.tick().await;
+                // Ensure that this task is cancellable.
+                tokio::select! {
+                    () = cancellation_token.cancelled() => break,
+                    _ = duration.tick() => {}
+                };
+
                 match load_tls_files(&cert_path, &key_path) {
                     Ok((server_cert, server_key)) => {
                         if let Err(e) =
