@@ -19,7 +19,7 @@ pub const HASH_BYTE_COUNT: usize = 256 / 8;
 
 /// The maximum number of milliseconds of inactivity before a QUIC connection is closed.
 /// Same for both the server and the client.
-pub const QUIC_TIMEOUT_MILLIS: u32 = 240_000;
+pub const QUIC_TIMEOUT_MILLIS: u32 = 300_000;
 
 /// Code sent on a graceful disconnect.
 pub const GOODBYE_CODE: quinn::VarInt = quinn::VarInt::from_u32(0);
@@ -310,7 +310,8 @@ pub fn server_transport_config() -> Arc<quinn::TransportConfig> {
     transport_config.max_idle_timeout(Some(quinn::IdleTimeout::from(quinn::VarInt::from_u32(
         QUIC_TIMEOUT_MILLIS,
     ))));
-    transport_config.keep_alive_interval(Some(Duration::from_secs(30)));
+    transport_config
+        .keep_alive_interval(Some(Duration::from_millis(QUIC_TIMEOUT_MILLIS as u64 / 6)));
     Arc::new(transport_config)
 }
 
