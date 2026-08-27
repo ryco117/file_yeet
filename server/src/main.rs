@@ -20,6 +20,7 @@ use tokio::{
 };
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
+// Control connections and requests from the local admin server.
 mod admin;
 
 /// A client stream that is handling a publish request.
@@ -197,14 +198,20 @@ async fn main() {
     };
     tracing::debug!("TLS certificate and key ready");
 
-    let mut server_config = quinn::ServerConfig::with_single_cert(vec![server_cert], server_key)
+    let new_server_config = |cert, key| -> Result<_, rustls::Error> {
+        let mut config = quinn::ServerConfig::with_single_cert(vec![cert], key)?;
+
+        // Set custom keep alive policies.
+        config.transport_config(file_yeet_shared::server_transport_config());
+
+        // Tell the clients that they cannot change their socket address mid connection since
+        // without a way to catch these changes we can't update the socket address to share with peers.
+        config.migration(false);
+
+        Ok(config)
+    };
+    let server_config = new_server_config(server_cert, server_key)
         .expect("Quinn failed to accept the server certificates");
-
-    // Set custom keep alive policies.
-    server_config.transport_config(file_yeet_shared::server_transport_config());
-
-    // Tell the clients that they cannot change their socket address mid connection since it will disrupt peer-to-peer connecting.
-    server_config.migration(false);
 
     // Create a new QUIC endpoint.
     let local_end = quinn::Endpoint::server(server_config, bind_address)
@@ -233,12 +240,13 @@ async fn main() {
     }
 
     // Optionally, start a task to periodically reload the TLS certificate and key files if they are provided.
+    // TODO: Use filesystem last modified timestamps to only reload if the files have changed.
     if let (Some(cert_path), Some(key_path)) = (args.tls_cert, args.tls_key) {
         let local_endpoint = local_end.clone();
         let cancellation_token = global_cancellation_token.clone();
 
         task_master.spawn(async move {
-            let mut duration = tokio::time::interval(std::time::Duration::from_hours(1));
+            let mut duration = tokio::time::interval(std::time::Duration::from_hours(8));
             duration.tick().await;
             loop {
                 // Ensure that this task is cancellable.
@@ -250,19 +258,17 @@ async fn main() {
                 match load_tls_files(&cert_path, &key_path) {
                     Ok((server_cert, server_key)) => {
                         if let Err(e) =
-                            quinn::ServerConfig::with_single_cert(vec![server_cert], server_key)
+                            new_server_config(server_cert, server_key)
                                 .map(|config| {
                                     local_endpoint.set_server_config(Some(config));
                                 })
                         {
                             tracing::error!("Quinn failed to accept the server certificates: {e}");
                         } else {
-                            tracing::info!("Successfully reloaded TLS certificate and key: cert - {} and key - {}", cert_path.display(), key_path.display());
+                            tracing::debug!("Successfully reloaded TLS certificate and key: cert - {} and key - {}", cert_path.display(), key_path.display());
                         }
                     }
-                    Err(e) => {
-                        tracing::error!("Failed to reload TLS certificate and key: {e}");
-                    }
+                    Err(e) => tracing::error!("Failed to reload TLS certificate and key from file: {e}"),
                 }
             }
         });

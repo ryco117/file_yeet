@@ -116,7 +116,11 @@ async fn handle_admin_connection(
                         let mut resp = String::new();
                         for (hash, count) in snapshot {
                             use std::fmt::Write as _;
-                            let _ = writeln!(resp, "{hash} ({count} publisher(s))");
+                            let _ = writeln!(
+                                resp,
+                                "{hash} ({count} publisher{}",
+                                if count == 1 { "" } else { "s" }
+                            );
                         }
                         resp.into()
                     }

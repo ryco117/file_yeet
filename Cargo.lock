@@ -1164,7 +1164,7 @@ dependencies = [
 
 [[package]]
 name = "file_yeet_server"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "bytes",
  "clap",
