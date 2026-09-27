@@ -16,13 +16,16 @@ use crate::{
     core::{
         create_sized_file, humanize_bytes,
         intervals::{FileIntervals, RangeData},
-        ConnectionIntoStreamError, DownloadError, FileAccessError, FileYeetCommandType,
-        ReadPubRangeError, SubscribeError, UploadError,
+        peer::{
+            ConnectionIntoStreamError, DownloadError, PeerRequestStream, ReadPubRangeError,
+            UploadError,
+        },
+        server::SubscribeError,
+        FileAccessError, FileYeetCommandType,
     },
     gui::{
         confirmation, full_download, remove_nonce_for_peer, strings, text_horizontal_scrollbar,
-        timed_tooltip, CreateOrExisting, Message, Nonce, NonceItem, PeerRequestStream,
-        ERROR_RED_COLOR,
+        timed_tooltip, CreateOrExisting, Message, Nonce, NonceItem, ERROR_RED_COLOR,
     },
 };
 

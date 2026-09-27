@@ -21,7 +21,7 @@ pub enum PublishFileError {
     FileAccess(#[from] FileAccessError),
 
     #[error("{0}")]
-    Publish(#[from] crate::core::PublishError),
+    Publish(#[from] crate::core::server::PublishError),
 
     #[error("{0}")]
     SocketRead(#[from] ReadIpPortError),

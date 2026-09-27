@@ -181,7 +181,7 @@ async fn main() {
     let SocketAddrHelper {
         address: bind_address,
         hostname: _,
-    } = file_yeet_shared::get_server_or_default(args.bind_ip.as_deref(), args.bind_port)
+    } = file_yeet_shared::hostname_and_port_to_socket_addr(args.bind_ip.as_deref(), args.bind_port)
         .expect("Failed to parse server address");
 
     // Print out the address we're going to bind to.

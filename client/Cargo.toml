@@ -22,6 +22,7 @@ netdev = "0.46"
 nonempty = "0.12"
 open = "5.4"
 quinn = "0.11"
+rcgen = "0.14"
 regex = "1.13"
 rfd = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

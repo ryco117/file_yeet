@@ -8,11 +8,11 @@ use tokio::io::AsyncWriteExt as _;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    core::{ConnectionsManager, ReadSubscribingPeerError},
+    core::{peer::PeerRequestStream, server::ReadSubscribingPeerError, ConnectionsManager},
     gui::{
         publish::{Publish, PublishItem, PublishRequestResult, PublishState},
         transfers::{DownloadState, DownloadTransfer},
-        IncomingSubscribePeers, Message, Nonce, PeerRequestStream, TOOLTIP_WAIT_DURATION,
+        IncomingSubscribePeers, Message, Nonce, TOOLTIP_WAIT_DURATION,
     },
 };
 
@@ -186,7 +186,7 @@ async fn peers_requesting_publish_inner_loop(
             }
 
             // Await the server to send a peer connection.
-            result = crate::core::read_subscribing_peer(
+            result = crate::core::server::read_subscribing_peer(
                 &mut request.recv,
                 Some(our_external_address),
             ) => {
@@ -452,10 +452,11 @@ where
 
                         // Attempt to start a download where the final size hasn't been accepted yet.
                         tracing::debug!("Checking for new peers for {hash:#}");
-                        let result = crate::core::subscribe(&server, hash, Some(external_address))
-                            .await
-                            .map(|peers| IncomingSubscribePeers::existing(peers, nonce))
-                            .map_err(Arc::new);
+                        let result =
+                            crate::core::server::subscribe(&server, hash, Some(external_address))
+                                .await
+                                .map(|peers| IncomingSubscribePeers::existing(peers, nonce))
+                                .map_err(Arc::new);
                         output
                             .send(Message::SubscribePeersResult(result))
                             .await

@@ -19,6 +19,7 @@ pub const HASH_BYTE_COUNT: usize = 256 / 8;
 
 /// The maximum number of milliseconds of inactivity before a QUIC connection is closed.
 /// Same for both the server and the client.
+/// Five minutes is used to allow for reasonable detection of inactivity while still allowing low-impact keep-alive messages.
 pub const QUIC_TIMEOUT_MILLIS: u32 = 300_000;
 
 /// Code sent on a graceful disconnect.
@@ -159,16 +160,16 @@ impl std::fmt::Display for ClientApiRequest {
     }
 }
 
-/// Helper to get either the socket address corresponding to the user's input, or the default of IPv4 localhost.
-/// If `server_address` is `None` or empty, will use the `localhost` address for the server.
+/// Helper to get the socket address corresponding to the user's input.
+/// If `hostname` is `None` or an empty string, will use `localhost` for the server.
 /// # Errors
-/// If there is `Some(..)` non-empty server address, then it must be able to parse into a socket address using `ToSocketAddrs`.
-pub fn get_server_or_default(
-    server_address: Option<&str>,
+/// If there is `Some(..)` non-empty hostname, then it must be able to parse into a socket address using `ToSocketAddrs` when paired with a port.
+pub fn hostname_and_port_to_socket_addr(
+    hostname: Option<&str>,
     port: NonZeroU16,
 ) -> Result<SocketAddrHelper, std::io::Error> {
     // Parse the server address if one was specified.
-    server_address
+    hostname
         .iter()
         .find_map(|&s| {
             if s.is_empty() {

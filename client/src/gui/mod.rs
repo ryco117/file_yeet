@@ -29,10 +29,10 @@ use crate::{
         intervals::{
             self, merge_adjacent_ranges, FileIntervals, RangeData as _, DOWNLOAD_CHUNK_INTERVAL_MIN,
         },
-        peer_connection_into_stream, udp_holepunch, ConnectionsManager, FileYeetCommandType,
-        Hasher, PortMappingConfig, PrepareConnectionError, PreparedConnection,
-        ReadSubscribingPeerError, SubscribeError, HASH_EXT_REGEX, PEER_CONNECT_TIMEOUT,
-        SERVER_CONNECTION_TIMEOUT,
+        peer::{udp_holepunch, PeerRequestStream, PEER_CONNECT_TIMEOUT},
+        server::{ReadSubscribingPeerError, SubscribeError, SERVER_CONNECTION_TIMEOUT},
+        ConnectionsManager, CreateLocalEndpointError, FileYeetCommandType, Hasher,
+        PortMappingConfig, HASH_EXT_REGEX,
     },
     gui::{
         confirmation::ConfirmationDialog,
@@ -82,6 +82,9 @@ const MAX_SHUTDOWN_WAIT: Duration = Duration::from_secs(3);
 /// The red used to display errors to the user.
 const ERROR_RED_COLOR: iced::Color = iced::Color::from_rgb(1., 0.35, 0.45);
 
+/// The red used to display errors to the user.
+const INFO_WHITE_COLOR: iced::Color = iced::Color::WHITE;
+
 /// The yellow used to display warnings to the user.
 const WARN_YELLOW_COLOR: iced::Color = iced::Color::from_rgb(1., 0.85, 0.35);
 
@@ -93,29 +96,6 @@ const MAX_LOG_HISTORY_LINES: usize = 256;
 
 /// Maximum time to wait to gracefully reject a download.
 const MAX_REJECT_TIMEOUT: Duration = Duration::from_millis(250);
-
-/// A peer connection representing a single request/command.
-/// Peers may have multiple connections to the same peer for different requests.
-#[derive(Clone, Debug)]
-pub struct PeerRequestStream {
-    pub connection: quinn::Connection,
-    pub bistream: Arc<tokio::sync::Mutex<BiStream>>,
-}
-impl PeerRequestStream {
-    /// Make a new `PeerConnection` from a QUIC connection and a bi-directional stream.
-    #[must_use]
-    pub fn new(connection: quinn::Connection, streams: BiStream) -> Self {
-        Self {
-            connection,
-            bistream: Arc::new(tokio::sync::Mutex::new(streams)),
-        }
-    }
-}
-impl From<(quinn::Connection, BiStream)> for PeerRequestStream {
-    fn from((connection, streams): (quinn::Connection, BiStream)) -> Self {
-        Self::new(connection, streams)
-    }
-}
 
 /// Nonce used to identifying items locally.
 type Nonce = u64;
@@ -138,6 +118,18 @@ trait NonceItem {
 pub enum CreateOrExisting<D> {
     Create(D),
     Existing(Nonce),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum InitServerConnectionError {
+    #[error("Failed to resolve server hostname: {0}")]
+    ResolveHostname(#[from] std::io::Error),
+
+    #[error("Failed to create local endpoint: {0}")]
+    CreateLocalEndpointError(#[from] CreateLocalEndpointError),
+
+    #[error("Failed to initialize server connection: {0}")]
+    InitConnection(#[from] crate::core::server::PrepareConnectionError),
 }
 
 /// The result of a subscribe request.
@@ -392,7 +384,14 @@ pub enum Message {
 
     /// Handle the result of a server connection attempt.
     /// `None` indicates the attempt was cancelled by the user.
-    ConnectResulted(Option<Result<crate::core::PreparedConnection, Arc<PrepareConnectionError>>>),
+    ConnectResulted(
+        Option<
+            Result<
+                (quinn::Endpoint, crate::core::server::PreparedConnection),
+                Arc<InitServerConnectionError>,
+            >,
+        >,
+    ),
 
     /// Update the current port mapping state.
     PortMappingUpdated(Option<crab_nat::PortMapping>),
@@ -1452,7 +1451,7 @@ impl AppState {
         };
 
         // If the server address is invalid, display an error message and return.
-        let (server_address, port) = match regex_match {
+        let (server_address, server_port) = match regex_match {
             Ok(p) => p,
             Err(error_string) => {
                 log_status_change::<LogWarnStatus>(&mut self.status_manager, error_string);
@@ -1476,7 +1475,7 @@ impl AppState {
             }
         };
 
-        tracing::debug!("Trying connection to server {server_address}:{port}");
+        tracing::debug!("Trying connection to server {server_address}:{server_port}");
 
         // Set the state to `Stalling` before starting the connection attempt.
         let (stalling_state, cancellation_token) = ConnectionState::new_connect_stalling();
@@ -1484,7 +1483,12 @@ impl AppState {
 
         // Try to get the user's intent from the GUI options.
         let port_mapping = match self.options.port_mapping {
-            PortMappingSetting::None | PortMappingSetting::PortForwarding(None) => {
+            PortMappingSetting::None => PortMappingConfig::None,
+            PortMappingSetting::PortForwarding(None) => {
+                log_status_change::<LogWarnStatus>(
+                    &mut self.status_manager,
+                    "Invalid port forward, fallback to no port mapping logic".to_owned(),
+                );
                 PortMappingConfig::None
             }
             PortMappingSetting::PortForwarding(Some(port)) => {
@@ -1498,18 +1502,28 @@ impl AppState {
         let skip_server_cert_verification =
             self.options.skip_server_cert_verification.unwrap_or(false);
 
+        let future = async move || -> Result<(quinn::Endpoint, crate::core::server::PreparedConnection), InitServerConnectionError> {
+            // Get the server address info.
+            let server_socket = file_yeet_shared::hostname_and_port_to_socket_addr(Some(&server_address), server_port)?;
+
+            let ip_version = server_socket.address.ip().into();
+            let endpoint = crate::core::create_local_endpoint(internal_port, ip_version)?;
+            let connection = crate::core::server::prepare_server_connection(
+                &endpoint,
+                server_socket,
+                gateway.as_deref(),
+                port_mapping,
+                skip_server_cert_verification,
+            ).await?;
+
+            Ok((endpoint, connection))
+        };
+
         // Try to connect to the server in a new task.
         iced::Task::perform(
             async move {
                 tokio::select! {
-                    result = crate::core::prepare_server_connection(
-                        Some(&server_address),
-                        port,
-                        gateway.as_deref(),
-                        internal_port,
-                        port_mapping,
-                        skip_server_cert_verification,
-                    ) => Some(result.map_err(Arc::new)),
+                    result = future() => Some(result.map_err(Arc::new)),
                     () = cancellation_token.cancelled() => None,
                 }
             },
@@ -1553,7 +1567,12 @@ impl AppState {
     #[tracing::instrument(skip(self, result))]
     fn update_connect_resulted(
         &mut self,
-        result: Option<Result<PreparedConnection, Arc<PrepareConnectionError>>>,
+        result: Option<
+            Result<
+                (quinn::Endpoint, crate::core::server::PreparedConnection),
+                Arc<InitServerConnectionError>,
+            >,
+        >,
     ) -> iced::Task<Message> {
         // A `None` result means the connection attempt was cancelled; nothing left to do.
         let Some(result) = result else {
@@ -1562,9 +1581,8 @@ impl AppState {
         };
 
         match result {
-            Ok(prepared) => {
-                let PreparedConnection {
-                    endpoint,
+            Ok((endpoint, prepared)) => {
+                let crate::core::server::PreparedConnection {
                     server_connection,
                     external_address,
                     port_mapping,
@@ -1899,7 +1917,10 @@ impl AppState {
         };
 
         if saving_hash {
-            tracing::info!("File is larger than 1GB, saving hash to disk early");
+            log_status_change::<LogInfoStatus>(
+                &mut self.status_manager,
+                "File is larger than 1GB, saving hash to disk early".to_owned(),
+            );
 
             // Append the new publish to the list of last publishes.
             self.options.last_publishes.push(SavedPublish::new(
@@ -1966,8 +1987,8 @@ impl AppState {
                 // Check if this error indicates we lost connection to the server.
                 let should_disconnect = match e.as_ref() {
                     publish::PublishFileError::Publish(publish_error) => match publish_error {
-                        crate::core::PublishError::Connection(_) => true,
-                        crate::core::PublishError::SendRequest(write_error) => {
+                        crate::core::server::PublishError::Connection(_) => true,
+                        crate::core::server::PublishError::SendRequest(write_error) => {
                             should_disconnect_on_write_error(write_error)
                         }
                     },
@@ -2170,7 +2191,7 @@ impl AppState {
                 let mut streams = peer.bistream.lock().await;
 
                 let (start_index, upload_length) =
-                    match crate::core::read_publish_range(&mut streams, file_size).await {
+                    match crate::core::peer::read_publish_range(&mut streams, file_size).await {
                         Ok(range) => range,
                         Err(e) => {
                             return UploadResult::Failure(UploadFailure::ReadPeerUploadRange(
@@ -2190,7 +2211,7 @@ impl AppState {
 
                 tokio::select! {
                     () = cancellation_token.cancelled() => UploadResult::Cancelled,
-                    result = Box::pin(crate::core::upload_to_peer(
+                    result = Box::pin(crate::core::peer::upload_to_peer(
                         &mut streams,
                         start_index,
                         upload_length,
@@ -2302,7 +2323,7 @@ impl AppState {
         self.modal_state = ModalState::Confirmation(ConfirmationDialog {
             title: "Confirm download size".into(),
             message: format!(
-                "The file size is {} bytes. Do you want to continue?",
+                "The file size is {}. Do you want to continue?",
                 humanize_bytes(expected_bytes)
             )
             .into(),
@@ -2372,7 +2393,7 @@ impl AppState {
         let external_address = external_address.0;
         iced::Task::perform(
             async move {
-                crate::core::subscribe(&server, hash, Some(external_address))
+                crate::core::server::subscribe(&server, hash, Some(external_address))
                     .await
                     .map(|mut publishing_peers| {
                         // If a specific file size is expected, filter out peers reporting a different size
@@ -2936,7 +2957,7 @@ impl AppState {
             // Reject the download request on all peer streams.
             let reject_futures = r.into_iter().map(|peer| async move {
                 let mut bi_stream = peer.bistream.lock().await;
-                if let Err(e) = crate::core::reject_download_request(&mut bi_stream).await {
+                if let Err(e) = crate::core::peer::reject_download_request(&mut bi_stream).await {
                     tracing::debug!("Failed to reject download request: {e}");
                 }
             });
@@ -4529,12 +4550,14 @@ trait LogStatusLevel {
 }
 enum LogLevel {
     Error,
+    Info,
     Warn,
 }
 impl LogLevel {
     fn color(&self) -> iced::Color {
         match self {
             LogLevel::Error => ERROR_RED_COLOR,
+            LogLevel::Info => INFO_WHITE_COLOR,
             LogLevel::Warn => WARN_YELLOW_COLOR,
         }
     }
@@ -4546,6 +4569,15 @@ impl LogStatusLevel for LogErrorStatus {
     }
     fn log_level() -> LogLevel {
         LogLevel::Error
+    }
+}
+struct LogInfoStatus;
+impl LogStatusLevel for LogInfoStatus {
+    fn log_status(status: &str) {
+        tracing::info!("{status}");
+    }
+    fn log_level() -> LogLevel {
+        LogLevel::Info
     }
 }
 struct LogWarnStatus;
@@ -4623,8 +4655,8 @@ fn should_disconnect_on_read_ip_port_error(error: &ReadIpPortError) -> bool {
             // Check if this io::Error wraps a quinn ReadExactError.
             io_error
                 .get_ref()
-                .and_then(|e| e.downcast_ref::<quinn::ReadExactError>())
-                .is_some_and(should_disconnect_on_read_exact_error)
+                .and_then(|e| e.downcast_ref::<quinn::ReadError>())
+                .is_some_and(should_disconnect_on_read_error)
         }
 
         // The server should not be sending unspecified addresses, but it is recoverable.
@@ -4791,7 +4823,7 @@ async fn try_peer_connection(
     use PeerConnectionOrTarget::{Connection, Target};
     tokio::time::timeout(PEER_CONNECT_TIMEOUT, async move {
         match peer {
-            Connection(c) => match peer_connection_into_stream(&c, hash, cmd).await {
+            Connection(c) => match crate::core::peer::connection_into_stream(&c, hash, cmd).await {
                 Ok(s) => Some((c, s)),
                 Err(e) => {
                     tracing::error!("Failed to open stream on existing connection: {e}");
@@ -4826,7 +4858,7 @@ async fn full_download(
         () = cancellation_token.cancelled() => DownloadResult::Cancelled,
 
         // Await the file to be downloaded.
-        result = crate::core::download_from_peer(
+        result = crate::core::peer::download_from_peer(
             hash,
             &mut peer_stream_lock,
             file_size,
@@ -4880,10 +4912,10 @@ async fn partial_download(
     tokio::select! {
         () = cancellation_token.cancelled() => DownloadResult::Cancelled,
 
-        result = Box::pin(crate::core::download_partial_from_peer(
+        result = Box::pin(crate::core::peer::download_partial_from_peer(
             &mut request,
             &mut file,
-            crate::core::DownloadOffsetState::new(file_range, hasher.map(|h| (h, Some(hash)))),
+            crate::core::peer::DownloadOffsetState::new(file_range, hasher.map(|h| (h, Some(hash)))),
             Some(&byte_progress),
         )) => match result {
             Ok(()) => DownloadResult::Success,
@@ -4983,7 +5015,7 @@ async fn publish_request_to_server(
         () = cancellation_token.cancelled() => PublishRequestResult::Cancelled,
 
         // Create a bi-directional stream to the server for this publish request.
-        r = crate::core::publish(&server, hash, file_size) => match r {
+        r = crate::core::server::publish(&server, hash, file_size) => match r {
             Ok(b) => PublishRequestResult::Success(IncomingPublishSession::new(b, hash, file_size)),
             Err(e) => PublishRequestResult::Failure(Arc::new(e.into())),
         },
@@ -5001,7 +5033,7 @@ async fn multi_peer_download_next_chunk(
 ) -> DownloadResult {
     // Create a request stream to the peer.
     let request =
-        crate::core::peer_connection_into_stream(&peer, hash, FileYeetCommandType::Sub).await;
+        crate::core::peer::connection_into_stream(&peer, hash, FileYeetCommandType::Sub).await;
 
     let request = match request {
         Ok(r) => PeerRequestStream::new(peer, r),
@@ -5054,7 +5086,7 @@ async fn multi_peer_download_verify(
 
 /// The possible failure states when attempting to prepare connections to resume a download.
 enum ResumeConnectionsError {
-    SubscribeFailed(crate::core::SubscribeError),
+    SubscribeFailed(crate::core::server::SubscribeError),
     NoPeersAvailable,
     NoPeersReachable,
 }
@@ -5069,7 +5101,7 @@ async fn resume_download_connections(
     cancellation_token: &CancellationToken,
 ) -> Result<nonempty::NonEmpty<PeerRequestStream>, ResumeConnectionsError> {
     // Get the list of peers to resume the download from.
-    let peers = crate::core::subscribe(server, hash, Some(external_address))
+    let peers = crate::core::server::subscribe(server, hash, Some(external_address))
         .await
         .map_err(ResumeConnectionsError::SubscribeFailed)?;
 

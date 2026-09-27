@@ -9,7 +9,7 @@ use file_yeet_shared::{BiStream, HashBytes, GOODBYE_CODE, GOODBYE_MESSAGE};
 use futures_util::{stream::FuturesUnordered, StreamExt};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
-use crate::core::{humanize_bytes, FileYeetCommandType, PreparedConnection, HASH_EXT_REGEX};
+use core::{humanize_bytes, FileYeetCommandType, HASH_EXT_REGEX};
 
 mod core;
 mod gui;
@@ -144,12 +144,23 @@ fn main() {
         }
     };
     async_runtime.block_on(async move {
-        // Connect to the specified file_yeet server.
-        let prepared_connection = core::prepare_server_connection(
+        // Get the server address info.
+        let server_socket = file_yeet_shared::hostname_and_port_to_socket_addr(
             args.server_address.as_deref(),
             args.server_port,
+        )
+        .expect("Failed to parse server address");
+        let ip_version = server_socket.address.ip().into();
+
+        // Create a local QUIC endpoint bound to the specified internal port and IP version.
+        let endpoint = core::create_local_endpoint(args.internal_port, ip_version)
+            .expect("Failed to create local endpoint");
+
+        // Connect to the specified file_yeet server.
+        let prepared_connection = core::server::prepare_server_connection(
+            &endpoint,
+            server_socket,
             args.gateway.as_deref(),
-            args.internal_port,
             if let Some(g) = args.external_port_override {
                 // Use the provided port override.
                 core::PortMappingConfig::PortForwarding(g)
@@ -201,7 +212,7 @@ fn main() {
 
         // Create a background task to handle incoming peer connections.
         task_master.spawn(core::ConnectionsManager::manage_incoming_loop(
-            prepared_connection.endpoint.clone(),
+            endpoint.clone(),
         ));
         let manager = Manager {
             task_tracker: &mut task_master,
@@ -212,7 +223,9 @@ fn main() {
         match cmd {
             // Try to hash and publish the file to the rendezvous server.
             FileYeetCommand::Pub { file_path } => {
-                if let Err(e) = publish_command(&prepared_connection, file_path, manager).await {
+                if let Err(e) =
+                    publish_command(&endpoint, &prepared_connection, file_path, manager).await
+                {
                     tracing::error!("Failed to publish the file: {e}");
                 }
             }
@@ -220,7 +233,8 @@ fn main() {
             // Try to get the file hash from the rendezvous server and peers.
             FileYeetCommand::Sub { hash_ext, output } => {
                 if let Err(e) =
-                    subscribe_command(&prepared_connection, hash_ext, output, manager).await
+                    subscribe_command(&endpoint, &prepared_connection, hash_ext, output, manager)
+                        .await
                 {
                     tracing::error!("Failed to download the file: {e}");
                 }
@@ -231,9 +245,7 @@ fn main() {
         }
 
         // Close our connection to the server. Send a goodbye to be polite.
-        prepared_connection
-            .endpoint
-            .close(GOODBYE_CODE, GOODBYE_MESSAGE.as_bytes());
+        endpoint.close(GOODBYE_CODE, GOODBYE_MESSAGE.as_bytes());
 
         // Close the tracker after no more tasks should be spawned.
         task_master.close();
@@ -267,7 +279,7 @@ enum PublishCommandError {
     HashFile(core::FileAccessError),
 
     #[error("{0}")]
-    PublishLoop(#[from] core::PublishError),
+    PublishLoop(#[from] core::server::PublishError),
 }
 
 /// Errors that can occur while handling the subscribe command.
@@ -283,7 +295,7 @@ enum SubscribeCommandError {
     ParseHexHash(faster_hex::Error),
 
     #[error("Failed to subscribe to the file: {0}")]
-    Subscribe(#[from] core::SubscribeError),
+    Subscribe(#[from] core::server::SubscribeError),
 
     #[error("No peers are available for the file")]
     NoPeers,
@@ -292,13 +304,14 @@ enum SubscribeCommandError {
     NoViablePeers,
 
     #[error("Failed to download from peer: {0}")]
-    Download(#[from] core::DownloadError),
+    Download(#[from] core::peer::DownloadError),
 }
 
 /// Handle the CLI command to publish a file.
 #[tracing::instrument(skip_all)]
 async fn publish_command(
-    prepared_connection: &PreparedConnection,
+    endpoint: &quinn::Endpoint,
+    prepared_connection: &core::server::PreparedConnection,
     file_path: String,
     manager: Manager<'_>,
 ) -> Result<(), PublishCommandError> {
@@ -317,10 +330,8 @@ async fn publish_command(
         tracing::info!("File {display_path} has SHA-256 hash {hash} and size {file_bytes} bytes");
     }
 
-    let core::PreparedConnection {
-        endpoint,
-        server_connection,
-        ..
+    let core::server::PreparedConnection {
+        server_connection, ..
     } = prepared_connection;
     let cancellation_token = manager.cancellation_token.clone();
 
@@ -339,7 +350,8 @@ async fn publish_command(
 /// Handle the CLI command to subscribe to a file.
 #[tracing::instrument(skip_all)]
 async fn subscribe_command(
-    prepared_connection: &PreparedConnection,
+    endpoint: &quinn::Endpoint,
+    prepared_connection: &core::server::PreparedConnection,
     hash_ext: String,
     output_path: Option<String>,
     manager: Manager<'_>,
@@ -381,14 +393,12 @@ async fn subscribe_command(
         output
     };
 
-    let core::PreparedConnection {
-        endpoint,
-        server_connection,
-        ..
+    let core::server::PreparedConnection {
+        server_connection, ..
     } = prepared_connection;
 
     // Request all available peers from the server.
-    let mut peers = match core::subscribe(server_connection, hash, None).await {
+    let mut peers = match core::server::subscribe(server_connection, hash, None).await {
         Err(e) => return Err(SubscribeCommandError::Subscribe(e)),
         Ok(c) => c,
     };
@@ -411,7 +421,7 @@ async fn subscribe_command(
     for (peer_address, file_size) in peers.drain(..) {
         let local_endpoint = endpoint.clone();
         connection_attempts.push(async move {
-            core::udp_holepunch(FileYeetCommandType::Sub, hash, local_endpoint, peer_address)
+            core::peer::udp_holepunch(FileYeetCommandType::Sub, hash, local_endpoint, peer_address)
                 .await
                 .map(|(c, b)| (c, b, file_size))
         });
@@ -432,7 +442,7 @@ async fn subscribe_command(
                 // Try to gracefully reject the download in the background.
                 manager.task_tracker.spawn(async move {
                     // Reject the download gracefully.
-                    if let Ok(()) = core::reject_download_request(&mut b).await {
+                    if let Ok(()) = core::peer::reject_download_request(&mut b).await {
                         // Close the connection because we won't download from this peer.
                         tracing::debug!("Download rejected");
                     }
@@ -493,7 +503,7 @@ async fn subscribe_command(
 
     // Try to download the requested file using the accepted peer connection.
     // Pin the future to avoid a stack overflow. <https://rust-lang.github.io/rust-clippy/master/index.html#large_futures>
-    core::download_from_peer(
+    core::peer::download_from_peer(
         hash,
         &mut peer_streams,
         file_size,
@@ -516,10 +526,10 @@ async fn publish_loop(
     file_size: u64,
     file_path: &Path,
     manager: Manager<'_>,
-) -> Result<(), core::PublishError> {
+) -> Result<(), core::server::PublishError> {
     // Create a bi-directional stream to the server.
     let mut server_streams: BiStream =
-        crate::core::publish(server_connection, hash, file_size).await?;
+        core::server::publish(server_connection, hash, file_size).await?;
 
     // Enter a loop to listen for the server to send peer addresses.
     loop {
@@ -527,7 +537,7 @@ async fn publish_loop(
 
         // Await the server to send a peer connection.
         let peer_address =
-            match crate::core::read_subscribing_peer(&mut server_streams.recv, None).await {
+            match core::server::read_subscribing_peer(&mut server_streams.recv, None).await {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::warn!("Failed to read the server's response: {e}");
@@ -546,7 +556,7 @@ async fn publish_loop(
                 // Try to connect to the peer and upload the file.
                 () = async move {
                     // Attempt to connect to the peer using UDP hole punching.
-                    let Some((peer_connection, mut peer_streams)) = core::udp_holepunch(
+                    let Some((peer_connection, mut peer_streams)) = core::peer::udp_holepunch(
                         FileYeetCommandType::Pub,
                         hash,
                         endpoint,
@@ -568,7 +578,7 @@ async fn publish_loop(
                     };
 
                     // Determine the range from the file that the peer wants.
-                    let (start_index, upload_length) = match core::read_publish_range(&mut peer_streams, file_size).await {
+                    let (start_index, upload_length) = match core::peer::read_publish_range(&mut peer_streams, file_size).await {
                         Ok(range) => range,
                         Err(e) => {
                             tracing::warn!("Failed to read peer upload range: {e}");
@@ -580,7 +590,7 @@ async fn publish_loop(
                     let reader = tokio::io::BufReader::new(file);
 
                     // Try to upload the file to the peer connection.
-                    if let Err(e) = Box::pin(core::upload_to_peer(&mut peer_streams, start_index, upload_length, reader, None)).await {
+                    if let Err(e) = Box::pin(core::peer::upload_to_peer(&mut peer_streams, start_index, upload_length, reader, None)).await {
                         tracing::warn!("Failed to upload to peer: {e}");
                     }
 
