@@ -59,6 +59,7 @@ pub const LOCALLY_CLOSED_WRITE: quinn::WriteError =
     quinn::WriteError::ConnectionLost(quinn::ConnectionError::LocallyClosed);
 
 /// Specifies the IP version to use when creating a local endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IpVersion {
     V4,
     V6,
@@ -86,13 +87,14 @@ pub enum CreateLocalEndpointError {
 }
 
 /// Creates a local QUIC endpoint bound to the specified internal port and unspecified IP address for the given IP version.
-/// # Panics
-/// This function will panic if it fails to generate a self-signed certificate or if Quinn fails to accept the generated certificates.
 #[allow(clippy::needless_pass_by_value)]
+#[tracing::instrument()]
 pub fn create_local_endpoint(
     internal_port: Option<NonZeroU16>,
     ip_version: IpVersion,
 ) -> Result<quinn::Endpoint, CreateLocalEndpointError> {
+    tracing::debug!("Creating local endpoint");
+
     // Create a self-signed certificate for the peer communications.
     let (server_cert, server_key) = file_yeet_shared::generate_self_signed_cert()?;
     let mut server_config = quinn::ServerConfig::with_single_cert(vec![server_cert], server_key)?;
@@ -106,10 +108,12 @@ pub fn create_local_endpoint(
         IpVersion::V4 => SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, bind_port)),
         IpVersion::V6 => SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, bind_port, 0, 0)),
     };
+    tracing::debug!("Binding local endpoint to {bind_address}");
     let mut endpoint = quinn::Endpoint::server(server_config, bind_address)?;
 
     // Use an insecure client configuration when connecting to peers.
     endpoint.set_default_client_config(peer::configure_peer_verification());
+    tracing::debug!("Local endpoint created successfully");
 
     Ok(endpoint)
 }
@@ -151,27 +155,28 @@ pub enum ProbeLocalAddressError {
 }
 
 /// Helper to determine the default interface's IP address.
-fn probe_local_address(using_ipv4: bool) -> Result<IpAddr, ProbeLocalAddressError> {
+#[tracing::instrument()]
+fn probe_local_address(ip_version: IpVersion) -> Result<IpAddr, ProbeLocalAddressError> {
     let interface =
         netdev::get_default_interface().map_err(ProbeLocalAddressError::DefaultInterface)?;
-    let ip = if using_ipv4 {
-        IpAddr::V4(
+    let ip = match ip_version {
+        IpVersion::V4 => IpAddr::V4(
             interface
                 .ipv4
                 .first()
                 .ok_or(ProbeLocalAddressError::NoDefaultIpv4)?
                 .addr(),
-        )
-    } else {
-        IpAddr::V6(
+        ),
+        IpVersion::V6 => IpAddr::V6(
             interface
                 .ipv6
                 .first()
                 .ok_or(ProbeLocalAddressError::NoDefaultIpv6)?
                 .addr(),
-        )
+        ),
     };
 
+    tracing::debug!("Probed local interface address: {ip}");
     Ok(ip)
 }
 
@@ -211,7 +216,7 @@ pub async fn new_renewal_interval(lifetime_seconds: u64) -> tokio::time::Interva
     let mut interval = tokio::time::interval(
         Duration::from_secs(lifetime_seconds)
             .div_f64(3.)
-            .max(Duration::from_mins(2)),
+            .max(Duration::from_secs(120)),
     );
     interval.tick().await; // Skip the first tick.
     interval
@@ -282,7 +287,7 @@ pub struct ConnectionsManager {
 }
 
 impl ConnectionsManager {
-    /// Get a smart pointer to the `IncomingManager` singleton that maps incoming and connected peers.
+    /// Get a smart pointer to the `ConnectionsManager` singleton that maps incoming and connected peers.
     pub fn instance() -> Self {
         static MANAGER: std::sync::LazyLock<ConnectionsManager> =
             std::sync::LazyLock::<_>::new(ConnectionsManager::default);
@@ -503,6 +508,7 @@ impl ConnectionsManager {
     /// Get the connection state of a peer.
     /// # Panics
     /// Cannot be used in async contexts. Will panic if used in an async runtime.
+    #[tracing::instrument(skip_all)]
     pub fn get_connection_sync(&self, peer_address: SocketAddr) -> Option<quinn::Connection> {
         if let hash_map::Entry::Occupied(e) = self.map.blocking_write().entry(peer_address) {
             if let IncomingPeerState::Connected(c) = e.get() {
@@ -528,10 +534,13 @@ impl ConnectionsManager {
                 }
             }
         }
+
+        tracing::debug!("Synchronous get found no active connection");
         None
     }
 
     /// Get the connection state of a peer.
+    #[tracing::instrument(skip_all)]
     pub async fn get_connection_async(
         &self,
         peer_address: SocketAddr,
@@ -560,6 +569,8 @@ impl ConnectionsManager {
                 }
             }
         }
+
+        tracing::debug!("Asynchronous get found no active connection");
         None
     }
 }

@@ -262,7 +262,7 @@ pub struct PeerRequestStream {
     pub bistream: Arc<tokio::sync::Mutex<BiStream>>,
 }
 impl PeerRequestStream {
-    /// Make a new `PeerConnection` from a QUIC connection and a bi-directional stream.
+    /// Make a new `PeerRequestStream` from a QUIC connection and a bi-directional stream.
     #[must_use]
     pub fn new(connection: quinn::Connection, streams: BiStream) -> Self {
         Self {

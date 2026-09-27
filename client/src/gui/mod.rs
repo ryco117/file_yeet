@@ -1476,8 +1476,6 @@ impl AppState {
             }
         };
 
-        tracing::debug!("Trying connection to server {server_address}:{server_port}");
-
         // Set the state to `Stalling` before starting the connection attempt.
         let (stalling_state, cancellation_token) = ConnectionState::new_connect_stalling();
         self.connection_state = stalling_state;

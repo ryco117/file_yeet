@@ -12,10 +12,7 @@ use crate::core::Hasher;
 /// Helper to create an output file with the desired size.
 /// The work is not guaranteed to be fast.
 #[tracing::instrument()]
-pub async fn create_sized_file(
-    file_size: u64,
-    output_path: &std::path::Path,
-) -> Result<(), std::io::Error> {
+pub async fn create_sized_file(file_size: u64, output_path: &Path) -> Result<(), std::io::Error> {
     tracing::debug!("Creating output file with desired size");
     let file = tokio::fs::File::create(output_path).await?;
     file.set_len(file_size).await?;
@@ -42,12 +39,15 @@ pub enum FileAccessError {
     Write(std::io::Error),
 }
 
-/// Get access to a file with its size and its current hash state.
+/// Open a file and build a SHA-256 hasher from its current contents.
+/// Returns the open file, the number of bytes hashed, and the hasher state.
 /// The file read position will be after the last byte that was read into the hasher.
+#[tracing::instrument(skip(progress))]
 pub async fn file_size_and_hasher(
     file_path: &Path,
     progress: Option<&RwLock<f32>>,
 ) -> Result<(tokio::fs::File, u64, Hasher), FileAccessError> {
+    tracing::debug!("Opening file and calculating hash state");
     let mut hasher = Hasher::new();
     let mut file = tokio::fs::File::open(file_path)
         .await
@@ -66,7 +66,7 @@ pub async fn file_size_and_hasher(
         .map_err(FileAccessError::Seek)?;
 
     let size_float = file_size as f32;
-    let mut hash_byte_buffer = [0; 16_384];
+    let mut hash_byte_buffer = [0; 16 * 1024];
     let mut bytes_hashed = 0;
     while bytes_hashed < file_size {
         let n = file
@@ -87,6 +87,7 @@ pub async fn file_size_and_hasher(
     }
 
     // Return the number of bytes hashed.
+    tracing::debug!("Hashed {bytes_hashed} bytes");
     Ok((file, bytes_hashed, hasher))
 }
 
@@ -97,5 +98,8 @@ pub async fn file_size_and_hash(
     progress: Option<&RwLock<f32>>,
 ) -> Result<(u64, HashBytes), FileAccessError> {
     let (_, size, hasher) = Box::pin(file_size_and_hasher(file_path, progress)).await?;
-    Ok((size, HashBytes::new(hasher.finalize().into())))
+    let hash = HashBytes::new(hasher.finalize().into());
+
+    tracing::debug!("Calculated hash for file: {hash:#}");
+    Ok((size, hash))
 }

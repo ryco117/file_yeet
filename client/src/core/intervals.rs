@@ -19,7 +19,7 @@ impl RangeData for std::ops::Range<u64> {
     }
 }
 
-/// Errors that may occur when reading a subscriber address from the server.
+/// Errors that may occur when adding an interval to `FileIntervals`.
 #[derive(Debug, thiserror::Error)]
 pub enum AddIntervalError {
     /// Error returned when the new interval overlaps with any existing intervals.

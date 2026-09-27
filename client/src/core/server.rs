@@ -22,7 +22,7 @@ pub struct PreparedConnection {
     pub external_address: (SocketAddr, String),
 }
 
-/// Errors that may occur when attempting to connect to the server from its .
+/// Errors that may occur when preparing the client's network identity and the server connection.
 #[derive(Debug, thiserror::Error)]
 pub enum PrepareConnectionError {
     #[error("{0}")]
@@ -64,10 +64,9 @@ pub async fn prepare_server_connection(
         .local_addr()
         .expect("Failed to get the local address of our QUIC endpoint");
     if local_address.ip().is_unspecified() {
-        local_address.set_ip(probe_local_address(matches!(
-            connection.remote_address(),
-            SocketAddr::V4(_)
-        ))?);
+        local_address.set_ip(probe_local_address(
+            connection.remote_address().ip().into(),
+        )?);
     }
     tracing::info!("QUIC endpoint created with local address: {local_address}");
 
