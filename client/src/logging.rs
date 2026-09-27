@@ -1,14 +1,16 @@
 const FILE_YEET_LOG_SUFFIX: &str = "file_yeet.log";
 
 const MAX_LOG_FILE_COUNT: std::num::NonZeroUsize =
-    std::num::NonZeroUsize::new(2).expect("MAX_LOG_FILE_COUNT must be a non-zero size");
+    std::num::NonZeroUsize::new(3).expect("MAX_LOG_FILE_COUNT must be a non-zero size");
 
 /// Delete old log files in the application folder.
+/// Run after logging is initialized to ensure that the number of log files does not exceed the maximum count.
+#[tracing::instrument()]
 fn delete_old_logs(app_folder: &std::path::Path) {
     let entries = match std::fs::read_dir(app_folder) {
         Ok(entries) => entries,
         Err(e) => {
-            eprintln!("Failed to read application folder: {e}");
+            tracing::error!("Failed to read application folder: {e}");
             return;
         }
     };
@@ -27,7 +29,7 @@ fn delete_old_logs(app_folder: &std::path::Path) {
                     }
                 }
                 Err(e) => {
-                    eprintln!("Failed to read entry in application folder: {e}");
+                    tracing::error!("Failed to read entry in application folder: {e}");
                 }
             }
             None
@@ -36,6 +38,10 @@ fn delete_old_logs(app_folder: &std::path::Path) {
 
     if log_files.len() <= MAX_LOG_FILE_COUNT.get() {
         // If the number of log files is less than or equal to the maximum, no need to delete.
+        tracing::debug!(
+            "Number of log files ({}) is within the limit ({MAX_LOG_FILE_COUNT}), no need to delete.",
+            log_files.len(),
+        );
         return;
     }
 
@@ -45,7 +51,9 @@ fn delete_old_logs(app_folder: &std::path::Path) {
     // Remove the oldest log files, keeping only the most recent ones.
     for path in &log_files[MAX_LOG_FILE_COUNT.get()..] {
         if let Err(e) = std::fs::remove_file(path) {
-            eprintln!("Failed to remove log file: {e}");
+            tracing::error!("Failed to remove log file: {e}");
+        } else {
+            tracing::debug!("Removed old log file: {}", path.to_string_lossy());
         }
     }
 }
@@ -79,9 +87,6 @@ pub fn init(args: &crate::Cli) -> bool {
 
     if !args.log_to_stdout {
         if let Some(app_folder) = crate::settings::app_folder() {
-            // Delete previous log files if they exist.
-            delete_old_logs(&app_folder);
-
             // If logging to a file, disable logging with ANSI coloring.
             let layer = tracing_subscriber::fmt::layer().with_ansi(false);
 
@@ -89,7 +94,6 @@ pub fn init(args: &crate::Cli) -> bool {
             let file_appender = tracing_appender::rolling::Builder::new()
                 .rotation(tracing_appender::rolling::Rotation::DAILY)
                 .filename_suffix(FILE_YEET_LOG_SUFFIX)
-                .max_log_files(MAX_LOG_FILE_COUNT.get())
                 .build(&app_folder);
 
             if let Ok(file_appender) = file_appender {
@@ -106,6 +110,9 @@ pub fn init(args: &crate::Cli) -> bool {
                         filter,
                     );
                 }
+
+                // Delete previous log files if they exist.
+                delete_old_logs(&app_folder);
 
                 // Initialization of logging to disk was successful
                 return false;
