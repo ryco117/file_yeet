@@ -25,6 +25,7 @@ use tracing::Instrument as _;
 
 use crate::{
     core::{
+        file::{file_size_and_hash, file_size_and_hasher},
         humanize_bytes,
         intervals::{
             self, merge_adjacent_ranges, FileIntervals, RangeData as _, DOWNLOAD_CHUNK_INTERVAL_MIN,
@@ -2211,7 +2212,7 @@ impl AppState {
 
                 tokio::select! {
                     () = cancellation_token.cancelled() => UploadResult::Cancelled,
-                    result = Box::pin(crate::core::peer::upload_to_peer(
+                    result = Box::pin(crate::core::peer::upload::upload_to_peer(
                         &mut streams,
                         start_index,
                         upload_length,
@@ -2957,7 +2958,9 @@ impl AppState {
             // Reject the download request on all peer streams.
             let reject_futures = r.into_iter().map(|peer| async move {
                 let mut bi_stream = peer.bistream.lock().await;
-                if let Err(e) = crate::core::peer::reject_download_request(&mut bi_stream).await {
+                if let Err(e) =
+                    crate::core::peer::download::reject_download_request(&mut bi_stream).await
+                {
                     tracing::debug!("Failed to reject download request: {e}");
                 }
             });
@@ -3463,7 +3466,7 @@ impl AppState {
             if peer_streams.tail.is_empty() || final_file_size - current_file_size < 500_000_000 {
                 // Get the file size and digest state of the chosen file to publish.
                 let (_, current_file_size, digest) =
-                    Box::pin(crate::core::file_size_and_hasher(path, Some(progress_lock)))
+                    Box::pin(file_size_and_hasher(path, Some(progress_lock)))
                         .await
                         .map_err(|e| Some(DownloadFailure::ResumeHashFile(Arc::new(e))))?;
 
@@ -3493,7 +3496,7 @@ impl AppState {
                         return Message::ResumeFromPartialHashFile(
                             nonce,
                             Err(Some(DownloadFailure::ResumeHashFile(Arc::new(
-                                crate::core::FileAccessError::Open(e),
+                                crate::core::file::FileAccessError::Open(e),
                             )))),
                         )
                     }
@@ -3502,19 +3505,18 @@ impl AppState {
                 // If the file has already been downloaded in its entirety, we can skip to verifying the hash and finishing the download.
                 if current_file_size == final_file_size {
                     // TODO: Reuse existing logic and set the state to `DownloadState::HashingFile` with a new `Message`.
-                    let (_, current_file_size, digest) = match Box::pin(
-                        crate::core::file_size_and_hasher(path.as_ref(), Some(&progress_lock)),
-                    )
-                    .await
-                    {
-                        Ok(r) => r,
-                        Err(e) => {
-                            return Message::ResumeFromPartialHashFile(
-                                nonce,
-                                Err(Some(DownloadFailure::ResumeHashFile(Arc::new(e)))),
-                            )
-                        }
-                    };
+                    let (_, current_file_size, digest) =
+                        match Box::pin(file_size_and_hasher(path.as_ref(), Some(&progress_lock)))
+                            .await
+                        {
+                            Ok(r) => r,
+                            Err(e) => {
+                                return Message::ResumeFromPartialHashFile(
+                                    nonce,
+                                    Err(Some(DownloadFailure::ResumeHashFile(Arc::new(e)))),
+                                )
+                            }
+                        };
                     if current_file_size == final_file_size {
                         return if hash == digest.finalize().into() {
                             tracing::info!("{}", crate::gui::strings::SUCCESSFUL_DOWNLOAD);
@@ -4795,7 +4797,7 @@ fn hash_publish_task(
                 () = cancellation.cancelled() => Err(PublishRequestResult::Cancelled),
 
                 // Get the file size and hash of the chosen file to publish.
-                r = crate::core::file_size_and_hash(&path, Some(&progress)) => r.map_err(|e| {
+                r = file_size_and_hash(&path, Some(&progress)) => r.map_err(|e| {
                     PublishRequestResult::Failure(Arc::new(e.into()))
                 })
             }
@@ -4858,7 +4860,7 @@ async fn full_download(
         () = cancellation_token.cancelled() => DownloadResult::Cancelled,
 
         // Await the file to be downloaded.
-        result = crate::core::peer::download_from_peer(
+        result = crate::core::peer::download::download_from_peer(
             hash,
             &mut peer_stream_lock,
             file_size,
@@ -4912,10 +4914,10 @@ async fn partial_download(
     tokio::select! {
         () = cancellation_token.cancelled() => DownloadResult::Cancelled,
 
-        result = Box::pin(crate::core::peer::download_partial_from_peer(
+        result = Box::pin(crate::core::peer::download::download_partial_from_peer(
             &mut request,
             &mut file,
-            crate::core::peer::DownloadOffsetState::new(file_range, hasher.map(|h| (h, Some(hash)))),
+            crate::core::peer::download::DownloadOffsetState::new(file_range, hasher.map(|h| (h, Some(hash)))),
             Some(&byte_progress),
         )) => match result {
             Ok(()) => DownloadResult::Success,
@@ -5066,7 +5068,7 @@ async fn multi_peer_download_verify(
     file_size: u64,
     progress: Arc<RwLock<f32>>,
 ) -> DownloadResult {
-    let err = match crate::core::file_size_and_hash(&file_path, Some(&progress)).await {
+    let err = match file_size_and_hash(&file_path, Some(&progress)).await {
         Ok((calc_file_size, calc_file_hash)) => {
             if calc_file_hash == file_hash {
                 if calc_file_size == file_size {

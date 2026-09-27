@@ -14,14 +14,15 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     core::{
-        create_sized_file, humanize_bytes,
+        file::{create_sized_file, FileAccessError},
+        humanize_bytes,
         intervals::{FileIntervals, RangeData},
         peer::{
-            ConnectionIntoStreamError, DownloadError, PeerRequestStream, ReadPubRangeError,
-            UploadError,
+            download::DownloadError, upload::UploadError, ConnectionIntoStreamError,
+            PeerRequestStream, ReadPubRangeError,
         },
         server::SubscribeError,
-        FileAccessError, FileYeetCommandType,
+        FileYeetCommandType,
     },
     gui::{
         confirmation, full_download, remove_nonce_for_peer, strings, text_horizontal_scrollbar,

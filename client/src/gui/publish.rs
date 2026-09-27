@@ -6,7 +6,7 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    core::FileAccessError,
+    core::file::FileAccessError,
     gui::{
         fonts, generate_nonce, strings, text_horizontal_scrollbar, timed_tooltip,
         IncomingPublishSession, Message, Nonce, NonceItem, ERROR_RED_COLOR,

@@ -276,7 +276,7 @@ struct Manager<'a> {
 #[derive(Debug, thiserror::Error)]
 enum PublishCommandError {
     #[error("Failed to hash file: {0}")]
-    HashFile(core::FileAccessError),
+    HashFile(core::file::FileAccessError),
 
     #[error("{0}")]
     PublishLoop(#[from] core::server::PublishError),
@@ -304,7 +304,7 @@ enum SubscribeCommandError {
     NoViablePeers,
 
     #[error("Failed to download from peer: {0}")]
-    Download(#[from] core::peer::DownloadError),
+    Download(#[from] core::peer::download::DownloadError),
 }
 
 /// Handle the CLI command to publish a file.
@@ -316,7 +316,7 @@ async fn publish_command(
     manager: Manager<'_>,
 ) -> Result<(), PublishCommandError> {
     let file_path = std::path::Path::new(&file_path);
-    let (file_size, hash) = match core::file_size_and_hash(file_path, None).await {
+    let (file_size, hash) = match core::file::file_size_and_hash(file_path, None).await {
         Ok(t) => t,
         Err(e) => return Err(PublishCommandError::HashFile(e)),
     };
@@ -442,7 +442,7 @@ async fn subscribe_command(
                 // Try to gracefully reject the download in the background.
                 manager.task_tracker.spawn(async move {
                     // Reject the download gracefully.
-                    if let Ok(()) = core::peer::reject_download_request(&mut b).await {
+                    if let Ok(()) = core::peer::download::reject_download_request(&mut b).await {
                         // Close the connection because we won't download from this peer.
                         tracing::debug!("Download rejected");
                     }
@@ -503,7 +503,7 @@ async fn subscribe_command(
 
     // Try to download the requested file using the accepted peer connection.
     // Pin the future to avoid a stack overflow. <https://rust-lang.github.io/rust-clippy/master/index.html#large_futures>
-    core::peer::download_from_peer(
+    core::peer::download::download_from_peer(
         hash,
         &mut peer_streams,
         file_size,
@@ -590,7 +590,7 @@ async fn publish_loop(
                     let reader = tokio::io::BufReader::new(file);
 
                     // Try to upload the file to the peer connection.
-                    if let Err(e) = Box::pin(core::peer::upload_to_peer(&mut peer_streams, start_index, upload_length, reader, None)).await {
+                    if let Err(e) = Box::pin(core::peer::upload::upload_to_peer(&mut peer_streams, start_index, upload_length, reader, None)).await {
                         tracing::warn!("Failed to upload to peer: {e}");
                     }
 
