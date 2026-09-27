@@ -643,7 +643,7 @@ pub async fn subscribe(
 
     if response_count == 0 {
         // No peers are sharing the file.
-        return Ok(Vec::with_capacity(0));
+        return Ok(Vec::new());
     }
 
     // Warn if we do not know our external address.

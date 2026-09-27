@@ -266,7 +266,11 @@ enum ConnectionState {
     Disconnected,
 
     /// Connecting to the server.
-    ConnectStalling { start: Instant, tick: Instant },
+    ConnectStalling {
+        start: Instant,
+        tick: Instant,
+        cancellation_token: CancellationToken,
+    },
 
     /// A connection to the server is active.
     Connected(ConnectedState),
@@ -276,12 +280,18 @@ enum ConnectionState {
 }
 impl ConnectionState {
     /// Make a new `ConnectionState` in the `ConnectStalling` state.
-    pub fn new_connect_stalling() -> Self {
+    /// Returns the state and the cancellation token to pass to the connection task.
+    pub fn new_connect_stalling() -> (Self, CancellationToken) {
         let now = Instant::now();
-        Self::ConnectStalling {
-            start: now,
-            tick: now,
-        }
+        let cancellation_token = CancellationToken::new();
+        (
+            Self::ConnectStalling {
+                start: now,
+                tick: now,
+                cancellation_token: cancellation_token.clone(),
+            },
+            cancellation_token,
+        )
     }
 
     /// Make a new `ConnectionState` in the `SafelyLeaveStalling` state.
@@ -371,6 +381,9 @@ pub enum Message {
     /// Attempt a connection to the user-specified server.
     AttemptServerConnection,
 
+    /// Cancel an in-progress connection attempt.
+    CancelServerConnection,
+
     /// Update animations based on elapsed time.
     AnimationTick,
 
@@ -378,7 +391,8 @@ pub enum Message {
     ToggleStatusHistory,
 
     /// Handle the result of a server connection attempt.
-    ConnectResulted(Result<crate::core::PreparedConnection, Arc<PrepareConnectionError>>),
+    /// `None` indicates the attempt was cancelled by the user.
+    ConnectResulted(Option<Result<crate::core::PreparedConnection, Arc<PrepareConnectionError>>>),
 
     /// Update the current port mapping state.
     PortMappingUpdated(Option<crab_nat::PortMapping>),
@@ -636,6 +650,17 @@ impl AppState {
                 iced::Task::none()
             }
             Message::AttemptServerConnection => self.update_attempt_server_connection(),
+            Message::CancelServerConnection => {
+                tracing::info!("Cancelling server connection attempt");
+                if let ConnectionState::ConnectStalling {
+                    cancellation_token, ..
+                } = &self.connection_state
+                {
+                    cancellation_token.cancel();
+                }
+                self.connection_state = ConnectionState::Disconnected;
+                iced::Task::none()
+            }
             Message::AnimationTick => self.update_animation_tick(),
             Message::ToggleStatusHistory => self.update_show_status_logs(),
             Message::ConnectResulted(r) => self.update_connect_resulted(r),
@@ -912,13 +937,16 @@ impl AppState {
                 ConnectionState::Disconnected => self.view_disconnected_page(&mouse_move_elapsed),
 
                 // Display a progress animation while connecting.
-                &ConnectionState::ConnectStalling { start, tick } => {
-                    Self::view_stalling_page(start, tick, SERVER_CONNECTION_TIMEOUT)
-                }
+                ConnectionState::ConnectStalling { start, tick, .. } => Self::view_stalling_page(
+                    *start,
+                    *tick,
+                    SERVER_CONNECTION_TIMEOUT,
+                    Some(Message::CancelServerConnection),
+                ),
 
                 // Display a progress animation while stalling to leave server.
                 &ConnectionState::SafelyLeaveStalling { start, tick } => widget::column!(
-                    Self::view_stalling_page(start, tick, MAX_SHUTDOWN_WAIT),
+                    Self::view_stalling_page(start, tick, MAX_SHUTDOWN_WAIT, None),
                     widget::text("Closing, please wait...").size(24),
                     widget::text("Pressing close a second time will cancel safety operations.")
                         .size(16),
@@ -1084,22 +1112,33 @@ impl AppState {
     }
 
     /// Draw a stalling page with a progress animation.
+    /// If `cancel_message` is `Some`, a Cancel button is shown that sends the given message.
     fn view_stalling_page<'a>(
         start: Instant,
         tick: Instant,
         max_duration: Duration,
+        cancel_message: Option<Message>,
     ) -> iced::Element<'a, Message> {
         let fraction_waited = (tick - start)
             .as_secs_f32()
             .div(max_duration.as_secs_f32())
             .min(1.);
-        let spinner =
-            widget::container::Container::new(widget::progress_bar(0.0..=1., fraction_waited))
-                .padding(24)
-                .center_x(iced::Length::Fill)
-                .center_y(iced::Length::Fill);
+        let spinner = widget::progress_bar(0.0..=1., fraction_waited);
 
-        Element::<'a>::from(spinner)
+        let page_content = if let Some(cancel_msg) = cancel_message {
+            widget::column![spinner, widget::button("Cancel").on_press(cancel_msg)]
+                .align_x(iced::Alignment::Center)
+                .spacing(6)
+                .into()
+        } else {
+            Element::from(spinner)
+        };
+
+        widget::container::Container::new(page_content)
+            .padding(24)
+            .center_x(iced::Length::Fill)
+            .center_y(iced::Length::Fill)
+            .into()
     }
 
     /// Draw the transfer view for the main connected page.
@@ -1440,7 +1479,8 @@ impl AppState {
         tracing::debug!("Trying connection to server {server_address}:{port}");
 
         // Set the state to `Stalling` before starting the connection attempt.
-        self.connection_state = ConnectionState::new_connect_stalling();
+        let (stalling_state, cancellation_token) = ConnectionState::new_connect_stalling();
+        self.connection_state = stalling_state;
 
         // Try to get the user's intent from the GUI options.
         let port_mapping = match self.options.port_mapping {
@@ -1461,16 +1501,17 @@ impl AppState {
         // Try to connect to the server in a new task.
         iced::Task::perform(
             async move {
-                crate::core::prepare_server_connection(
-                    Some(&server_address),
-                    port,
-                    gateway.as_deref(),
-                    internal_port,
-                    port_mapping,
-                    skip_server_cert_verification,
-                )
-                .await
-                .map_err(Arc::new)
+                tokio::select! {
+                    result = crate::core::prepare_server_connection(
+                        Some(&server_address),
+                        port,
+                        gateway.as_deref(),
+                        internal_port,
+                        port_mapping,
+                        skip_server_cert_verification,
+                    ) => Some(result.map_err(Arc::new)),
+                    () = cancellation_token.cancelled() => None,
+                }
             },
             Message::ConnectResulted,
         )
@@ -1512,8 +1553,14 @@ impl AppState {
     #[tracing::instrument(skip(self, result))]
     fn update_connect_resulted(
         &mut self,
-        result: Result<PreparedConnection, Arc<PrepareConnectionError>>,
+        result: Option<Result<PreparedConnection, Arc<PrepareConnectionError>>>,
     ) -> iced::Task<Message> {
+        // A `None` result means the connection attempt was cancelled; nothing left to do.
+        let Some(result) = result else {
+            tracing::debug!("Server connection attempt was cancelled");
+            return iced::Task::none();
+        };
+
         match result {
             Ok(prepared) => {
                 let PreparedConnection {
