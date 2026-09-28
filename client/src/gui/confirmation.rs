@@ -23,33 +23,38 @@ impl std::fmt::Display for ConfirmationDialog {
 }
 
 /// A confirmation dialog for leaving a server. This will cancel all active transfers, but any partial download progress will be saved.
-pub fn leave_server() -> ConfirmationDialog {
+pub fn leave_server(modal_id: Nonce) -> ConfirmationDialog {
     ConfirmationDialog {
         title: Cow::Borrowed("Leave Server?"),
         message: Cow::Borrowed("Are you sure you want to leave the server? All active transfers will be cancelled. Any partial download progress will be saved."),
-        confirm_action: Box::new(Message::SafelyLeaveServer),
+        confirm_action: Box::new(Message::SafelyLeaveServer(Some(modal_id))),
     }
 }
 
 /// A confirmation dialog for cancelling a specific download. No progress is saved for resuming.
-pub fn cancel_download(nonce: Nonce) -> ConfirmationDialog {
+pub fn cancel_download(nonce: Nonce, modal_id: Nonce) -> ConfirmationDialog {
     ConfirmationDialog {
         title: Cow::Borrowed("Cancel Download?"),
         message: Cow::Borrowed(
             "Are you sure you want to cancel this download? All progress will be lost.",
         ),
-        confirm_action: Box::new(Message::CancelTransfer(nonce, FileYeetCommandType::Sub)),
+        confirm_action: Box::new(Message::CancelTransfer(
+            nonce,
+            FileYeetCommandType::Sub,
+            Some(modal_id),
+        )),
     }
 }
 
 /// A confirmation dialog for cancelling a specific upload. The peer may attempt to recover the transfer later if the file is still being published.
-pub fn cancel_upload(nonce: Nonce) -> ConfirmationDialog {
+pub fn cancel_upload(nonce: Nonce, modal_id: Nonce) -> ConfirmationDialog {
     ConfirmationDialog {
         title: Cow::Borrowed("Cancel Upload?"),
         message: Cow::Borrowed("Are you sure you want to cancel this upload? The peer may attempt to recover the transfer later if the file is still being published."),
         confirm_action: Box::new(Message::CancelTransfer(
             nonce,
             FileYeetCommandType::Pub,
+            Some(modal_id),
         )),
     }
 }

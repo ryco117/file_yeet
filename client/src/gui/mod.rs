@@ -109,6 +109,7 @@ pub fn generate_nonce() -> Nonce {
     NONCE_COUNTER.fetch_add(1, atomic::Ordering::Relaxed)
 }
 
+/// Trait for all items identified by a nonce.
 trait NonceItem {
     /// Get the nonce of this item.
     fn nonce(&self) -> Nonce;
@@ -307,26 +308,23 @@ struct StatusManager {
 
 /// Enum state of the modal dialog, if any, currently open.
 /// Takes precedence over other interactions.
-#[derive(Clone, Debug, Default)]
-pub enum ModalState {
-    #[default]
-    None,
-    ExternalDialog,
-    Confirmation(ConfirmationDialog),
+#[derive(Clone, Debug)]
+pub enum ModalDialog {
+    ExternalDialog(Nonce),
+    Confirmation(Nonce, ConfirmationDialog),
 }
-impl ModalState {
-    /// Returns true if and only if no modal dialog is currently open, allowing normal interactions.
-    #[inline]
-    pub fn is_non_modal(&self) -> bool {
-        matches!(self, ModalState::None)
-    }
-}
-impl std::fmt::Display for ModalState {
+impl std::fmt::Display for ModalDialog {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ModalState::None => write!(f, "None"),
-            ModalState::ExternalDialog => write!(f, "ExternalDialog"),
-            ModalState::Confirmation(dialog) => write!(f, "Confirmation('{dialog:#}')"),
+            ModalDialog::ExternalDialog(id) => write!(f, "ExternalDialog({id})"),
+            ModalDialog::Confirmation(id, dialog) => write!(f, "Confirmation({id}, '{dialog:#}')"),
+        }
+    }
+}
+impl NonceItem for ModalDialog {
+    fn nonce(&self) -> Nonce {
+        match self {
+            ModalDialog::ExternalDialog(id) | ModalDialog::Confirmation(id, _) => *id,
         }
     }
 }
@@ -337,7 +335,7 @@ pub struct AppState {
     connection_state: ConnectionState,
     options: AppSettings,
     status_manager: StatusManager,
-    modal_state: ModalState,
+    modal_stack: Vec<ModalDialog>,
     save_on_exit: bool,
     port_mapping: Option<crab_nat::PortMapping>,
     main_window: Option<window::Id>,
@@ -401,10 +399,11 @@ pub enum Message {
     CopyServer,
 
     /// Show a modal confirmation dialog with the given state.
-    ModalConfirmation(ConfirmationDialog),
+    ModalConfirmation(Nonce, ConfirmationDialog),
 
     /// Leave the server and disconnect.
-    SafelyLeaveServer,
+    /// Optionally, dismiss the specified confirmation dialog.
+    SafelyLeaveServer(Option<Nonce>),
 
     /// Complete the server disconnection process without further asynchronous actions.
     LeftServer,
@@ -422,10 +421,12 @@ pub enum Message {
     PublishClicked,
 
     /// Begin publishing the selected file or existing publish item.
-    PublishChosenItem(CreateOrExisting<Arc<PathBuf>>),
+    /// Optionally, dismiss the specified confirmation dialog.
+    PublishChosenItem(CreateOrExisting<Arc<PathBuf>>, Option<Nonce>),
 
     /// Handle cancellation of file selection for publishing.
-    PublishPathCancelled,
+    /// Dismisses the specified confirmation dialog.
+    PublishPathCancelled(Nonce),
 
     /// Create or update a publish item with a known hash. The hash may be from disk or freshly calculated.
     PublishFileHashed {
@@ -448,13 +449,16 @@ pub enum Message {
     SubscribeStarted,
 
     /// Handle cancellation of the download path selection.
-    SubscribePathCancelled,
+    /// Dismisses the specified confirmation dialog.
+    SubscribePathCancelled(Nonce),
 
     /// Accept the details (i.e., file size) before beginning a download.
-    SubscribePathChosenAcceptEarly(PathBuf, String, u64),
+    /// Dismisses the specified confirmation dialog.
+    SubscribePathChosenAcceptEarly(PathBuf, String, u64, Nonce),
 
     /// Begin a download with the selected file path and hash.
-    SubscribePathChosen(PathBuf, String, Option<u64>),
+    /// Dismisses the specified confirmation dialog.
+    SubscribePathChosen(PathBuf, String, Option<u64>, Nonce),
 
     /// Recreate a download from the saved transfer state.
     SubscribeRecreated(SavedDownload),
@@ -486,11 +490,11 @@ pub enum Message {
     /// Remove a publish item.
     RemovePublish(Nonce),
 
-    /// Dismiss the currently open confirmation modal without taking any action.
-    DismissModal,
+    /// Dismiss the specified confirmation modal without taking any further action.
+    DismissModal(Nonce),
 
-    /// Cancel a transfer that is in-progress.
-    CancelTransfer(Nonce, FileYeetCommandType),
+    /// Cancel a transfer that is in-progress. May need to dismiss a modal dialog.
+    CancelTransfer(Nonce, FileYeetCommandType, Option<Nonce>),
 
     /// Pause a download that is in-progress.
     PauseDownload(Nonce),
@@ -669,25 +673,26 @@ impl AppState {
                 tracing::debug!("Copying server address to clipboard");
                 iced::clipboard::write(self.options.server_address.clone())
             }
-            Message::ModalConfirmation(dialog) => {
-                tracing::debug!("Showing confirmation dialog '{}'", dialog.title);
-
-                // Error if a modal dialog was opened while already modal. This should never happen.
-                if !self.modal_state.is_non_modal() {
-                    log_status_change::<LogErrorStatus>(
-                        &mut self.status_manager,
-                        "Opening a confirmation dialog while another modal was open".to_owned(),
-                    );
-                }
-
-                self.modal_state = ModalState::Confirmation(dialog);
+            Message::ModalConfirmation(id, dialog) => {
+                tracing::debug!("Showing confirmation dialog {id}: '{}'", dialog.title);
+                self.modal_stack.push(ModalDialog::Confirmation(id, dialog));
                 iced::Task::none()
             }
-            Message::SafelyLeaveServer => self.safely_close(CloseType::Connections),
+            Message::SafelyLeaveServer(modal_id) => {
+                self.safely_close(CloseType::Connections, modal_id)
+            }
             Message::LeftServer => {
                 tracing::debug!("Left server, now disconnected");
                 self.connection_state = ConnectionState::Disconnected;
-                self.modal_state = ModalState::None; // No file dialogs or confirmations should be open when disconnected.
+
+                // No file dialogs or confirmations should be open when disconnected.
+                for modal in self.modal_stack.drain(..) {
+                    log_status_change::<LogWarnStatus>(
+                        &mut self.status_manager,
+                        format!("Modal dialog {modal} was closed due to disconnection"),
+                    );
+                }
+
                 iced::Task::none()
             }
             Message::PeerRequestedTransfer((hash, peer_request)) => {
@@ -720,23 +725,29 @@ impl AppState {
                 self.clear_status_message();
 
                 // Let state know that a modal dialog is open.
-                self.modal_state = ModalState::ExternalDialog;
+                let modal_id = generate_nonce();
+                self.modal_stack.push(ModalDialog::ExternalDialog(modal_id));
 
                 iced::Task::perform(
                     rfd::AsyncFileDialog::new()
                         .set_title("Choose a file to publish")
                         .pick_file(),
-                    |f| {
-                        f.map_or(Message::PublishPathCancelled, |f| {
-                            Message::PublishChosenItem(CreateOrExisting::Create(Arc::new(f.into())))
+                    move |f| {
+                        f.map_or(Message::PublishPathCancelled(modal_id), |f| {
+                            Message::PublishChosenItem(
+                                CreateOrExisting::Create(Arc::new(f.into())),
+                                Some(modal_id),
+                            )
                         })
                     },
                 )
             }
-            Message::PublishChosenItem(publish) => self.update_publish_chosen_item(publish),
-            Message::PublishPathCancelled => {
+            Message::PublishChosenItem(publish, modal_id) => {
+                self.update_publish_chosen_item(publish, modal_id)
+            }
+            Message::PublishPathCancelled(modal_id) => {
                 tracing::debug!("Publish choice cancelled");
-                self.modal_state = ModalState::None;
+                self.remove_modal(modal_id);
                 iced::Task::none()
             }
             Message::PublishFileHashed {
@@ -753,12 +764,19 @@ impl AppState {
                 self.update_publish_peer_connect_resulted(pub_nonce, peer)
             }
             Message::SubscribeStarted => self.update_subscribe_started(),
-            Message::SubscribePathCancelled => self.update_subscribe_path_cancelled(),
-            Message::SubscribePathChosenAcceptEarly(path, hash_hex, expected_bytes) => {
-                self.update_subscribe_path_chosen_accept_early(path, hash_hex, expected_bytes)
+            Message::SubscribePathCancelled(modal_id) => {
+                self.update_subscribe_path_cancelled(modal_id)
             }
-            Message::SubscribePathChosen(path, hash_hex, expected_bytes) => {
-                self.update_subscribe_path_chosen(path, &hash_hex, expected_bytes)
+            Message::SubscribePathChosenAcceptEarly(path, hash_hex, expected_bytes, modal_id) => {
+                self.update_subscribe_path_chosen_accept_early(
+                    path,
+                    hash_hex,
+                    expected_bytes,
+                    modal_id,
+                )
+            }
+            Message::SubscribePathChosen(path, hash_hex, expected_bytes, modal_id) => {
+                self.update_subscribe_path_chosen(path, &hash_hex, expected_bytes, Some(modal_id))
             }
             Message::SubscribeRecreated(transfer_base) => {
                 self.update_subscribe_recreated(transfer_base)
@@ -774,16 +792,13 @@ impl AppState {
             Message::CancelPublish(nonce) => self.update_cancel_publish(nonce),
             Message::RetryPublish(nonce) => self.update_retry_publish(nonce),
             Message::RemovePublish(nonce) => self.update_remove_publish(nonce),
-            Message::DismissModal => {
-                tracing::debug!("Dismissing modal dialog: {}", self.modal_state);
-                if self.modal_state.is_non_modal() {
-                    tracing::warn!("Attempted to dismiss modal dialog when no modal was open");
-                }
-                self.modal_state = ModalState::None;
+            Message::DismissModal(modal_id) => {
+                tracing::debug!("Dismissing modal dialog: {modal_id}");
+                self.remove_modal(modal_id);
                 iced::Task::none()
             }
-            Message::CancelTransfer(nonce, transfer_type) => {
-                self.update_cancel_transfer(nonce, transfer_type)
+            Message::CancelTransfer(nonce, transfer_type, modal_id) => {
+                self.update_cancel_transfer(nonce, transfer_type, modal_id)
             }
             Message::PauseDownload(nonce) => self.update_pause_download(nonce),
             Message::DownloadContextMenuVisibility(nonce, is_open) => {
@@ -877,11 +892,19 @@ impl AppState {
             .unwrap_or_default();
 
         // If a confirmation dialog is active, display it instead of the main content.
-        if let ModalState::Confirmation(ConfirmationDialog {
-            title,
-            message,
-            confirm_action,
-        }) = &self.modal_state
+        // We show the confirmation dialog highest on the stack if there are multiple.
+        if let Some(ModalDialog::Confirmation(
+            id,
+            ConfirmationDialog {
+                title,
+                message,
+                confirm_action,
+            },
+        )) = &self
+            .modal_stack
+            .iter()
+            .rev()
+            .find(|dialog| matches!(dialog, ModalDialog::Confirmation(_, _)))
         {
             return widget::container(
                 widget::container(
@@ -894,7 +917,7 @@ impl AppState {
                                 .on_press_with(|| confirm_action.as_ref().clone())
                                 .style(widget::button::danger),
                             timed_tooltip(
-                                widget::button("Back").on_press(Message::DismissModal),
+                                widget::button("Back").on_press(Message::DismissModal(*id)),
                                 "Dismiss this confirmation dialog",
                                 &mouse_move_elapsed
                             ),
@@ -1008,8 +1031,8 @@ impl AppState {
         );
 
         let connect_button = widget::button("Connect").on_press_maybe(
-            self.modal_state
-                .is_non_modal()
+            self.modal_stack
+                .is_empty()
                 .then_some(Message::AttemptServerConnection),
         );
         let mut internal_port_text = widget::text_input(
@@ -1019,7 +1042,7 @@ impl AppState {
         let mut port_forward_text =
             widget::text_input("E.g., 8888", &self.options.port_forwarding_text);
 
-        if self.modal_state.is_non_modal() {
+        if self.modal_stack.is_empty() {
             server_address = server_address
                 .on_input(Message::ServerAddressChanged)
                 .on_submit(Message::AttemptServerConnection);
@@ -1172,11 +1195,13 @@ impl AppState {
         let mut leave_server_button = widget::button(widget::text("Leave").size(14));
 
         // Disable the inputs while a modal is open.
-        if self.modal_state.is_non_modal() {
+        if self.modal_stack.is_empty() {
             publish_button = publish_button.on_press(Message::PublishClicked);
             hash_text_input = hash_text_input.on_input(Message::HashInputChanged);
-            leave_server_button = leave_server_button
-                .on_press(Message::ModalConfirmation(confirmation::leave_server()));
+            leave_server_button = leave_server_button.on_press_with(|| {
+                let modal_id = generate_nonce();
+                Message::ModalConfirmation(modal_id, confirmation::leave_server(modal_id))
+            });
 
             // Enable the download button if the hash is valid.
             if HASH_EXT_REGEX.is_match(&connected_state.hash_input) {
@@ -1278,7 +1303,7 @@ impl AppState {
                     (true, false) => Self::draw_transfers(
                         &connected_state.uploads,
                         mouse_move_elapsed,
-                        self.modal_state.is_non_modal(),
+                        self.modal_stack.is_empty(),
                     ),
 
                     // Show both publishes and uploads. Separate them with a line.
@@ -1288,7 +1313,7 @@ impl AppState {
                         Self::draw_transfers(
                             &connected_state.uploads,
                             mouse_move_elapsed,
-                            self.modal_state.is_non_modal()
+                            self.modal_stack.is_empty(),
                         ),
                     )
                     .spacing(12)
@@ -1300,7 +1325,7 @@ impl AppState {
             TransferView::Downloads => Self::draw_transfers(
                 &connected_state.downloads,
                 mouse_move_elapsed,
-                self.modal_state.is_non_modal(),
+                self.modal_stack.is_empty(),
             ),
         };
 
@@ -1646,8 +1671,8 @@ impl AppState {
                                 }
                             } else {
                                 Message::PublishChosenItem(CreateOrExisting::Create(
-                                    Arc::new(p.path),
-                                ))
+                                        Arc::new(p.path),
+                                ), None)
                             };
                             Some(iced::Task::done(message))
                         })
@@ -1717,9 +1742,14 @@ impl AppState {
     fn update_publish_chosen_item(
         &mut self,
         publish: CreateOrExisting<Arc<PathBuf>>,
+        modal_id: Option<Nonce>,
     ) -> iced::Task<Message> {
         tracing::debug!("Publish dialog closed");
-        self.modal_state = ModalState::None;
+
+        if let Some(modal_id) = modal_id {
+            // Remove the modal file-choice dialog from the stack.
+            self.remove_modal(modal_id);
+        }
 
         // Ensure the client is connected to a server.
         let ConnectionState::Connected(ConnectedState {
@@ -2008,7 +2038,7 @@ impl AppState {
                 publish.state = PublishState::Failure(e, publish.state.hash_and_file_size());
 
                 if should_disconnect {
-                    return iced::Task::done(Message::SafelyLeaveServer);
+                    return iced::Task::done(Message::SafelyLeaveServer(None));
                 }
             }
             (PublishRequestResult::Cancelled, Some((_, publish))) => {
@@ -2095,7 +2125,7 @@ impl AppState {
                         &mut self.status_manager,
                         format!("{}: {e}", strings::LOST_CONNECTION_TO_SERVER),
                     );
-                    iced::Task::done(Message::SafelyLeaveServer)
+                    iced::Task::done(Message::SafelyLeaveServer(None))
                 } else {
                     iced::Task::none()
                 }
@@ -2281,22 +2311,23 @@ impl AppState {
 
         // Let state know that a modal file dialog is open.
         tracing::debug!("Choosing download location in external modal dialog");
-        self.modal_state = ModalState::ExternalDialog;
+        let modal_id = generate_nonce();
+        self.modal_stack.push(ModalDialog::ExternalDialog(modal_id));
 
         if let Some(file_size) = bytes {
             iced::Task::perform(builder.save_file(), move |f| {
                 if let Some(f) = f {
-                    Message::SubscribePathChosenAcceptEarly(f.into(), hash_hex, file_size)
+                    Message::SubscribePathChosenAcceptEarly(f.into(), hash_hex, file_size, modal_id)
                 } else {
-                    Message::SubscribePathCancelled
+                    Message::SubscribePathCancelled(modal_id)
                 }
             })
         } else {
             iced::Task::perform(builder.save_file(), move |f| {
                 if let Some(f) = f {
-                    Message::SubscribePathChosen(f.into(), hash_hex, None)
+                    Message::SubscribePathChosen(f.into(), hash_hex, None, modal_id)
                 } else {
-                    Message::SubscribePathCancelled
+                    Message::SubscribePathCancelled(modal_id)
                 }
             })
         }
@@ -2304,9 +2335,11 @@ impl AppState {
 
     /// Update the state after the download button was clicked. Begins a subscribe request.
     #[tracing::instrument(skip(self))]
-    fn update_subscribe_path_cancelled(&mut self) -> iced::Task<Message> {
+    fn update_subscribe_path_cancelled(&mut self, modal_id: Nonce) -> iced::Task<Message> {
         tracing::debug!("Download path dialog cancelled");
-        self.modal_state = ModalState::None;
+
+        // Close the modal dialog opened for download path.
+        self.remove_modal(modal_id);
         iced::Task::none()
     }
 
@@ -2317,21 +2350,32 @@ impl AppState {
         path: PathBuf,
         hash_hex: String,
         expected_bytes: u64,
+        modal_id: Nonce,
     ) -> iced::Task<Message> {
         tracing::debug!("Download path chosen with early accept");
-        self.modal_state = ModalState::Confirmation(ConfirmationDialog {
-            title: "Confirm download size".into(),
-            message: format!(
-                "The file size is {}. Do you want to continue?",
-                humanize_bytes(expected_bytes)
-            )
-            .into(),
-            confirm_action: Box::new(Message::SubscribePathChosen(
-                path,
-                hash_hex,
-                Some(expected_bytes),
-            )),
-        });
+
+        // Close the file-choice modal dialog.
+        self.remove_modal(modal_id);
+
+        // Create a new confirmation dialog to early-accept the file size.
+        let modal_id = generate_nonce();
+        self.modal_stack.push(ModalDialog::Confirmation(
+            modal_id,
+            ConfirmationDialog {
+                title: "Confirm download size".into(),
+                message: format!(
+                    "The file size is {}. Do you want to continue?",
+                    humanize_bytes(expected_bytes)
+                )
+                .into(),
+                confirm_action: Box::new(Message::SubscribePathChosen(
+                    path,
+                    hash_hex,
+                    Some(expected_bytes),
+                    modal_id,
+                )),
+            },
+        ));
         iced::Task::none()
     }
 
@@ -2342,8 +2386,11 @@ impl AppState {
         path: PathBuf,
         hash_hex: &str,
         expected_bytes: Option<u64>,
+        modal_id: Option<Nonce>,
     ) -> iced::Task<Message> {
-        self.modal_state = ModalState::None;
+        if let Some(modal_id) = modal_id {
+            self.remove_modal(modal_id);
+        }
 
         // Ensure the client is connected to a server.
         let ConnectionState::Connected(ConnectedState {
@@ -2449,7 +2496,7 @@ impl AppState {
                 // No size has been consented to, no partial progress.
                 SavedDownloadState::NotConsented => {
                     // If the download was not consented to we take a different path.
-                    return self.update_subscribe_path_chosen(path, &hash.to_string(), None);
+                    return self.update_subscribe_path_chosen(path, &hash.to_string(), None, None);
                 }
             };
 
@@ -2755,7 +2802,7 @@ impl AppState {
                         &mut self.status_manager,
                         format!("{}: {e}", strings::LOST_CONNECTION_TO_SERVER),
                     );
-                    iced::Task::done(Message::SafelyLeaveServer)
+                    iced::Task::done(Message::SafelyLeaveServer(None))
                 } else {
                     log_status_change::<LogErrorStatus>(
                         &mut self.status_manager,
@@ -3096,7 +3143,7 @@ impl AppState {
                     new_hash: false,
                 }
             } else {
-                Message::PublishChosenItem(CreateOrExisting::Existing(publish.nonce))
+                Message::PublishChosenItem(CreateOrExisting::Existing(publish.nonce), None)
             },
         )
     }
@@ -3129,8 +3176,13 @@ impl AppState {
         &mut self,
         nonce: Nonce,
         transfer_type: FileYeetCommandType,
+        modal_id: Option<Nonce>,
     ) -> iced::Task<Message> {
-        self.modal_state = ModalState::None;
+        if let Some(modal_id) = modal_id {
+            // Close the modal dialog if one was opened.
+            self.remove_modal(modal_id);
+        }
+
         let ConnectionState::Connected(ConnectedState {
             peers,
             downloads,
@@ -4288,16 +4340,19 @@ impl AppState {
                     iced::window::close(window)
                 } else {
                     // If the main window is requesting to close during a managed modal state, just close the modal dialog instead.
-                    if let ModalState::Confirmation(ConfirmationDialog { title, .. }) =
-                        &self.modal_state
+                    if let Some(ModalDialog::Confirmation(id, ConfirmationDialog { title, .. })) =
+                        &self.modal_stack.last()
                     {
-                        tracing::debug!("Close requested while confirmation `{title}` is open, dismissing modal");
-                        self.modal_state = ModalState::None;
+                        tracing::debug!(
+                            "Close requested, dismissing confirmation modal {id}: `{title}`"
+                        );
+                        self.modal_stack.pop();
+
                         return iced::Task::none();
                     }
 
                     // Start the safe exit process.
-                    self.safely_close(CloseType::Application)
+                    self.safely_close(CloseType::Application, None)
                 }
             }
 
@@ -4315,12 +4370,14 @@ impl AppState {
             }) => {
                 // TODO: If multiple windows are ever open, will need to verify that the escape
                 //       key is active to the main window before closing the modal.
-                if let ModalState::Confirmation(ConfirmationDialog { title, .. }) =
-                    &self.modal_state
+                if let Some(ModalDialog::Confirmation(id, ConfirmationDialog { title, .. })) =
+                    &self.modal_stack.last()
                 {
                     // If an internally managed modal is open, close it.
-                    tracing::debug!("Escape key pressed, dismissing confirmation modal '{title}'");
-                    self.modal_state = ModalState::None;
+                    tracing::debug!(
+                        "Escape key pressed, dismissing confirmation modal {id}: '{title}'"
+                    );
+                    self.modal_stack.pop();
                     iced::Task::none()
                 } else {
                     // Otherwise, ignore the escape key.
@@ -4335,12 +4392,23 @@ impl AppState {
 
     /// Try to safely close.
     #[tracing::instrument(skip(self))]
-    fn safely_close(&mut self, close_type: CloseType) -> iced::Task<Message> {
+    fn safely_close(
+        &mut self,
+        close_type: CloseType,
+        modal_id: Option<Nonce>,
+    ) -> iced::Task<Message> {
+        if let Some(modal_id) = modal_id {
+            self.remove_modal(modal_id);
+        }
+
         if matches!(
             &self.connection_state,
             ConnectionState::SafelyLeaveStalling { .. }
         ) {
-            tracing::warn!("Already safely closing, ignoring additional close request");
+            log_status_change::<LogWarnStatus>(
+                &mut self.status_manager,
+                "Already safely closing, ignoring additional close request".to_owned(),
+            );
             return iced::Task::none();
         }
         let mut connection_state = std::mem::replace(
@@ -4463,6 +4531,12 @@ impl AppState {
             }
         }
 
+        // Helper to do the final message cleanup based on the requested close type.
+        let close_type_message = |close_type| match close_type {
+            CloseType::Application => Message::ForceExit,
+            CloseType::Connections => Message::LeftServer,
+        };
+
         if let Some(port_mapping) = self.port_mapping.take() {
             let port_mapping_timeout = Duration::from_millis(500);
             iced::Task::perform(
@@ -4477,26 +4551,10 @@ impl AppState {
                     }
                 }),
                 // Force the close operation after completing the request or after a timeout.
-                move |_| match close_type {
-                    CloseType::Application => Message::ForceExit,
-                    CloseType::Connections => Message::LeftServer,
-                },
+                move |_| close_type_message(close_type),
             )
         } else {
-            match close_type {
-                // Immediately exit if there isn't a port mapping to remove.
-                CloseType::Application => {
-                    tracing::debug!("No work to do before exiting, closing now");
-                    iced::exit()
-                }
-
-                // Close connections and return to the main screen.
-                CloseType::Connections => {
-                    tracing::debug!("Exiting connected view to main screen");
-                    self.connection_state = ConnectionState::Disconnected;
-                    iced::Task::none()
-                }
-            }
+            iced::Task::done(close_type_message(close_type))
         }
     }
 
@@ -4505,6 +4563,26 @@ impl AppState {
         // Save the old status message to history.
         if let Some(old_status) = self.status_manager.message.take() {
             self.status_manager.history.push_back(old_status);
+        }
+    }
+
+    /// Helper to remove a modal from the stack by its ID. Logs a warning if the modal was not present.
+    fn remove_modal(&mut self, modal_id: Nonce) {
+        let modal_stack_len = self.modal_stack.len();
+        self.modal_stack.retain(|modal| {
+            if modal.nonce() == modal_id {
+                tracing::debug!("Dismissing modal with ID {modal_id}");
+                false
+            } else {
+                true
+            }
+        });
+
+        if self.modal_stack.len() == modal_stack_len {
+            log_status_change::<LogWarnStatus>(
+                &mut self.status_manager,
+                format!("Attempted to remove modal {modal_id} that was not present"),
+            );
         }
     }
 }

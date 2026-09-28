@@ -25,8 +25,9 @@ use crate::{
         FileYeetCommandType,
     },
     gui::{
-        confirmation, full_download, remove_nonce_for_peer, strings, text_horizontal_scrollbar,
-        timed_tooltip, CreateOrExisting, Message, Nonce, NonceItem, ERROR_RED_COLOR,
+        confirmation, full_download, generate_nonce, remove_nonce_for_peer, strings,
+        text_horizontal_scrollbar, timed_tooltip, CreateOrExisting, Message, Nonce, NonceItem,
+        ERROR_RED_COLOR,
     },
 };
 
@@ -591,6 +592,38 @@ impl Transfer for DownloadTransfer {
         mouse_move_elapsed: &Duration,
         is_non_modal: bool,
     ) -> iced::Element<'_, Message> {
+        /// A helper function to create a button style with squared corners for the context menu.
+        fn context_menu_button_style(
+            theme: &iced::Theme,
+            status: widget::button::Status,
+        ) -> widget::button::Style {
+            let mut style = widget::button::primary(theme, status);
+
+            // Set the border radii to `0` to square the corners.
+            style.border.radius = iced::border::Radius::default();
+            style
+        }
+
+        // Helper for creating standard buttons with tooltips.
+        fn tooltip_button_on_press<'a, F>(
+            text: &'static str,
+            enabled: bool,
+            on_press: F,
+            tooltip: &'static str,
+            mouse_move_elapsed: &Duration,
+        ) -> iced::Element<'a, Message>
+        where
+            F: 'a + Fn() -> Message,
+        {
+            let button = widget::button(widget::text(text).size(12));
+            let button = if enabled {
+                button.on_press_with(on_press)
+            } else {
+                button
+            };
+            timed_tooltip(button, tooltip, mouse_move_elapsed)
+        }
+
         // Helper for creating standard buttons with tooltips.
         let tooltip_button =
             |text: &'static str, message: Option<Message>, tooltip: &'static str| {
@@ -604,26 +637,24 @@ impl Transfer for DownloadTransfer {
         // Helper for creating context menu buttons with tooltips.
         let context_menu_button =
             |text: &'static str, message: Option<Message>, tooltip: &'static str| {
-                /// A helper function to create a button style with squared corners for the context menu.
-                fn button_style(
-                    theme: &iced::Theme,
-                    status: widget::button::Status,
-                ) -> widget::button::Style {
-                    let mut style = widget::button::primary(theme, status);
-
-                    // Set the border radii to `0` to square the corners.
-                    style.border.radius = iced::border::Radius::default();
-                    style
-                }
-
-                timed_tooltip(
-                    widget::button(widget::text(text).size(12))
-                        .on_press_maybe(message)
-                        .style(button_style)
-                        .width(iced::Length::Fill),
-                    tooltip,
-                    mouse_move_elapsed,
-                )
+                let button = widget::button(widget::text(text).size(12))
+                    .on_press_maybe(message)
+                    .style(context_menu_button_style)
+                    .width(iced::Length::Fill);
+                timed_tooltip(button, tooltip, mouse_move_elapsed)
+            };
+        // Helper for creating context menu buttons with tooltips.
+        let context_menu_button_on_press =
+            |text: &'static str, enabled: bool, on_press, tooltip: &'static str| {
+                let button = widget::button(widget::text(text).size(12))
+                    .style(context_menu_button_style)
+                    .width(iced::Length::Fill);
+                let button = if enabled {
+                    button.on_press_with(on_press)
+                } else {
+                    button
+                };
+                timed_tooltip(button, tooltip, mouse_move_elapsed)
             };
 
         // Try to get a transfer rate string or `None`.
@@ -658,34 +689,37 @@ impl Transfer for DownloadTransfer {
                 // Create either a context menu or a button to open one, depending on the state.
                 // TODO: Use a proper context menu when `iced` adds support for them in the future.
                 let context_menu: iced::Element<Message> = if self.context_menu_visible {
+                    let nonce = self.base.nonce;
                     widget::container(widget::column!(
                         context_menu_button(
                             "⋯",
-                            Some(Message::DownloadContextMenuVisibility(
-                                self.base.nonce,
-                                false
-                            )),
+                            Some(Message::DownloadContextMenuVisibility(nonce, false)),
                             "Close this context menu",
                         ),
                         widget::rule::horizontal(2),
                         context_menu_button(
                             "Pause Transfer",
-                            Some(Message::PauseDownload(self.base.nonce)),
+                            Some(Message::PauseDownload(nonce)),
                             "Pause the download, it can be safely resumed",
                         ),
                         widget::rule::horizontal(2),
-                        context_menu_button(
+                        context_menu_button_on_press(
                             strings::CANCEL,
-                            is_non_modal.then(|| Message::ModalConfirmation(
-                                confirmation::cancel_download(self.base.nonce)
-                            )),
+                            is_non_modal,
+                            move || {
+                                let modal_id = generate_nonce();
+                                Message::ModalConfirmation(
+                                    modal_id,
+                                    confirmation::cancel_download(nonce, modal_id),
+                                )
+                            },
                             strings::CANCEL_DOWNLOAD_TOOLTIP,
                         ),
                         widget::rule::horizontal(2),
                         timed_tooltip(
                             widget::checkbox(self.publish_on_success)
                                 .label("Reyeet on success")
-                                .on_toggle(|b| Message::PublishOnSuccessToggle(self.base.nonce, b))
+                                .on_toggle(move |b| Message::PublishOnSuccessToggle(nonce, b))
                                 .size(12),
                             "Automatically publish the file after a successful download",
                             mouse_move_elapsed,
@@ -724,12 +758,18 @@ impl Transfer for DownloadTransfer {
                     Some(Message::ResumePausedDownload(self.base.nonce)),
                     "Attempt to resume the download",
                 ),
-                tooltip_button(
+                tooltip_button_on_press(
                     strings::CANCEL,
-                    is_non_modal.then(|| Message::ModalConfirmation(
-                        confirmation::cancel_download(self.base.nonce)
-                    )),
+                    is_non_modal,
+                    move || {
+                        let modal_id = generate_nonce();
+                        Message::ModalConfirmation(
+                            modal_id,
+                            confirmation::cancel_download(self.base.nonce, modal_id),
+                        )
+                    },
                     strings::CANCEL_DOWNLOAD_TOOLTIP,
+                    mouse_move_elapsed,
                 ),
             )
             .spacing(6)
@@ -740,30 +780,45 @@ impl Transfer for DownloadTransfer {
             } => widget::row!(
                 "Hashing file...",
                 widget::progress_bar(0.0..=1., *progress_animation).girth(24),
-                tooltip_button(
+                tooltip_button_on_press(
                     strings::CANCEL,
-                    is_non_modal.then(|| Message::ModalConfirmation(
-                        confirmation::cancel_download(self.base.nonce)
-                    )),
+                    is_non_modal,
+                    move || {
+                        let modal_id = generate_nonce();
+                        Message::ModalConfirmation(
+                            modal_id,
+                            confirmation::cancel_download(self.base.nonce, modal_id),
+                        )
+                    },
                     strings::CANCEL_DOWNLOAD_TOOLTIP,
+                    mouse_move_elapsed,
                 ),
             )
             .spacing(6)
             .into(),
 
-            DownloadState::NoPeersAvailable(_) => widget::row!(
-                "No peers available, retrying...",
-                widget::space().width(iced::Length::Fill),
-                tooltip_button(
-                    strings::CANCEL,
-                    is_non_modal.then(|| {
-                        Message::ModalConfirmation(confirmation::cancel_download(self.base.nonce))
-                    }),
-                    strings::CANCEL_DOWNLOAD_TOOLTIP,
-                ),
-            )
-            .spacing(6)
-            .into(),
+            DownloadState::NoPeersAvailable(_) => {
+                let nonce = self.base.nonce;
+                widget::row!(
+                    "No peers available, retrying...",
+                    widget::space().width(iced::Length::Fill),
+                    tooltip_button_on_press(
+                        strings::CANCEL,
+                        is_non_modal,
+                        move || {
+                            let modal_id = generate_nonce();
+                            Message::ModalConfirmation(
+                                modal_id,
+                                confirmation::cancel_download(nonce, modal_id),
+                            )
+                        },
+                        strings::CANCEL_DOWNLOAD_TOOLTIP,
+                        mouse_move_elapsed,
+                    ),
+                )
+                .spacing(6)
+                .into()
+            }
 
             DownloadState::Done(r) => {
                 let remove = tooltip_button(
@@ -925,14 +980,24 @@ impl Transfer for UploadTransfer {
         is_non_modal: bool,
     ) -> iced::Element<'_, Message> {
         // Helper for creating standard buttons with tooltips.
-        let tooltip_button =
-            |text: &'static str, message: Option<Message>, tooltip: &'static str| {
-                timed_tooltip(
-                    widget::button(widget::text(text).size(12)).on_press_maybe(message),
-                    tooltip,
-                    mouse_move_elapsed,
-                )
+        fn tooltip_button<'a, F>(
+            text: &'static str,
+            enabled: bool,
+            on_press: F,
+            tooltip: &'static str,
+            mouse_move_elapsed: &Duration,
+        ) -> iced::Element<'a, Message>
+        where
+            F: 'a + Fn() -> Message,
+        {
+            let button = widget::button(widget::text(text).size(12));
+            let button = if enabled {
+                button.on_press_with(on_press)
+            } else {
+                button
             };
+            timed_tooltip(button, tooltip, mouse_move_elapsed)
+        }
 
         let (progress, rate_or_size) = match &self.progress {
             UploadState::Transferring {
@@ -940,13 +1005,19 @@ impl Transfer for UploadTransfer {
                 snapshot,
                 ..
             } => {
+                let nonce = self.base.nonce;
                 let progress = widget::row!(
                     strings::TRANSFERRING_ELLIPSIS,
                     widget::progress_bar(0.0..=1., *p).girth(24),
                     tooltip_button(
                         strings::CANCEL,
-                        is_non_modal.then(|| Message::ModalConfirmation(confirmation::cancel_upload(self.base.nonce))),
+                        is_non_modal,
+                        move || {
+                            let modal_id = generate_nonce();
+                            Message::ModalConfirmation(modal_id, confirmation::cancel_upload(nonce, modal_id))
+                        },
                         "Cancel the upload. The peer may attempt to recover the transfer later if the file is still being published.",
+                        mouse_move_elapsed,
                     ),
                 )
                 .spacing(6)
@@ -960,13 +1031,13 @@ impl Transfer for UploadTransfer {
                 size_string,
                 ..
             } => {
+                let nonce = self.base.nonce;
                 let remove = tooltip_button(
                     strings::REMOVE,
-                    Some(Message::RemoveFromTransfers(
-                        self.base.nonce,
-                        FileYeetCommandType::Pub,
-                    )),
+                    true,
+                    move || Message::RemoveFromTransfers(nonce, FileYeetCommandType::Pub),
                     strings::REMOVE_TRANSFER_TOOLTIP,
+                    mouse_move_elapsed,
                 );
                 let result_text = widget::text(result.to_string())
                     .width(iced::Length::Fill)
