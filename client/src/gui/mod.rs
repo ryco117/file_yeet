@@ -4339,15 +4339,9 @@ impl AppState {
                     // Also allows non-main windows to close immediately.
                     iced::window::close(window)
                 } else {
-                    // If the main window is requesting to close during a managed modal state, just close the modal dialog instead.
-                    if let Some(ModalDialog::Confirmation(id, ConfirmationDialog { title, .. })) =
-                        &self.modal_stack.last()
-                    {
-                        tracing::debug!(
-                            "Close requested, dismissing confirmation modal {id}: `{title}`"
-                        );
-                        self.modal_stack.pop();
-
+                    if let Some(ModalDialog::Confirmation(id, _)) = &self.modal_stack.last() {
+                        // If the main window is requesting to close during an internally managed modal state, just close the modal dialog instead.
+                        self.remove_modal(*id);
                         return iced::Task::none();
                     }
 
@@ -4370,14 +4364,9 @@ impl AppState {
             }) => {
                 // TODO: If multiple windows are ever open, will need to verify that the escape
                 //       key is active to the main window before closing the modal.
-                if let Some(ModalDialog::Confirmation(id, ConfirmationDialog { title, .. })) =
-                    &self.modal_stack.last()
-                {
+                if let Some(ModalDialog::Confirmation(id, _)) = &self.modal_stack.last() {
                     // If an internally managed modal is open, close it.
-                    tracing::debug!(
-                        "Escape key pressed, dismissing confirmation modal {id}: '{title}'"
-                    );
-                    self.modal_stack.pop();
+                    self.remove_modal(*id);
                     iced::Task::none()
                 } else {
                     // Otherwise, ignore the escape key.
