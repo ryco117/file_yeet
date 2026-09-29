@@ -655,7 +655,10 @@ impl AppState {
             }
             Message::AttemptServerConnection => self.update_attempt_server_connection(),
             Message::CancelServerConnection => {
-                tracing::info!("Cancelling server connection attempt");
+                log_status_change::<LogInfoStatus>(
+                    &mut self.status_manager,
+                    "Cancelling server connection attempt".to_owned(),
+                );
                 if let ConnectionState::ConnectStalling {
                     cancellation_token, ..
                 } = &self.connection_state
@@ -4510,9 +4513,15 @@ impl AppState {
             // Save the app settings if needed.
             if self.save_on_exit || !self.options.last_downloads.is_empty() {
                 if let Err(e) = save_settings(&self.options) {
-                    tracing::error!("Could not save settings: {e}");
+                    log_status_change::<LogErrorStatus>(
+                        &mut self.status_manager,
+                        "Could not save settings: {e}".to_owned(),
+                    );
                 } else {
-                    tracing::info!("Settings saved");
+                    log_status_change::<LogInfoStatus>(
+                        &mut self.status_manager,
+                        "Settings saved".to_owned(),
+                    );
                     self.save_on_exit = false;
                 }
             } else {

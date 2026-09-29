@@ -115,6 +115,7 @@ pub fn init(args: &crate::Cli) -> bool {
                 delete_old_logs(&app_folder);
 
                 // Initialization of logging to disk was successful
+                tracing::debug!("Initialized logging to app_folder");
                 return false;
             }
 
@@ -134,5 +135,6 @@ pub fn init(args: &crate::Cli) -> bool {
     }
 
     // Logging with stdout.
+    tracing::debug!("Initialized logging to stdout");
     true
 }

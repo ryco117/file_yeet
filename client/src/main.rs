@@ -97,7 +97,6 @@ fn main() {
     // Initialize logging based on the command line arguments.
     #[allow(unused_variables)]
     let log_to_stdout = logging::init(&args);
-    tracing::debug!("Initialized logging");
     tracing::info!("Client Version: {}", env!("CARGO_PKG_VERSION"));
 
     // If no subcommand was provided, run the GUI.
